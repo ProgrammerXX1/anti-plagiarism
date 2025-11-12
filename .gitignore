@@ -1,0 +1,50 @@
+# Файл: .gitignore
+# Корень репозитория (рядом с папками Back/ и Front/)
+
+# --- Общие ---
+*.log
+*.pyc
+__pycache__/
+.env
+*.env
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# --- Бэкенд (FastAPI) ---
+Back/.venv/
+Back/__pycache__/
+Back/*.pyc
+Back/.mypy_cache/
+Back/.pytest_cache/
+Back/.coverage
+Back/instance/
+Back/.cache/
+Back/.ruff_cache/
+Back/.pdm.toml
+Back/.pdm.lock
+Back/.python-version
+Back/.env
+Back/env/
+Back/.env.*
+
+# --- Фронтенд (React) ---
+Front/node_modules/
+Front/build/
+Front/dist/
+Front/.env
+Front/.env.*.local
+Front/.next/
+Front/.turbo/
+Front/.parcel-cache/
+Front/npm-debug.log
+Front/yarn-debug.log
+Front/yarn-error.log
+Front/pnpm-debug.log
+Front/.eslintcache
+
+# --- OS/System ---
+Thumbs.db
+ehthumbs.db
+Desktop.ini

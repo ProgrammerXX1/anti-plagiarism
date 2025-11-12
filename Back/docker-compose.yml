@@ -1,0 +1,10 @@
+services:
+  plagio:
+    build: .
+    image: plagio-fastapi:latest
+    ports: ["8002:8000"]
+    environment:
+      - PLAGIO_ROOT=/data
+    volumes:
+      - ./runtime:/data
+    restart: unless-stopped
