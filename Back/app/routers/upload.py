@@ -5,27 +5,21 @@ from typing import Iterator, Dict, Any, List
 
 import orjson
 from fastapi import APIRouter, UploadFile, File, HTTPException, Query
+from fastapi.responses import Response
 
-from ..services.normalizer import normalize_nfkc_lower, clean_spaces_punct, simple_tokens
+from ..core.config import CORPUS_JSONL, INDEX_JSON, UPLOAD_DIR
+from ..core.io_utils import file_lock
 from ..services.index_build import build_index_json
-from ..core.config import CORPUS_JSONL, INDEX_JSON
 from ..services.index_search import clear_index_cache, load_index_cached
+from ..services.normalizer import normalize_for_shingles, simple_tokens
+from ..services.pdf_heavy import extract_and_normalize_pdf
+from ..services.pdf_convert import smart_pdf_to_docx
 
 # --- optional parsers ---
 try:
-    from docx import Document  # python-docx
+    from docx import Document
 except Exception:
     Document = None
-
-try:
-    from pypdf import PdfReader  # pypdf
-except Exception:
-    PdfReader = None
-
-try:
-    from pdfminer.high_level import extract_text as pdfminer_extract_text  # pdfminer.six
-except Exception:
-    pdfminer_extract_text = None
 # ------------------------
 
 router = APIRouter(prefix="/api", tags=["Operations"])
@@ -49,76 +43,6 @@ def _docx_to_text(raw: bytes) -> str:
             parts.append(" ".join(c.text for c in row.cells if c.text))
     return "\n".join(parts)
 
-# Unicode classes: [^\W\d_] == letters with UNICODE flag
-# Unicode classes: [^\W\d_] == letters with UNICODE flag
-_LET = r"[^\W\d_]"
-_ZW = "[\u200B-\u200F\u202A-\u202E\u2060\uFEFF]"
-_SOFT_HYPHEN = "\u00AD"
-_NBSP = "\u00A0"
-
-def _repair_pdf_text(raw_txt: str) -> str:
-    t = raw_txt.replace("\r\n", "\n").replace("\r", "\n")
-
-    # 0) невидимые символы и NBSP
-    t = re.sub(_ZW, "", t)
-    t = t.replace(_SOFT_HYPHEN, "")     # мягкий перенос убрать
-    t = t.replace(_NBSP, " ")
-
-    # 1) склейка переносов со знаком (включая en-dash, non-breaking hyphen)
-    t = re.sub(fr"({_LET}+)[\--–]\s*\n\s*({_LET}+)", r"\1\2", t, flags=re.UNICODE)
-
-    # 2) одинарные переносы внутри абзаца -> пробел
-    t = re.sub(r"([^\n])\n(?!\n)", r"\1 ", t)
-
-    # 3) редкие разрывы внутри слова без дефиса: "исто рии"
-    # Склеиваем короткие куски 1–3 символа по обе стороны пробела.
-    for _ in range(3):
-        t2 = re.sub(fr"\b({_LET}{{1,3}})\s({_LET}{{1,3}})\b", r"\1\2", t, flags=re.UNICODE)
-        if t2 == t:
-            break
-        t = t2
-
-    # 4) множественные пробелы
-    t = re.sub(r"[ \t]{2,}", " ", t)
-
-    return t.strip()
-
-
-from pdfminer.high_level import extract_text as pdfminer_extract_text
-from pdfminer.layout import LAParams
-
-def _pdf_to_text(raw: bytes) -> str:
-    # 1) предпочтительно pdfminer: обычно лучше для кириллицы и переносов
-    if pdfminer_extract_text is not None:
-        try:
-            laparams = LAParams(
-                line_margin=0.12,   # склеивать строки одного абзаца
-                word_margin=0.08,   # не рвать слова
-                char_margin=2.0,    # терпим межсимвольные зазоры
-                detect_vertical=False,
-                all_texts=False,
-            )
-            txt = pdfminer_extract_text(io.BytesIO(raw), laparams=laparams) or ""
-            if txt.strip():
-                return txt
-        except Exception:
-            pass
-
-    # 2) fallback: pypdf
-    if PdfReader is not None:
-        try:
-            reader = PdfReader(io.BytesIO(raw))
-            parts = []
-            for page in reader.pages:
-                txt = page.extract_text() or ""
-                if txt:
-                    parts.append(txt)
-            if parts:
-                return "\n".join(parts)
-        except Exception:
-            pass
-
-    raise HTTPException(500, "no PDF parser available (install pdfminer.six or pypdf)")
 def _guess_ext(fname: str) -> str:
     fname = (fname or "").lower()
     if fname.endswith((".txt", ".log", ".md")): return "txt"
@@ -129,8 +53,11 @@ def _guess_ext(fname: str) -> str:
 # ---------- routes ----------
 
 @router.post("/upload")
-
-async def upload_file(file: UploadFile = File(...), normalize: bool = Query(True)):
+async def upload_file(
+    file: UploadFile = File(...),
+    normalize: bool = Query(True),
+    save_docx: bool = Query(True)
+):
     ctype = (file.content_type or "").lower()
     fname = (file.filename or "").lower()
     raw = await file.read()
@@ -142,35 +69,50 @@ async def upload_file(file: UploadFile = File(...), normalize: bool = Query(True
     elif (
         ctype in (
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            "application/msword",  # некоторые клиенты так шлют и .docx
+            "application/msword",
         ) or _guess_ext(fname) == "docx"
     ):
         text = _docx_to_text(raw)
 
     elif ctype == "application/pdf" or _guess_ext(fname) == "pdf":
-        base_text = _pdf_to_text(raw)
-        text = _repair_pdf_text(base_text)
+        # heavy PDF normalize for indexing
+        try:
+            text = extract_and_normalize_pdf(raw)
+        except Exception as e:
+            raise HTTPException(500, f"PDF extract failed: {e}")
+
+        # сохранить DOCX-версию
+        if save_docx:
+            try:
+                docx_bytes = smart_pdf_to_docx(raw, try_ocr=True)
+                UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+                base = hashlib.sha256(raw).hexdigest()[:12]
+                out_path = UPLOAD_DIR / f"{base}.docx"
+                out_path.write_bytes(docx_bytes)
+            except Exception:
+                pass
 
     else:
         raise HTTPException(400, f"unsupported content-type: {ctype or fname or 'unknown'}")
 
     # 2) нормализация для индекса
     if normalize:
-        text = clean_spaces_punct(normalize_nfkc_lower(text))
+        text = normalize_for_shingles(text)
 
     if not text.strip():
         raise HTTPException(400, "empty text after extraction")
 
     # 3) запись в корпус
     CORPUS_JSONL.parent.mkdir(parents=True, exist_ok=True)
-    doc_hash_src = text[:2048].encode("utf-8", "ignore")
-    doc_id = f"doc_{hashlib.sha1(doc_hash_src).hexdigest()[:8]}"
-    with open(CORPUS_JSONL, "ab") as f:
-        f.write(orjson.dumps({"doc_id": doc_id, "text": text}) + b"\n")
+    doc_id = f"doc_{hashlib.sha256(text.encode('utf-8')).hexdigest()[:8]}"
+    with file_lock(CORPUS_JSONL.with_suffix(".lock")):
+        with open(CORPUS_JSONL, "ab") as f:
+            f.write(orjson.dumps({"doc_id": doc_id, "text": text}) + b"\n")
 
-    # lightweight метрики
     toks = simple_tokens(text)
     return {"doc_id": doc_id, "bytes": len(raw), "tokens": len(toks)}
+
+# ---------- index ops ----------
 
 @router.post("/build")
 def build_index():
@@ -178,7 +120,6 @@ def build_index():
         idx = build_index_json()
     except FileNotFoundError:
         raise HTTPException(400, "corpus.jsonl not found")
-    # сброс и прогрев кэша индекса
     clear_index_cache()
     _ = load_index_cached()
     return {
@@ -192,18 +133,17 @@ def build_index():
 @router.delete("/reset")
 def reset_all():
     removed = []
-    if CORPUS_JSONL.exists():
-        try:
-            os.remove(CORPUS_JSONL); removed.append(str(CORPUS_JSONL))
-        except OSError as e:
-            raise HTTPException(500, f"cannot remove corpus: {e}")
-    if INDEX_JSON.exists():
-        try:
-            os.remove(INDEX_JSON); removed.append(str(INDEX_JSON))
-        except OSError as e:
-            raise HTTPException(500, f"cannot remove index: {e}")
+    for p in (CORPUS_JSONL, INDEX_JSON):
+        if p.exists():
+            try:
+                os.remove(p)
+                removed.append(str(p))
+            except OSError as e:
+                raise HTTPException(500, f"cannot remove {p.name}: {e}")
     clear_index_cache()
     return {"status": "ok", "removed": removed}
+
+# ---------- corpus list ----------
 
 def _iter_jsonl(path) -> Iterator[Dict[str, Any]]:
     with open(path, "r", encoding="utf-8") as f:
@@ -223,8 +163,8 @@ def _iter_jsonl(path) -> Iterator[Dict[str, Any]]:
 def corpus_list(
     offset: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=1000),
-    reverse: bool = Query(True, description="Последние сверху"),
-    preview: bool = Query(True, description="Добавить краткий текстовый превью"),
+    reverse: bool = Query(True),
+    preview: bool = Query(True),
     max_preview_chars: int = Query(160, ge=0, le=2000),
 ):
     if not CORPUS_JSONL.exists():
@@ -234,8 +174,9 @@ def corpus_list(
     if reverse:
         buf: deque = deque(maxlen=offset + limit)
         for obj in _iter_jsonl(CORPUS_JSONL):
-            buf.append(obj); total += 1
-        selected = list(buf)[max(0, len(buf) - (offset + limit)) :]
+            buf.append(obj)
+            total += 1
+        selected = list(buf)[max(0, len(buf) - (offset + limit)):]
         selected = selected[-limit:] if offset == 0 else selected[:-offset] if offset < len(selected) else []
         selected.reverse()
     else:
@@ -256,10 +197,25 @@ def corpus_list(
             "tokens": len(toks),
         }
         if preview and max_preview_chars > 0:
-            p = text[: max_preview_chars].replace("\n", " ")
+            p = text[:max_preview_chars].replace("\n", " ")
             if len(text) > max_preview_chars:
                 p += "…"
             rec["preview"] = p
         items.append(rec)
 
     return {"total": total, "offset": offset, "limit": limit, "items": items}
+
+# ---------- optional: отдельная конвертация ----------
+
+@router.post("/convert/pdf-to-docx")
+async def convert_pdf_to_docx(file: UploadFile = File(...)):
+    raw = await file.read()
+    try:
+        docx = smart_pdf_to_docx(raw, try_ocr=True)
+    except Exception as e:
+        raise HTTPException(500, f"convert failed: {e}")
+    return Response(
+        content=docx,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{(file.filename or "file").rsplit(".",1)[0]}.docx"'}
+    )

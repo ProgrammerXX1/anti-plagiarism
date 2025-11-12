@@ -21,3 +21,25 @@ def clean_spaces_punct(s: str) -> str:
 
 def simple_tokens(text: str) -> List[str]:
     return [t for t in _ws.split(text) if t]
+def normalize_for_shingles(text: str) -> str:
+    """
+    Убирает мусор, нормализует Unicode, пробелы, дефисы, невидимые символы.
+    Готовит текст для шинглов.
+    """
+    # убрать невидимые символы и zero-width
+    text = re.sub(r"[\u200B-\u200F\u202A-\u202E\u2060\uFEFF]", "", text)
+    text = text.replace("\u00AD", "")  # soft hyphen
+    text = text.replace("\u00A0", " ")  # NBSP → обычный пробел
+
+    # нормализация Unicode
+    text = unicodedata.normalize("NFKC", text).lower()
+
+    # дефисы и переносы строк
+    text = re.sub(r"([^\W\d_])-\s+([^\W\d_])", r"\1\2", text)
+    text = re.sub(r"[\r\n]+", " ", text)
+
+    # убрать всё, кроме букв и цифр
+    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text
