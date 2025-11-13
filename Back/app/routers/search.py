@@ -9,7 +9,7 @@ try:
 except Exception:
     Document = None
 
-router = APIRouter(prefix="/api", tags=["search"])
+router = APIRouter(prefix="/api", tags=["Search"])
 
 class SearchReq(BaseModel):
     query: str

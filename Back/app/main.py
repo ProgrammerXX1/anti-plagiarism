@@ -4,7 +4,7 @@ from .routers import health, upload, search
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(
-    title="Checker FastAPI", 
+    title="Plagiarism", 
     default_response_class=ORJSONResponse
 )
 
