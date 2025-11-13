@@ -25,23 +25,38 @@ def ocr_pdf_bytes(raw_pdf: bytes, lang: str = "rus+eng") -> bytes:
         out = Path(td) / "out.pdf"
         inp.write_bytes(raw_pdf)
         # --skip-text для гибридных pdf с текстом
-        cmd = ["ocrmypdf", "--skip-text", "-l", lang, "--force-ocr", str(inp), str(out)]
+        cmd = [
+    "ocrmypdf",
+    "--skip-text",      # или "--force-ocr", но не оба
+    "-l", lang,
+    str(inp),
+    str(out),
+]
+
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if proc.returncode != 0 or not out.exists():
             raise RuntimeError(f"OCR failed: rc={proc.returncode}, err={proc.stderr.decode('utf-8', 'ignore')}")
         return out.read_bytes()
 
-def smart_pdf_to_docx(raw_pdf: bytes, try_ocr: bool = True, lang: str = "kaz+rus+eng") -> bytes:
+def smart_pdf_to_docx(
+    raw_pdf: bytes,
+    try_ocr: bool = True,
+    lang: str = "kaz+rus+eng",
+    ocr_workers: int = 16,       # ← явно задаём параллелизм
+) -> bytes:
     """Сначала пробуем прямую конверсию, если пусто — OCR (через pytesseract, как в скрипте)."""
     docx = pdf_to_docx_bytes(raw_pdf)
     # если docx реально содержит текст, возвращаем
     if len(docx) >= 50_000 or not try_ocr:
         return docx
 
-    # OCR путь
-    txt, dbg = pytess_ocr_pdf(raw_pdf, lang=lang)
+    # OCR путь (страничный, параллельный)
+    txt, dbg = pytess_ocr_pdf(raw_pdf, lang=lang, workers=ocr_workers)
+    # при желании можешь залогировать dbg["workers"], dbg["pages"]
+    # logger.info(f"smart_pdf_to_docx: OCR dbg={dbg}")
+
     if not txt.strip():
-        # fallback через ocrmypdf
+        # fallback через ocrmypdf (он сам внутри уже юзает tesseract, но обычно однопоточно на уровне проц)
         searchable = ocr_pdf_bytes(raw_pdf, lang=lang)
         return pdf_to_docx_bytes(searchable)
 
@@ -49,7 +64,9 @@ def smart_pdf_to_docx(raw_pdf: bytes, try_ocr: bool = True, lang: str = "kaz+rus
     from docx import Document
     doc = Document()
     for para in txt.split("\n\n"):
-        doc.add_paragraph(para.strip())
+        p = para.strip()
+        if p:
+            doc.add_paragraph(p)
     out = io.BytesIO()
     doc.save(out)
     return out.getvalue()
