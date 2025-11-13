@@ -2,6 +2,7 @@
 import io, subprocess, tempfile, os
 from pathlib import Path
 from typing import Optional
+from .pdf_heavy import pytess_ocr_pdf
 
 def pdf_to_docx_bytes(raw_pdf: bytes, start: int = 0, end: Optional[int] = None) -> bytes:
     """Конвертирует 'текстовый' PDF в DOCX. Без OCR."""
@@ -30,11 +31,25 @@ def ocr_pdf_bytes(raw_pdf: bytes, lang: str = "rus+eng") -> bytes:
             raise RuntimeError(f"OCR failed: rc={proc.returncode}, err={proc.stderr.decode('utf-8', 'ignore')}")
         return out.read_bytes()
 
-def smart_pdf_to_docx(raw_pdf: bytes, try_ocr: bool = True) -> bytes:
-    """Пробуем прямую конверсию. Если DOCX пуст/плохой и разрешён OCR — делаем OCR и пробуем снова."""
+def smart_pdf_to_docx(raw_pdf: bytes, try_ocr: bool = True, lang: str = "kaz+rus+eng") -> bytes:
+    """Сначала пробуем прямую конверсию, если пусто — OCR (через pytesseract, как в скрипте)."""
     docx = pdf_to_docx_bytes(raw_pdf)
-    # эвристика «пустой/битый» DOCX: <50 КБ
+    # если docx реально содержит текст, возвращаем
     if len(docx) >= 50_000 or not try_ocr:
         return docx
-    searchable = ocr_pdf_bytes(raw_pdf)
-    return pdf_to_docx_bytes(searchable)
+
+    # OCR путь
+    txt, dbg = pytess_ocr_pdf(raw_pdf, lang=lang)
+    if not txt.strip():
+        # fallback через ocrmypdf
+        searchable = ocr_pdf_bytes(raw_pdf, lang=lang)
+        return pdf_to_docx_bytes(searchable)
+
+    # создать DOCX из распознанного текста
+    from docx import Document
+    doc = Document()
+    for para in txt.split("\n\n"):
+        doc.add_paragraph(para.strip())
+    out = io.BytesIO()
+    doc.save(out)
+    return out.getvalue()
