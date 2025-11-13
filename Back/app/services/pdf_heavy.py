@@ -157,93 +157,155 @@ def _default_workers(workers: int | None) -> int:
 def pytess_ocr_pdf(
     raw: bytes,
     lang: str,
-    dpi: int = 200,
-    psm: int = 1,
+    ocr_mode: str = "speed",     # speed / balanced / quality
     workers: int | None = None,
 ) -> Tuple[str, Dict[str, Any]]:
     """
-    OCR PDF через pdf2image + pytesseract с мультипоточностью по страницам.
-    Поддерживает tries, detailed debug, best_psm — но работает быстрее.
+    OCR PDF через pdf2image + pytesseract с мультипоточностью.
+    Режимы:
+        speed     — самый быстрый
+        balanced  — баланс скорость/качество
+        quality   — максимум качества (дороже по времени)
     """
     import time
 
+    # ─────────────────────────────────────────────────────────────
+    # 1. Профили режимов
+    # ─────────────────────────────────────────────────────────────
+    MODES = {
+        "speed": {
+            "dpi": 150,
+            "max_w": 1600,
+            "psm": 3,
+            "psm_tries": False,
+            "autocontrast": False,
+            "heavy_filters": False,
+        },
+        "balanced": {
+            "dpi": 200,
+            "max_w": 2000,
+            "psm": 3,
+            "psm_tries": True,   # psm: 3, 6, 4, 7
+            "autocontrast": False,
+            "heavy_filters": False,
+        },
+        # если хочешь реально 500 dpi — верни 300 -> 500, но это x3-x4 по времени
+        "quality": {
+            "dpi": 300,
+            "max_w": 2000,
+            "psm": 6,
+            "psm_tries": True,
+            "autocontrast": True,
+            "heavy_filters": True,  # включаем median+sharp+contrast
+        },
+    }
+
+    if ocr_mode not in MODES:
+        raise ValueError(f"Unknown OCR mode: {ocr_mode}")
+
+    cfg = MODES[ocr_mode]
+    dpi = cfg["dpi"]
+    max_w = cfg["max_w"]
+    psm = cfg["psm"]
+    enable_psm_tries = cfg["psm_tries"]
+    enable_autocontrast = cfg["autocontrast"]
+    heavy_filters = cfg["heavy_filters"]
+
     start_total = time.time()
 
+    # ─────────────────────────────────────────────────────────────
+    # 2. PDF → images
+    # ─────────────────────────────────────────────────────────────
     poppler_path = os.environ.get("POPPLER_PATH") or os.environ.get("POPPLER_BIN")
-    convert_kwargs = {"fmt": "jpeg", "dpi": dpi}  # JPEG быстрее PNG
+    convert_kwargs = {"fmt": "jpeg", "dpi": dpi}
     if poppler_path:
         convert_kwargs["poppler_path"] = poppler_path
 
     dbg: Dict[str, Any] = {
-        "pytess_used": False,
-        "pages": 0,
-        "per_page": [],
+        "mode": ocr_mode,
         "dpi": dpi,
+        "max_w": max_w,
         "psm": psm,
-        "poppler_path": poppler_path,
-        "workers": None,
-        "tesseract_total_sec": 0.0,
+        "psm_tries": enable_psm_tries,
+        "autocontrast": enable_autocontrast,
+        "heavy_filters": heavy_filters,
+        "pages": 0,
         "convert_sec": 0.0,
+        "workers": None,
+        "per_page": [],
+        "total_sec": 0.0,
     }
 
-    # 1) PDF → Images
     t0 = time.time()
     try:
         images = convert_from_bytes(raw, **convert_kwargs)
     except Exception as e:
-        dbg["convert_error"] = str(e)
+        dbg["error"] = f"convert_from_bytes: {e}"
         return "", dbg
+
     dbg["convert_sec"] = round(time.time() - t0, 4)
-
-    dbg["pytess_used"] = True
     dbg["pages"] = len(images)
-
     if not images:
         return "", dbg
 
-    # psm fallback order
-    base_order = [psm] + [p for p in (6, 4, 7) if p != psm]
+    # ─────────────────────────────────────────────────────────────
+    # 3. resize
+    # ─────────────────────────────────────────────────────────────
+    def _fast_resize(im: Image.Image) -> Image.Image:
+        if im.width > max_w:
+            ratio = max_w / im.width
+            im = im.resize((max_w, int(im.height * ratio)), Image.LANCZOS)
+        return im
 
-    # workers selection
+    images = [_fast_resize(im) for im in images]
+
+    # ─────────────────────────────────────────────────────────────
+    # 4. preprocess с heavy-фильтрами для quality
+    # ─────────────────────────────────────────────────────────────
+    def _preprocess(im: Image.Image) -> Image.Image:
+        g = ImageOps.grayscale(im)
+        if enable_autocontrast:
+            g = ImageOps.autocontrast(g)
+        if heavy_filters:
+            g = g.filter(ImageFilter.MedianFilter(3))
+            g = ImageEnhance.Sharpness(g).enhance(1.3)
+            g = ImageEnhance.Contrast(g).enhance(1.4)
+        return g
+
+    # ─────────────────────────────────────────────────────────────
+    # 5. PSM order
+    # ─────────────────────────────────────────────────────────────
+    if enable_psm_tries:
+        psm_order = [psm] + [p for p in (6, 4, 7, 3) if p != psm]
+    else:
+        psm_order = [psm]
+
+    # ─────────────────────────────────────────────────────────────
+    # 6. workers
+    # ─────────────────────────────────────────────────────────────
     workers = _default_workers(workers)
     dbg["workers"] = workers
 
     logger.info(
-        f"[OCR] pytess_ocr_pdf START lang={lang}, pages={len(images)}, workers={workers}, dpi={dpi}, psm={psm}"
+        f"[OCR] START mode={ocr_mode}, pages={len(images)}, dpi={dpi}, "
+        f"workers={workers}, psm_tries={enable_psm_tries}, heavy_filters={heavy_filters}"
     )
 
-    # --- НОВОЕ: предварительный resize перед threads (ускоряет ×1.15–1.3)
-    def _fast_resize(img: Image.Image) -> Image.Image:
-        MAX_W = 2000
-        if img.width > MAX_W:
-            ratio = MAX_W / img.width
-            img = img.resize((MAX_W, int(img.height * ratio)), Image.LANCZOS)
-        return img
-
-    images = [_fast_resize(im) for im in images]   # ускорение до 20%
-
-    def _preprocess_for_ocr_fast(img: Image.Image) -> Image.Image:
-        # Перевод в grayscale
-        g = ImageOps.grayscale(img)
-        # Лёгкая нормализация (быстрее autocontrast)
-        g = g.point(lambda x: x)
-        return g
-
-    # --- Основной OCR по страницам (с psm fallback)
-    def _ocr_one_page(args: Tuple[int, Image.Image]):
-        import time
+    # ─────────────────────────────────────────────────────────────
+    # 7. OCR одной страницы
+    # ─────────────────────────────────────────────────────────────
+    def _ocr_one(args):
         idx, img = args
-        start_page = time.time()
+        start = time.time()
+        prep = _preprocess(img)
+
         best_txt, best_len, best_psm = "", 0, psm
         tried = []
 
-        # Подготовка заранее
-        prep = _preprocess_for_ocr_fast(img)
-
-        for p in base_order:
-            cfg = f"--oem 3 --psm {p}"
+        for p in psm_order:
+            cfg_str = f"--oem 3 --psm {p}"
             try:
-                t = pytesseract.image_to_string(prep, lang=lang, config=cfg) or ""
+                t = pytesseract.image_to_string(prep, lang=lang, config=cfg_str) or ""
             except Exception as e:
                 tried.append((p, f"ERR:{e}"))
                 continue
@@ -251,45 +313,41 @@ def pytess_ocr_pdf(
             L = len(t)
             tried.append((p, L))
             if L > best_len:
-                best_txt, best_len, best_psm = t, L, p
-
-            # ранний выход если текст достаточно длинный
+                best_len = L
+                best_txt = t
+                best_psm = p
             if L >= 1500:
                 break
 
-        page_time = round(time.time() - start_page, 4)
+        sec = round(time.time() - start, 4)
 
         logger.info(
-            f"[OCR] page={idx} lang={lang} best_psm={best_psm}, text_len={best_len}, tries={tried}, time={page_time}s"
+            f"[OCR] page={idx}, mode={ocr_mode}, len={best_len}, best_psm={best_psm}, "
+            f"tries={tried}, sec={sec}"
         )
 
-        return idx, best_txt, best_len, best_psm, tried, page_time
+        return idx, best_txt, best_len, tried, sec
 
-    tasks = [(idx, img) for idx, img in enumerate(images, 1)]
+    # ─────────────────────────────────────────────────────────────
+    # 8. ThreadPool OCR
+    # ─────────────────────────────────────────────────────────────
+    tasks = [(i, im) for i, im in enumerate(images, 1)]
     page_texts = [""] * len(images)
-    per_page_info = []
 
-    # --- ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        for idx, best_txt, best_len, best_psm, tried, page_time in ex.map(_ocr_one_page, tasks):
-            page_texts[idx - 1] = best_txt
-            per_page_info.append({
+        for idx, txt, L, tried, sec in ex.map(_ocr_one, tasks):
+            page_texts[idx - 1] = txt
+            dbg["per_page"].append({
                 "page": idx,
-                "len": best_len,
-                "psm": best_psm,
+                "len": L,
                 "tries": tried,
-                "sec": page_time,
+                "sec": sec,
             })
 
-    dbg["per_page"] = per_page_info
-    dbg["tesseract_total_sec"] = round(time.time() - start_total, 4)
-
-    logger.info(
-        f"[OCR] pytess_ocr_pdf DONE lang={lang}, pages={len(images)}, total={dbg['tesseract_total_sec']}s"
-    )
+    dbg["total_sec"] = round(time.time() - start_total, 4)
+    logger.info(f"[OCR] DONE mode={ocr_mode}, total={dbg['total_sec']}s")
 
     return "\n\n".join(page_texts).strip(), dbg
-
 
 
 def _extract_text_pdftotext(raw: bytes) -> str:
@@ -349,7 +407,7 @@ def extract_and_normalize_pdf(
         ocr_start = time.time()
 
     # основной язык
-        t, d = pytess_ocr_pdf(raw, lang, dpi=dpi, psm=psm, workers=ocr_workers)
+        t, d = pytess_ocr_pdf(raw, lang, ocr_mode="speed", workers=ocr_workers)
         dbg.update(d)
 
         if t.strip():
@@ -363,7 +421,7 @@ def extract_and_normalize_pdf(
         # fallback языки
             for lg in [lang, "kaz+rus", "rus+eng", "kaz", "rus", "eng"]:
                 fb_start = time.time()
-                t2, d2 = pytess_ocr_pdf(raw, lg, dpi=dpi, psm=psm, workers=ocr_workers)
+                t2, d2 = pytess_ocr_pdf(raw, lg, ocr_mode="speed", workers=ocr_workers)
                 logger.info(f"[OCR] fallback lang={lg} result_len={len(t2.strip())}, time={time.time() - fb_start}s")
 
                 if len(t2.strip()) > len(txt.strip()):
