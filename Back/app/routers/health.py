@@ -1,4 +1,4 @@
-from Desktop.Plagiarism.Back.app.routers.upload import _iter_jsonl
+from ..routers.upload import _iter_jsonl
 from ..core.config import CORPUS_JSONL, INDEX_JSON, MANIFEST_JSON
 from collections import deque
 from typing import Dict, Any, List

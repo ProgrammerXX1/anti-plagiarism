@@ -14,7 +14,7 @@ services:
     volumes:
       - ./runtime:/runtime
     ports:
-      - "8001:8001"
+      - "8001:8001"   # ← вернули
 
   plagio-ops:
     build: .
@@ -31,4 +31,20 @@ services:
     volumes:
       - ./runtime:/runtime
     ports:
-      - "8002:8002"
+      - "8002:8002"   # ← вернули
+
+  nginx:
+    image: nginx:alpine
+    container_name: plagio-nginx
+    depends_on:
+      - plagio-search
+      - plagio-ops
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8000:80"
+
+
+
+
+

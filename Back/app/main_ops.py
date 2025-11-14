@@ -3,7 +3,7 @@ from fastapi import FastAPI
 from fastapi.responses import ORJSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from .routers import upload, config_runtime  # upload = твой "Operations" router
+from .routers import upload, config_runtime, health  # upload = твой "Operations" router
 
 app = FastAPI(
     title="Plagiarism Operations API",
@@ -21,10 +21,10 @@ app.add_middleware(
 # тяжёлые штуки: OCR, загрузка, билд индекса, corpus list/text
 app.include_router(upload.router)
 app.include_router(config_runtime.router)
-
+app.include_router(health.router)
 # опционально health
-try:
-    from .routers import health
-    app.include_router(health.router)
-except ImportError:
-    pass
+# try:
+#     from .routers import health
+#     app.include_router(health.router)
+# except ImportError:
+#     pass

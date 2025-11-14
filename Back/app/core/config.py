@@ -43,7 +43,7 @@ MANIFEST_JSON = INDEX_DIR / "manifest.json"
 
 # ── OCR дефолты ────────────────────────────────────────────────────────────────
 OCR_LANG_DEFAULT = os.environ.get("PLAGIO_OCR_LANG", "kaz+rus+eng")
-OCR_WORKERS_DEFAULT = int(os.environ.get("PLAGIO_OCR_WORKERS", "16"))
+OCR_WORKERS_DEFAULT = int(os.environ.get("PLAGIO_OCR_WORKERS", "8"))
 
 # ── Pydantic-конфиг индекса ───────────────────────────────────────────────────
 
