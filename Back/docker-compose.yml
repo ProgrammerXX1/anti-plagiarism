@@ -1,10 +1,34 @@
+version: "3.9"
+
 services:
-  plagio:
+  plagio-search:
     build: .
-    image: plagio-fastapi:latest
-    ports: ["8002:8000"]
+    container_name: plagio-search
+    command: >
+      uvicorn app.main_search:app
+      --host 0.0.0.0
+      --port 8001
+      --workers 2
     environment:
-      - PLAGIO_ROOT=/data
+      - PLAGIO_ROOT=/runtime
     volumes:
-      - ./runtime:/data
-    restart: unless-stopped
+      - ./runtime:/runtime
+    ports:
+      - "8001:8001"
+
+  plagio-ops:
+    build: .
+    container_name: plagio-ops
+    command: >
+      uvicorn app.main_ops:app
+      --host 0.0.0.0
+      --port 8002
+      --workers 1
+    environment:
+      - PLAGIO_ROOT=/runtime
+      - PLAGIO_OCR_LANG=kaz+rus+eng
+      - PLAGIO_OCR_WORKERS=8
+    volumes:
+      - ./runtime:/runtime
+    ports:
+      - "8002:8002"

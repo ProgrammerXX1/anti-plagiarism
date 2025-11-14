@@ -1,9 +1,17 @@
-FROM python:3.12-slim
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PLAGIO_ROOT=/runtime
+
 WORKDIR /app
+
+# зависимости
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# код
 COPY app ./app
-ENV PLAGIO_ROOT=/data
-RUN mkdir -p /data && adduser --disabled-password --gecos "" app && chown -R app:app /data /app
-USER app
-CMD ["uvicorn","app.main:app","--host","0.0.0.0","--port","8000","--proxy-headers"]
+
+# директория под runtime (corpus/index/uploads/logs)
+RUN mkdir -p /runtime

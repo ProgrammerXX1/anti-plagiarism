@@ -1,7 +1,10 @@
-fastapi==0.115.5
-uvicorn[standard]==0.32.0
-orjson==3.10.7
-python-dotenv==1.0.1
-python-docx==1.1.2
-pypdf>=5.0.0
+fastapi
+uvicorn[standard]
+orjson
+python-multipart
+pillow
+python-docx
 pdf2docx
+pdfminer.six
+pdf2image
+pytesseract
