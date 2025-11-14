@@ -1,20 +1,30 @@
-# app/routers/upload.py
 import hashlib, io, os, json, re, zipfile
 from collections import deque
 from typing import Iterator, Dict, Any, List
+from ..core.runtime_cfg import get_runtime_cfg
 
 import orjson
 from fastapi import APIRouter, UploadFile, File, HTTPException, Query
 from fastapi.responses import Response
 
-from ..core.config import CORPUS_JSONL, INDEX_JSON, UPLOAD_DIR
+from ..core.config import (
+    CORPUS_JSONL,
+    INDEX_JSON,
+    UPLOAD_DIR,
+    OCR_LANG_DEFAULT,
+    OCR_WORKERS_DEFAULT,
+)
 from ..core.io_utils import file_lock
+from ..core.logger import logger
+
 from ..services.index_build import build_index_json
 from ..services.index_search import clear_index_cache, load_index_cached
 from ..services.normalizer import normalize_for_shingles, simple_tokens
 from ..services.pdf_heavy import extract_and_normalize_pdf
 from ..services.pdf_convert import smart_pdf_to_docx
-from ..core.logger import logger  # вместо from venv import logger
+from ..services.docx_utils import extract_docx_text
+
+router = APIRouter(prefix="/api", tags=["Operations"])
 
 # --- optional parsers ---
 try:
@@ -23,7 +33,6 @@ except Exception:
     Document = None
 # ------------------------
 
-router = APIRouter(prefix="/api", tags=["Operations"])
 
 # ---------- helpers ----------
 
@@ -66,6 +75,10 @@ def _ingest_single(
     Общий пайплайн для одного файла.
     Возвращает dict с doc_id, токенами и пр.
     """
+    rt_cfg = get_runtime_cfg()
+    ocr_lang = rt_cfg.ocr.lang
+    ocr_workers = rt_cfg.ocr.workers
+
     ctype_guess = _guess_ext(fname)
     text: str
 
@@ -74,7 +87,10 @@ def _ingest_single(
         text = _bytes_to_text_utf8(raw)
 
     elif ctype_guess == "docx":
-        text = _docx_to_text(raw)
+        try:
+            text = extract_docx_text(raw)
+        except RuntimeError as e:
+            raise HTTPException(500, str(e))
 
     elif ctype_guess == "pdf":
         # heavy PDF normalize for indexing
@@ -82,11 +98,12 @@ def _ingest_single(
             text = extract_and_normalize_pdf(
                 raw,
                 try_ocr=ocr,
-                lang="kaz+rus+eng",
-                ocr_workers=16,
                 dpi=200,
                 psm=3,
                 return_debug=False,
+                ocr_mode=ocr_mode,
+                lang=ocr_lang,
+                ocr_workers=ocr_workers,
             )
         except Exception as e:
             raise HTTPException(500, f"PDF extract failed: {e}")
@@ -97,11 +114,10 @@ def _ingest_single(
                 docx_bytes = smart_pdf_to_docx(
                     raw,
                     try_ocr=ocr,
-                    lang="kaz+rus+eng",
-                    ocr_workers=16,
                     ocr_mode=ocr_mode,
-                    # здесь OCR не форсим, просто «умный» режим
                     force_ocr=False,
+                    lang=ocr_lang,
+                    ocr_workers=ocr_workers,
                 )
                 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
                 base = hashlib.sha256(raw).hexdigest()[:12]
@@ -137,6 +153,7 @@ def _ingest_single(
         "tokens": len(toks),
     }
 
+
 def _iter_jsonl(path) -> Iterator[Dict[str, Any]]:
     with open(path, "r", encoding="utf-8") as f:
         for i, line in enumerate(f, 1):
@@ -152,7 +169,6 @@ def _iter_jsonl(path) -> Iterator[Dict[str, Any]]:
                 continue
 
 # ---------- routes ----------
-
 @router.post("/upload")
 async def upload_file(
     file: UploadFile = File(...),
@@ -242,7 +258,6 @@ async def upload_zip(
             processed += 1
             items.append(res)
         except HTTPException as e:
-            # бизнес-ошибка (unsupported, пустой и т.п.)
             items.append(
                 {
                     "filename": name,
@@ -251,7 +266,6 @@ async def upload_zip(
                 }
             )
         except Exception as e:
-            # защитный fallback
             items.append(
                 {
                     "filename": name,
@@ -271,8 +285,9 @@ async def upload_zip(
 
 @router.post("/build")
 def build_index():
+    rt_cfg = get_runtime_cfg()
     try:
-        idx = build_index_json()
+        idx = build_index_json(cfg=rt_cfg.index.model_dump())
     except FileNotFoundError:
         raise HTTPException(400, "corpus.jsonl not found")
     clear_index_cache()
@@ -413,14 +428,19 @@ async def convert_pdf_to_docx(
     ),
 ):
     raw = await file.read()
+
+    rt_cfg = get_runtime_cfg()
+    ocr_lang = rt_cfg.ocr.lang
+    ocr_workers = rt_cfg.ocr.workers
+
     try:
         docx = smart_pdf_to_docx(
             raw,
             try_ocr=ocr,
-            lang="kaz+rus+eng",
-            ocr_workers=16,
             ocr_mode=ocr_mode,
             force_ocr=ocr,
+            lang=ocr_lang,
+            ocr_workers=ocr_workers,
         )
     except Exception as e:
         raise HTTPException(500, f"convert failed: {e}")

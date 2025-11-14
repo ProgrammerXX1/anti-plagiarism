@@ -1,12 +1,9 @@
 # app/services/index_build.py
-# Быстрый и детерминированный билдер индекса документов.
-# Совместим с текущим DEFAULT_CFG и остальным кодом.
-
 import json, gzip, hashlib
 from pathlib import Path
 from typing import Dict, Any, List, Set, Tuple
 
-from ..core.config import CORPUS_JSONL, INDEX_JSON, MANIFEST_JSON, DEFAULT_CFG
+from ..core.config import CORPUS_JSONL, INDEX_JSON, MANIFEST_JSON, DEFAULT_CFG, ensure_index_cfg
 from ..services.normalizer import clean_spaces_punct, normalize_nfkc_lower
 from ..services.shingles import build_shingles_multi
 from ..services.simhash import simhash128
@@ -20,14 +17,6 @@ except Exception:
     def _dumps(obj) -> bytes: return json.dumps(obj, ensure_ascii=False).encode("utf-8")
 
 # -------------------- helpers --------------------
-def _validate_cfg(cfg: Dict[str, Any]) -> Tuple[int, int]:
-    K = int(cfg["minhash"]["K"])
-    rows = int(cfg["minhash"]["rows"])
-    if K <= 0 or rows <= 0 or K % rows != 0:
-        raise ValueError(f"Invalid MinHash/LSH config: K={K}, rows={rows}")
-    if int(cfg.get("w_min_doc", 1)) < 1:
-        raise ValueError("w_min_doc must be >= 1")
-    return K, rows
 
 def _hash_chunk_u32_be(chunk: List[int]) -> str:
     bb = b"".join(int(x).to_bytes(4, "big") for x in chunk)
@@ -51,8 +40,9 @@ def _safe_sig_list(sig, K: int) -> List[int] | None:
 
 # -------------------- main --------------------
 def build_index_json(cfg: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    cfg = cfg or DEFAULT_CFG
-    K, rows = _validate_cfg(cfg)
+    cfg = ensure_index_cfg(cfg)
+    K = int(cfg["minhash"]["K"])
+    rows = int(cfg["minhash"]["rows"])
     A, B = make_AB(K, seed=cfg["minhash"]["seed"])
     bands_cnt = K // rows
 

@@ -3,6 +3,7 @@ import io, subprocess, tempfile, os
 from pathlib import Path
 from typing import Optional
 from .pdf_heavy import pytess_ocr_pdf
+from ..core.config import OCR_LANG_DEFAULT, OCR_WORKERS_DEFAULT
 
 def pdf_to_docx_bytes(raw_pdf: bytes, start: int = 0, end: Optional[int] = None) -> bytes:
     """Конвертирует 'текстовый' PDF в DOCX. Без OCR."""
@@ -53,10 +54,10 @@ def _build_docx_from_text(text: str) -> bytes:
 def smart_pdf_to_docx(
     raw_pdf: bytes,
     try_ocr: bool = True,
-    lang: str = "kaz+rus+eng",
-    ocr_workers: int = 16,
-    ocr_mode: str = "speed",     # speed / balanced / quality
-    force_ocr: bool = False,     # <<< ГЛАВНЫЙ ПАРАМЕТР ДЛЯ ТЕБЯ
+    ocr_mode: str = "speed",
+    force_ocr: bool = False,
+    lang: str = OCR_LANG_DEFAULT,
+    ocr_workers: int = OCR_WORKERS_DEFAULT,   
 ) -> bytes:
     """
     Варианты работы:

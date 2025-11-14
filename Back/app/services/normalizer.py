@@ -1,5 +1,4 @@
-# services/normalizer.py
-
+# app/services/normalizer.py
 import unicodedata, re
 from typing import List
 

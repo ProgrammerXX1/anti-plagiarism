@@ -1,3 +1,4 @@
+# app/services/shingles.py
 import hashlib
 from typing import List, Dict
 

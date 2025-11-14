@@ -1,7 +1,6 @@
+# app/services/simhash.py
 import hashlib
 from typing import List, Tuple
-
-# services/simhash.py
 from functools import lru_cache
 
 @lru_cache(maxsize=1<<18)  # достаточно ~262k уникальных токенов

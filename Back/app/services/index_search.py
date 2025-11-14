@@ -1,7 +1,7 @@
 # app/services/index_search.py
 import json, gzip
 from typing import Dict, Any, List, Tuple
-from ..core.config import INDEX_JSON, DEFAULT_CFG
+from ..core.config import INDEX_JSON, ensure_index_cfg, DEFAULT_CFG
 from .normalizer import normalize_nfkc_lower, clean_spaces_punct
 from .shingles import build_shingles_multi
 from .simhash import simhash128, hamming_hex128
@@ -31,15 +31,13 @@ def _pos_map(sh_list: List[int]) -> Dict[int, List[int]]:
     return pos
 
 def _validate_index(idx: Dict[str, Any]) -> None:
-    req = ["version","config","docs_meta","inverted_doc","lsh"]
-    if not all(k in idx for k in req): raise ValueError("invalid index")
-    inv=idx["inverted_doc"]
-    if not isinstance(inv,dict) or not all(k in inv for k in ("k5","k9","k13")):
-        raise ValueError("invalid inverted_doc")
-    K = int(idx["config"]["minhash"]["K"])
-    rows = int(idx["config"]["minhash"]["rows"])
-    if K <= 0 or rows <= 0 or K % rows != 0:
-        raise ValueError(f"Invalid MinHash/LSH config: K={K}, rows={rows}")
+    req = ["version", "config", "docs_meta", "inverted_doc", "lsh"]
+    if not all(k in idx for k in req):
+        raise ValueError("invalid index: missing required keys")
+    inv = idx["inverted_doc"]
+    if not isinstance(inv, dict) or not all(k in inv for k in ("k5", "k9", "k13")):
+        raise ValueError("invalid inverted_doc structure")
+
 
 def _get_intersections_lazy(cand_ids: set[str], qS: set[int], inv: dict) -> dict[str, int]:
     """|Q ∩ D| только по выбранным кандидатам."""
@@ -57,17 +55,26 @@ def _get_intersections_lazy(cand_ids: set[str], qS: set[int], inv: dict) -> dict
 # ── core search ────────────────────────────────────────────────────────────────
 def search(index: Dict[str, Any], qtext: str, top: int = 5) -> Dict[str, Any]:
     _validate_index(index)
-    cfg=index["config"]; inv=index["inverted_doc"]
-    inv5,inv9,inv13=inv["k5"],inv["k9"],inv["k13"]
-    bands=index["lsh"]["bands"]
-    A=index["lsh"]["A"]; B=index["lsh"]["B"]
-    K=cfg["minhash"]["K"]; rows=cfg["minhash"]["rows"]; alpha=cfg["weights"]["alpha"]
-    w13=cfg["weights"]["w13"]; w9=cfg["weights"]["w9"]; w5=cfg["weights"]["w5"]
-    simhash_bonus=float(cfg.get("simhash_bonus",0.0)); hbits=int(cfg["minhash"]["hamming_bonus_bits"])
-    fetch_per_k=int(cfg.get("fetch_per_k_doc", 256)); fetch_per_k5=int(cfg.get("fetch_per_k5_doc",512))
-    thr=cfg.get("thresholds",{}); plag_thr=float(thr.get("plag_thr",0.85)); partial_thr=float(thr.get("partial_thr",0.45))
-    max_cands_doc=int(cfg.get("max_cands_doc", 5000))
-    frag_for_top=int(cfg.get("fragments_for_top", min(16, top)))
+    cfg = ensure_index_cfg(index.get("config") or DEFAULT_CFG)
+
+    inv = index["inverted_doc"]
+    inv5, inv9, inv13 = inv["k5"], inv["k9"], inv["k13"]
+    bands = index["lsh"]["bands"]
+    A = index["lsh"]["A"]; B = index["lsh"]["B"]
+
+    K = cfg["minhash"]["K"]
+    rows = cfg["minhash"]["rows"]
+    alpha = cfg["weights"]["alpha"]
+    w13 = cfg["weights"]["w13"]; w9 = cfg["weights"]["w9"]; w5 = cfg["weights"]["w5"]
+    simhash_bonus = float(cfg.get("simhash_bonus", 0.0))
+    hbits = int(cfg["minhash"]["hamming_bonus_bits"])
+    fetch_per_k = int(cfg.get("fetch_per_k_doc", 256))
+    fetch_per_k5 = int(cfg.get("fetch_per_k5_doc", 512))
+    thr = cfg.get("thresholds", {})
+    plag_thr = float(thr.get("plag_thr", 0.85))
+    partial_thr = float(thr.get("partial_thr", 0.45))
+    max_cands_doc = int(cfg.get("max_cands_doc", 5000))
+    frag_for_top = int(cfg.get("fragments_for_top", min(16, top)))
 
     qnorm = clean_spaces_punct(normalize_nfkc_lower(qtext))
     qtoks = qnorm.split()
@@ -236,6 +243,8 @@ def load_index() -> dict:
         with open(INDEX_JSON, "r", encoding="utf-8") as f:
             idx = json.load(f)
     _validate_index(idx)
+    # нормализуем конфиг индекса (добьём дефолты, проверим K%rows)
+    idx["config"] = ensure_index_cfg(idx.get("config"))
     return idx
 
 def load_index_cached():

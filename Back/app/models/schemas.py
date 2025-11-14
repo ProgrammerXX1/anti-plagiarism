@@ -1,3 +1,4 @@
+# app/models/schemas.py
 from pydantic import BaseModel, Field
 from typing import Dict, Any, List, Optional
 
@@ -17,7 +18,7 @@ class BuildResp(BaseModel):
 
 class SearchReq(BaseModel):
     query: str = Field(..., min_length=3)
-    top: int = 5
+    top: int = Field(5, ge=1, le=50)
 
 class Frag(BaseModel):
     start: int

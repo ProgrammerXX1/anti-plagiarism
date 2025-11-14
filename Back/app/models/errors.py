@@ -1,3 +1,4 @@
+# app/models/errors.py
 from fastapi import HTTPException
 
 def bad_request(msg: str) -> HTTPException:

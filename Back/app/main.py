@@ -1,6 +1,7 @@
+# app/main.py
 from fastapi import FastAPI
 from fastapi.responses import ORJSONResponse
-from .routers import health, upload, search
+from .routers import health, upload, search, config_runtime
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(
@@ -19,3 +20,4 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(upload.router)
 app.include_router(search.router)
+app.include_router(config_runtime.router)

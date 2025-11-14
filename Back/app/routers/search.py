@@ -1,19 +1,13 @@
+# app/routers/search.py
 import io
 from fastapi import APIRouter, HTTPException, UploadFile, File, Query, Body
-from pydantic import BaseModel
-from ..services.index_search import search_cached, load_index
 
-# Пытаться подключить парсер DOCX
-try:
-    from docx import Document  # python-docx
-except Exception:
-    Document = None
+from ..models.schemas import SearchReq
+from ..services.index_search import search_cached, load_index
+from ..services.docx_utils import extract_docx_text
 
 router = APIRouter(prefix="/api", tags=["Search"])
 
-class SearchReq(BaseModel):
-    query: str
-    top: int = 5
 
 def _ensure_index():
     try:
@@ -23,22 +17,12 @@ def _ensure_index():
     except ValueError:
         raise HTTPException(500, "invalid index structure")
 
-def _docx_to_text(raw: bytes) -> str:
-    if Document is None:
-        raise HTTPException(500, "python-docx is not installed")
-    f = io.BytesIO(raw)
-    doc = Document(f)
-    parts = [p.text for p in doc.paragraphs]
-    for tbl in doc.tables:
-        for row in tbl.rows:
-            parts.append(" ".join(c.text for c in row.cells))
-    text = "\n".join(p for p in parts if p)
-    return text
 
 @router.post("/search")
 def search(req: SearchReq):
     _ensure_index()
     return search_cached(req.query.strip(), top=req.top)
+
 
 @router.post("/search-raw")
 async def search_raw(
@@ -50,6 +34,7 @@ async def search_raw(
     if not text:
         raise HTTPException(400, "empty body")
     return search_cached(text, top=top)
+
 
 @router.post("/search-file")
 async def search_file(
@@ -74,17 +59,25 @@ async def search_file(
 
     # .docx (OOXML)
     elif (
-        ctype == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        ctype
+        == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         or fname.endswith(".docx")
     ):
-        text = _docx_to_text(raw)
+        try:
+            text = extract_docx_text(raw)
+        except RuntimeError as e:
+            raise HTTPException(500, str(e))
 
     # .doc (старый MS Word) — не поддерживаем надёжно без внешних утилит
     elif ctype == "application/msword" or fname.endswith(".doc"):
-        raise HTTPException(415, "legacy .doc is not supported; convert to .docx or .txt")
+        raise HTTPException(
+            415, "legacy .doc is not supported; convert to .docx or .txt"
+        )
 
     else:
-        raise HTTPException(400, f"unsupported file type: {ctype or fname or 'unknown'}")
+        raise HTTPException(
+            400, f"unsupported file type: {ctype or fname or 'unknown'}"
+        )
 
     text = (text or "").strip()
     if not text:

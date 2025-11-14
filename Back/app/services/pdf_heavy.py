@@ -2,8 +2,9 @@
 import io, re, subprocess, tempfile, os, shutil
 from typing import List, Tuple, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
-from ..core.logger import logger
 from PIL import ImageEnhance
+from ..core.logger import logger
+from ..core.config import OCR_LANG_DEFAULT, OCR_WORKERS_DEFAULT
 
 # pdfminer (layout-aware)
 try:
@@ -367,15 +368,18 @@ def _extract_text_pdftotext(raw: bytes) -> str:
             return ""
         return open(out, "r", encoding="utf-8", errors="ignore").read()
 
+# фрагмент app/services/pdf_heavy.py
+
 def extract_and_normalize_pdf(
     raw: bytes,
     try_ocr: bool = True,
-    lang: str = "kaz+rus+eng",
+    lang: str = OCR_LANG_DEFAULT,
     return_debug: bool = False,
     oversample: int = 400,
     dpi: int = 200,
     psm: int = 3,
-    ocr_workers: int | None = None,
+    ocr_workers: int | None = OCR_WORKERS_DEFAULT,
+    ocr_mode: str = "speed",  # НОВЫЙ параметр
 ):
     dbg: Dict[str, Any] = {
         "pdfminer_before_chars": 0,
@@ -389,6 +393,7 @@ def extract_and_normalize_pdf(
         "dpi": dpi,
         "psm": psm,
         "ocr_workers": ocr_workers,
+        "ocr_mode": ocr_mode,
     }
 
     # 1) прямое извлечение
@@ -397,32 +402,52 @@ def extract_and_normalize_pdf(
     dbg["alpha_before"] = _alpha_density(txt0)
     txt = txt0
 
-    # 2) OCR-путь
     # 2) OCR-путь — без ocrmypdf, сразу параллельный pytesseract
     import time
 
     if try_ocr and dbg["alpha_before"] < 0.02:
-        logger.info(f"[OCR] alpha_before={dbg['alpha_before']} → starting Pytesseract OCR")
+        logger.info(
+            f"[OCR] alpha_before={dbg['alpha_before']} → starting Pytesseract OCR "
+            f"(mode={ocr_mode})"
+        )
 
         ocr_start = time.time()
 
-    # основной язык
-        t, d = pytess_ocr_pdf(raw, lang, ocr_mode="speed", workers=ocr_workers)
+        # основной язык
+        t, d = pytess_ocr_pdf(
+            raw,
+            lang,
+            ocr_mode=ocr_mode,
+            workers=ocr_workers,
+        )
         dbg.update(d)
 
         if t.strip():
             txt = t
             dbg["used"] = f"pytesseract:{lang}"
             dbg["ocr_time_sec"] = round(time.time() - ocr_start, 4)
-            logger.info(f"[OCR] success main lang={lang}, time={dbg['ocr_time_sec']}s")
+            logger.info(
+                f"[OCR] success main lang={lang}, mode={ocr_mode}, "
+                f"time={dbg['ocr_time_sec']}s"
+            )
         else:
-            logger.info(f"[OCR] main lang={lang} empty → fallback languages")
+            logger.info(
+                f"[OCR] main lang={lang}, mode={ocr_mode} empty → fallback languages"
+            )
 
-        # fallback языки
+            # fallback языки
             for lg in [lang, "kaz+rus", "rus+eng", "kaz", "rus", "eng"]:
                 fb_start = time.time()
-                t2, d2 = pytess_ocr_pdf(raw, lg, ocr_mode="speed", workers=ocr_workers)
-                logger.info(f"[OCR] fallback lang={lg} result_len={len(t2.strip())}, time={time.time() - fb_start}s")
+                t2, d2 = pytess_ocr_pdf(
+                    raw,
+                    lg,
+                    ocr_mode=ocr_mode,
+                    workers=ocr_workers,
+                )
+                logger.info(
+                    f"[OCR] fallback lang={lg}, mode={ocr_mode}, "
+                    f"result_len={len(t2.strip())}, time={time.time() - fb_start}s"
+                )
 
                 if len(t2.strip()) > len(txt.strip()):
                     txt = t2
@@ -430,12 +455,16 @@ def extract_and_normalize_pdf(
                     dbg["used"] = f"pytesseract:{lg}"
 
                 if len(txt) >= 1500:
-                    logger.info(f"[OCR] fallback lang={lg} reached enough text → stop fallback")
+                    logger.info(
+                        f"[OCR] fallback lang={lg} reached enough text → stop fallback"
+                    )
                     break
 
             dbg["ocr_time_sec"] = round(time.time() - ocr_start, 4)
-            logger.info(f"[OCR] fallback total time={dbg['ocr_time_sec']}s, used={dbg.get('used')}")
-
+            logger.info(
+                f"[OCR] fallback total time={dbg['ocr_time_sec']}s, "
+                f"used={dbg.get('used')}"
+            )
 
     # 3) нормализация
     t = (txt or "").replace("\r\n", "\n").replace("\r", "\n")
@@ -449,3 +478,4 @@ def extract_and_normalize_pdf(
     if return_debug:
         return t, dbg
     return t
+
