@@ -1,20 +1,20 @@
-version: "3.9"
-
 services:
-  plagio-search:
-    build: .
-    container_name: plagio-search
-    command: >
-      uvicorn app.main_search:app
-      --host 0.0.0.0
-      --port 8001
-      --workers 2
-    environment:
-      - PLAGIO_ROOT=/runtime
-    volumes:
-      - ./runtime:/runtime
-    ports:
-      - "8001:8001"   # ← вернули
+  # plagio-search:
+  #   build: .
+  #   container_name: plagio-search
+  #   command: >
+  #     uvicorn app.main_search:app
+  #     --host 0.0.0.0
+  #     --port 8001
+  #     --workers 1
+  #   environment:
+  #     - PLAGIO_ROOT=/runtime
+  #   volumes:
+  #     - ./runtime:/runtime
+  #   ports:
+  #     - "8001:8001"
+  #   # 2 логических ядер только под поиск
+  #   cpuset: "0-1"
 
   plagio-ops:
     build: .
@@ -27,22 +27,26 @@ services:
     environment:
       - PLAGIO_ROOT=/runtime
       - PLAGIO_OCR_LANG=kaz+rus+eng
-      - PLAGIO_OCR_WORKERS=8
+      # 14 OCR-потоков — ровно под выделенные ядра
+      - PLAGIO_OCR_WORKERS=16
     volumes:
       - ./runtime:/runtime
     ports:
-      - "8002:8002"   # ← вернули
+      - "8002:8002"
+    # 14 логических ядер только под загрузку/OCR
+    cpuset: "0-15"
 
-  nginx:
-    image: nginx:alpine
-    container_name: plagio-nginx
-    depends_on:
-      - plagio-search
-      - plagio-ops
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-    ports:
-      - "8000:80"
+
+  # nginx:
+  #   image: nginx:alpine
+  #   container_name: plagio-nginx
+  #   depends_on:
+  #     - plagio-search
+  #     - plagio-ops
+  #   volumes:
+  #     - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+  #   ports:
+  #     - "8000:80"
 
 
 
