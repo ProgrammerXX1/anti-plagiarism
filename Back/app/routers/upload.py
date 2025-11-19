@@ -6,6 +6,7 @@ from ..core.runtime_cfg import get_runtime_cfg
 import orjson
 from fastapi import APIRouter, UploadFile, File, HTTPException, Query
 from fastapi.responses import Response
+from pathlib import Path
 
 from ..core.config import (
     CORPUS_JSONL,
@@ -70,6 +71,8 @@ def _ingest_single(
     save_docx: bool,
     ocr: bool,
     ocr_mode: str,
+    title: str | None = None,
+    author: str | None = None,
 ) -> Dict[str, Any]:
     """
     Общий пайплайн для одного файла.
@@ -136,19 +139,38 @@ def _ingest_single(
     if not text.strip():
         raise HTTPException(400, "empty text after extraction")
 
+    if not title:
+        base_name = Path(fname).name if fname else ""
+        if "." in base_name:
+            title = base_name.rsplit(".", 1)[0]
+        else:
+            title = base_name or ""
+
+    if author is None:
+        author = ""
+
     # 3) запись в корпус
     CORPUS_JSONL.parent.mkdir(parents=True, exist_ok=True)
     doc_id = f"doc_{hashlib.sha256(text.encode('utf-8')).hexdigest()[:8]}"
 
     with file_lock(CORPUS_JSONL.with_suffix(".lock")):
         with open(CORPUS_JSONL, "ab") as f:
-            f.write(orjson.dumps({"doc_id": doc_id, "text": text}) + b"\n")
+            f.write(orjson.dumps(
+                {
+                    "doc_id": doc_id,
+                    "text": text,
+                    "title": title,
+                    "author": author,
+                }        
+            ) + b"\n")
 
     toks = simple_tokens(text)
 
     return {
         "doc_id": doc_id,
         "filename": fname,
+        "title": title,
+        "author": author,
         "bytes": len(raw),
         "tokens": len(toks),
     }
@@ -180,6 +202,14 @@ async def upload_file(
         pattern="^(speed|balanced|quality)$",
         description="OCR режим: speed / balanced / quality",
     ),
+    title: str | None = Query(
+        None,
+        description="Название документа (если не указано — берётся из имени файла)",
+    ),
+    author: str | None = Query(
+        None,
+        description="Автор документа (если не указано — пустая строка)",
+    ),
 ):
     fname = (file.filename or "").lower()
     raw = await file.read()
@@ -191,8 +221,11 @@ async def upload_file(
         save_docx=save_docx,
         ocr=ocr,
         ocr_mode=ocr_mode,
+        title=title,
+        author=author,
     )
     return result
+
 
 # ---------- массовая загрузка из ZIP ----------
 
@@ -225,6 +258,7 @@ async def upload_zip(
     processed = 0
 
     for info in zf.infolist():
+        name = info.filename.rsplit("/", 1)[-1]
         # пропускаем директории и системный мусор
         if info.is_dir():
             continue
@@ -254,6 +288,8 @@ async def upload_zip(
                 save_docx=save_docx,
                 ocr=ocr,
                 ocr_mode=ocr_mode,
+                title=None,   # возьмётся из имени файла
+                author=None,  # пустой
             )
             processed += 1
             items.append(res)

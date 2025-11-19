@@ -221,15 +221,26 @@ def search(index: Dict[str, Any], qtext: str, top: int = 5) -> Dict[str, Any]:
 
     docs=[]
     for h in kept:
+        did = h["doc_id"]
+        meta = index["docs_meta"].get(did, {})
         docs.append({
-            "doc_id": h["doc_id"],
-            "max_score": h["score"],
-            "originality_pct": round((1.0 - min(max(h["score"],0.0),1.0))*100.0,1),
-            "decision": decide(h["score"]),
-            "details": h
-        })
-    return {"hits_total": len(scored), "docs_found": len(docs), "documents": docs}
+        "doc_id": did,
+        "title": meta.get("title"),
+        "author": meta.get("author"),
+        "max_score": h["score"],
+        "originality_pct": round(
+            (1.0 - min(max(h["score"], 0.0), 1.0)) * 100.0,
+            1,
+        ),
+        "decision": decide(h["score"]),
+        "details": h,
+    })
 
+    return {
+        "hits_total": len(scored),
+        "docs_found": len(docs),
+        "documents": docs,
+    }
 # ── cache/load ────────────────────────────────────────────────────────────────
 _INDEX_CACHE = None
 

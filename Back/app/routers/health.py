@@ -49,8 +49,10 @@ def corpus_text(
         raise HTTPException(404, f"doc_id not found in corpus: {doc_id}")
 
     text = found.get("text", "") or ""
+    title = found.get("title")
+    author = found.get("author")
+
     if as_plain:
-        # голый текст, удобно для просмотра результата OCR
         return Response(
             content=text,
             media_type="text/plain; charset=utf-8"
@@ -59,12 +61,13 @@ def corpus_text(
     toks = simple_tokens(text)
     return {
         "doc_id": doc_id,
+        "title": title,
+        "author": author,
         "line_no": line_no,
         "chars": len(text),
         "tokens": len(toks),
         "text": text,
     }
-
 
 # ---------- corpus list ----------
 
@@ -106,10 +109,12 @@ def corpus_list(
         text = obj.get("text", "")
         toks = simple_tokens(text)
         rec = {
-            "doc_id": obj["doc_id"],
-            "line_no": obj.get("_line_no"),
-            "chars": len(text),
-            "tokens": len(toks),
+                "doc_id": obj["doc_id"],
+                "title": obj.get("title"),
+                "author": obj.get("author"),
+                "line_no": obj.get("_line_no"),
+                "chars": len(text),
+                "tokens": len(toks),
         }
         if preview and max_preview_chars > 0:
             p = text[:max_preview_chars].replace("\n", " ")

@@ -66,6 +66,8 @@ def build_index_json(cfg: Dict[str, Any] | None = None) -> Dict[str, Any]:
             doc = json.loads(line)
             did = doc.get("doc_id")
             raw_text = doc.get("text", "")
+            title = doc.get("title")
+            author = doc.get("author")
 
             # нормализация
             toks = clean_spaces_punct(normalize_nfkc_lower(raw_text)).split()
@@ -115,10 +117,15 @@ def build_index_json(cfg: Dict[str, Any] | None = None) -> Dict[str, Any]:
                     bucket.append(did)
 
             # метаданные
-            docs_meta[did] = {
+            meta: Dict[str, Any] = {
                 "tok_len": len(toks),
                 "simhash128": simhash128(toks),
             }
+            if title is not None:
+                meta["title"] = title
+            if author is not None:
+                meta["author"] = author
+            docs_meta[did] = meta
 
             kept_docs += 1
             if progress_every and kept_docs % progress_every == 0:

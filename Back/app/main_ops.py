@@ -2,6 +2,7 @@
 from fastapi import FastAPI
 from fastapi.responses import ORJSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from .core.logger import logger 
 
 from .routers import upload, config_runtime, health  # upload = твой "Operations" router
 
@@ -17,7 +18,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
+logger.info("=== main_ops started ===") 
 # тяжёлые штуки: OCR, загрузка, билд индекса, corpus list/text
 app.include_router(upload.router)
 app.include_router(config_runtime.router)

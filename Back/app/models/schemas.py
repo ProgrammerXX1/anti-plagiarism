@@ -34,10 +34,13 @@ class HitDetails(BaseModel):
 
 class Hit(BaseModel):
     doc_id: str
+    title: str | None = None
+    author: str | None = None
     max_score: float
     originality_pct: float
     decision: str
     details: HitDetails
+
 
 class SearchResp(BaseModel):
     hits_total: int

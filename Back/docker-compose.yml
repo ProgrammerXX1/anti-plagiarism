@@ -1,20 +1,20 @@
 services:
-  # plagio-search:
-  #   build: .
-  #   container_name: plagio-search
-  #   command: >
-  #     uvicorn app.main_search:app
-  #     --host 0.0.0.0
-  #     --port 8001
-  #     --workers 1
-  #   environment:
-  #     - PLAGIO_ROOT=/runtime
-  #   volumes:
-  #     - ./runtime:/runtime
-  #   ports:
-  #     - "8001:8001"
-  #   # 2 логических ядер только под поиск
-  #   cpuset: "0-1"
+  plagio-search:
+    build: .
+    container_name: plagio-search
+    command: >
+      uvicorn app.main_search:app
+      --host 0.0.0.0
+      --port 8001
+      --workers 1
+    environment:
+      - PLAGIO_ROOT=/runtime
+    volumes:
+      - ./runtime:/runtime
+    ports:
+      - "8001:8001"
+    # 2 логических ядер только под поиск
+    cpuset: "0-15"
 
   plagio-ops:
     build: .
