@@ -2,7 +2,6 @@
 #include "search_core.h"
 
 #include <vector>
-#include <unordered_map>
 #include <string>
 #include <mutex>
 #include <algorithm>
@@ -20,6 +19,7 @@ namespace {
 
 struct DocMeta {
     std::uint32_t tok_len;
+    std::uint32_t bm25_len;   // пока не используем, но оставим на будущее под BM25
     std::uint64_t simhash_hi;
     std::uint64_t simhash_lo;
 };
@@ -30,14 +30,20 @@ struct Config {
 
     double alpha = 0.60;
     double w13   = 0.85;
-    double w9    = 0.90;  // оставлено для совместимости с config, но не используется
+    double w9    = 0.90;  // чисто для совместимости с config, в расчётах не участвует
 
     double plag_thr    = 0.70;
     double partial_thr = 0.30;
 
-    double simhash_bonus = 0.0;  // сейчас не используется
+    double simhash_bonus = 0.0;  // не используем пока
     int    fetch_per_k   = 64;
     int    max_cands_doc = 1000;
+};
+
+// компактная структура postings k=13
+struct Posting13 {
+    std::uint64_t h;   // hash шингла k=13
+    std::uint32_t did; // doc_id_int
 };
 
 std::once_flag g_init_flag;
@@ -47,8 +53,8 @@ Config g_cfg;
 
 // doc_id_int → Meta
 std::vector<DocMeta> g_docs;
-// hash -> [doc_id_int] — ТОЛЬКО k=13
-std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> g_inv13;
+// ПЛОСКИЙ массив postings k=13, отсортированный по h (и did)
+std::vector<Posting13> g_post13;
 // doc_id_int → doc_id (строка)
 std::vector<std::string> g_doc_ids;
 
@@ -70,6 +76,33 @@ static inline void jc_compute(
     if (u <= 0) u = 1;
     J = static_cast<double>(inter) / static_cast<double>(u);
     C = static_cast<double>(inter) / static_cast<double>(q_size);
+}
+
+// поиск диапазона postings для данного hash13 через lower/upper_bound
+static inline std::pair<std::size_t, std::size_t> find_postings13_range(std::uint64_t h) {
+    if (g_post13.empty()) return {0, 0};
+
+    auto lower = std::lower_bound(
+        g_post13.begin(),
+        g_post13.end(),
+        h,
+        [](const Posting13& p, std::uint64_t value) {
+            return p.h < value;
+        }
+    );
+    if (lower == g_post13.end() || lower->h != h) {
+        return {0, 0};
+    }
+    auto upper = std::upper_bound(
+        lower,
+        g_post13.end(),
+        h,
+        [](std::uint64_t value, const Posting13& p) {
+            return value < p.h;
+        }
+    );
+    return {static_cast<std::size_t>(lower - g_post13.begin()),
+            static_cast<std::size_t>(upper - g_post13.begin())};
 }
 
 // читаем index_config.json из каталога индекса
@@ -97,7 +130,7 @@ static Config load_config_from_json(const std::string& index_dir) {
         auto w = j["weights"];
         if (w.contains("alpha")) cfg.alpha = w["alpha"].get<double>();
         if (w.contains("w13"))   cfg.w13   = w["w13"].get<double>();
-        if (w.contains("w9"))    cfg.w9    = w["w9"].get<double>(); // не используем в расчётах
+        if (w.contains("w9"))    cfg.w9    = w["w9"].get<double>(); // не используем
     }
     if (j.contains("thresholds")) {
         auto t = j["thresholds"];
@@ -116,21 +149,21 @@ static Config load_config_from_json(const std::string& index_dir) {
 
 // ── Загрузка индекса ─────────────────────────────────────────────────-
 //
-// Формат index_native.bin (совместимый, k=13-only):
+// Формат index_native.bin (k=13-only, совместим с твоим index_builder):
 //   magic[4] = "PLAG"
 //   u32 version = 1
 //   u32 N_docs
-//   u64 N_post9   (может быть 0; блок postings9 тогда отсутствует)
+//   u64 N_post9   (у тебя всегда 0)
 //   u64 N_post13
 //   [N_docs * (u32 tok_len, u64 simhash_hi, u64 simhash_lo)]
-//   [N_post9 * (u64 hash9, u32 doc_id_int)]    // опционально, можем пропустить
-//   [N_post13 * (u64 hash13, u32 doc_id_int)]  // грузим в g_inv13
+//   [N_post9 * (u64 hash9, u32 doc_id_int)]         // 0 записей
+//   [N_post13 * (u64 hash13, u32 doc_id_int)]       // читаем в g_post13, потом sort
 //
 extern "C" int se_load_index(const char* index_dir_utf8) {
     std::call_once(g_init_flag, [&]() {
         g_index_loaded = false;
         g_docs.clear();
-        g_inv13.clear();
+        g_post13.clear();
         g_doc_ids.clear();
 
         std::string dir = index_dir_utf8 ? std::string(index_dir_utf8) : std::string(".");
@@ -164,9 +197,8 @@ extern "C" int se_load_index(const char* index_dir_utf8) {
             return;
         }
 
-        // Sanity-check, чтобы не раздувать память, если заголовок битый
-        const std::uint64_t MAX_DOCS      = 100000000ULL;   // 1e8
-        const std::uint64_t MAX_POSTINGS  = 5000000000ULL;  // 5e9
+        const std::uint64_t MAX_DOCS     = 100000000ULL;   // 1e8
+        const std::uint64_t MAX_POSTINGS = 5000000000ULL;  // 5e9
 
         if (N_docs == 0 || N_docs > MAX_DOCS) {
             std::cerr << "[se_load_index] suspicious N_docs=" << N_docs << ", abort\n";
@@ -189,10 +221,11 @@ extern "C" int se_load_index(const char* index_dir_utf8) {
                 std::cerr << "[se_load_index] truncated docs_meta\n";
                 return;
             }
+            dm.bm25_len = dm.tok_len; // пока копируем, под BM25 пригодится
             g_docs[i] = dm;
         }
 
-        // postings k9 — просто ПРОПУСКАЕМ, не грузим в память
+        // postings k9 — просто пропускаем, их нет (N_post9=0), но код оставим
         for (std::uint64_t i = 0; i < N_post9; ++i) {
             std::uint64_t h;
             std::uint32_t did;
@@ -204,11 +237,9 @@ extern "C" int se_load_index(const char* index_dir_utf8) {
             }
         }
 
-        // postings k13 — грузим в g_inv13
-        g_inv13.clear();
-        if (N_post13 > 0) {
-            g_inv13.reserve(static_cast<std::size_t>(N_post13 / 4 + 1));
-        }
+        // postings k13 — читаем в плоский массив
+        g_post13.clear();
+        g_post13.reserve(static_cast<std::size_t>(N_post13));
 
         for (std::uint64_t i = 0; i < N_post13; ++i) {
             std::uint64_t h;
@@ -220,13 +251,23 @@ extern "C" int se_load_index(const char* index_dir_utf8) {
                 return;
             }
             if (did >= N_docs) {
-                // защитимся от битого doc_id_int
+                // защита от битых doc_id_int
                 continue;
             }
-            g_inv13[h].push_back(did);
+            g_post13.push_back(Posting13{h, did});
         }
 
         bin.close();
+
+        // сортируем postings по hash, потом по doc_id_int
+        std::sort(
+            g_post13.begin(),
+            g_post13.end(),
+            [](const Posting13& a, const Posting13& b) {
+                if (a.h != b.h) return a.h < b.h;
+                return a.did < b.did;
+            }
+        );
 
         // doc_ids
         std::ifstream dj(docids_path);
@@ -259,14 +300,14 @@ extern "C" int se_load_index(const char* index_dir_utf8) {
 
         g_index_loaded = true;
         std::cerr << "[se_load_index] loaded: docs=" << g_docs.size()
-                  << " inv13=" << g_inv13.size()
-                  << " (post9 skipped in RAM)\n";
+                  << " post13=" << g_post13.size()
+                  << " (flat postings, no unordered_map)\n";
     });
 
     return g_index_loaded ? 0 : -1;
 }
 
-// ── Поиск по тексту (ТОЛЬКО k=13) ────────────────────────────────────
+// ── Поиск по тексту (ТОЛЬКО k=13, postings плоские) ─────────────────────────
 
 extern "C" SeSearchResult se_search_text(
     const char* text_utf8,
@@ -306,13 +347,13 @@ extern "C" SeSearchResult se_search_text(
 
     const int fetch13 = std::min(cfg.fetch_per_k, qS13);
 
-    // кандидаты по k13
+    // кандидаты по k13: для первых fetch13 шинглов
     for (int i = 0; i < fetch13; ++i) {
-        auto h = s13[i];
-        auto it = g_inv13.find(h);
-        if (it == g_inv13.end()) continue;
-        const auto& lst = it->second;
-        for (auto did : lst) {
+        std::uint64_t h = s13[i];
+        auto [beg, end] = find_postings13_range(h);
+        if (beg == end) continue;
+        for (std::size_t idx = beg; idx < end; ++idx) {
+            std::uint32_t did = g_post13[idx].did;
             if (static_cast<int>(did) >= N_docs) continue;
             cand_hits[did] += 1;
             cand_mask[did] = 1;
@@ -362,16 +403,17 @@ extern "C" SeSearchResult se_search_text(
         }
     }
 
-    // уникальные шинглы запроса k13
+    // уникальные шинглы запроса k13 → пересечения по всем postings
     {
-        std::unordered_map<std::uint64_t, bool> seen;
-        seen.reserve(s13.size() * 2);
-        for (auto h : s13) {
-            if (seen[h]) continue;
-            seen[h] = true;
-            auto it = g_inv13.find(h);
-            if (it == g_inv13.end()) continue;
-            for (auto did : it->second) {
+        std::vector<std::uint64_t> uniq = s13;
+        std::sort(uniq.begin(), uniq.end());
+        uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+
+        for (auto h : uniq) {
+            auto [beg, end] = find_postings13_range(h);
+            if (beg == end) continue;
+            for (std::size_t idx = beg; idx < end; ++idx) {
+                std::uint32_t did = g_post13[idx].did;
                 if (static_cast<int>(did) < N_docs && is_cand[did]) {
                     inter13[did] += 1;
                 }

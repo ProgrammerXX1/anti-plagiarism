@@ -1,53 +1,52 @@
-import hashlib, io, os, json, re, zipfile
-from collections import deque
+import hashlib
+import io
+import os
+import json
+import zipfile
 from typing import Iterator, Dict, Any, List, Tuple, Set
+
+import orjson
+import subprocess
+
+from pathlib import Path
+
+from fastapi import APIRouter, UploadFile, File, HTTPException, Query
 
 from ..core.runtime_cfg import get_runtime_cfg
 from ..core.memlog import log_mem
-import subprocess
-
-import orjson
-from fastapi import APIRouter, UploadFile, File, HTTPException, Query
-from fastapi.responses import Response
-from pathlib import Path
 
 from ..core.config import (
     CORPUS_JSONL,
     INDEX_JSON,
     UPLOAD_DIR,
-    OCR_LANG_DEFAULT,
-    OCR_WORKERS_DEFAULT,
 )
-
-
 from ..core.io_utils import file_lock
 from ..core.logger import logger
 
-from ..services.indexing.index_build import build_index_json
-from ..services.search.index_search import (
-    clear_index_cache,
-    get_index_cached,
-    load_index,
-    load_index_cached,
-)
-from ..services.helpers.normalizer import normalize_for_shingles, simple_tokens
 from ..services.converters.pdf_heavy import extract_and_normalize_pdf
 from ..services.converters.pdf_convert import smart_pdf_to_docx
 from ..services.converters.docx_utils import extract_docx_text
+from ..services.helpers.normalizer import simple_tokens
 
 router = APIRouter(prefix="/api", tags=["Operations"])
 
 INDEX_NATIVE_META = INDEX_JSON.parent / "index_native_meta.json"
 
-# --- optional parsers ---
-try:
-    from docx import Document
-except Exception:
-    Document = None
-# ------------------------
-
 
 # ---------- helpers ----------
+def _iter_jsonl(path) -> Iterator[Dict[str, Any]]:
+    with open(path, "r", encoding="utf-8") as f:
+        for i, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if "doc_id" in obj and "text" in obj:
+                    obj["_line_no"] = i
+                    yield obj
+            except json.JSONDecodeError:
+                continue
 
 def _chunked(seq, size: int):
     """Разбивает последовательность на куски по size."""
@@ -66,12 +65,12 @@ def _build_native_index() -> None:
     """
     Строит C++-индекс через бинарь `index_builder`.
 
-    Ожидаемый CLI (подправь под свой index_builder.cpp, если отличается):
+    Ожидаемый CLI:
         index_builder <corpus_jsonl> <index_dir>
 
     Где:
       - corpus_jsonl = CORPUS_JSONL
-      - index_dir    = директория, в которой лежит index.json
+      - index_dir    = директория, в которой лежат index_native.* файлы
     """
     index_dir = INDEX_JSON.parent
     index_dir.mkdir(parents=True, exist_ok=True)
@@ -103,18 +102,6 @@ def _build_native_index() -> None:
 
     log_mem("[index_build] native: after index_builder")
     logger.info("[index_build] NATIVE done")
-
-
-def _docx_to_text(raw: bytes) -> str:
-    if Document is None:
-        raise HTTPException(500, "python-docx not installed")
-    f = io.BytesIO(raw)
-    doc = Document(f)
-    parts = [p.text for p in doc.paragraphs if p.text]
-    for tbl in doc.tables:
-        for row in tbl.rows:
-            parts.append(" ".join(c.text for c in row.cells if c.text))
-    return "\n".join(parts)
 
 
 def _guess_ext(fname: str) -> str:
@@ -150,10 +137,19 @@ def _collect_corpus_stats() -> Tuple[int, Set[str]]:
                 ids.add(did)
     return lines, ids
 
+
 def _collect_index_ids_safe() -> Set[str]:
     """
     doc_id из C++ мета-файла index_native_meta.json, если он есть и валиден.
-    Python index.json больше не используем.
+
+    Текущий формат meta в index_native_export.py:
+        {
+            "docs_meta": { "<doc_id>": { ... }, ... },
+            "config": { ... }
+        }
+
+    Также поддерживаем старый формат:
+        { "docs": [ {"doc_id": "...", ...}, ... ] }
     """
     if not INDEX_NATIVE_META.exists():
         return set()
@@ -164,15 +160,23 @@ def _collect_index_ids_safe() -> Set[str]:
     except Exception:
         return set()
 
-    # ожидаем что в meta есть либо "docs", либо "docs_meta"
-    docs = meta.get("docs") or meta.get("docs_meta") or []
     ids: Set[str] = set()
-    for d in docs:
-        did = d.get("doc_id")
-        if isinstance(did, str):
-            ids.add(did)
-    return ids
 
+    # новый формат
+    docs_meta = meta.get("docs_meta")
+    if isinstance(docs_meta, dict):
+        ids.update(str(did) for did in docs_meta.keys())
+
+    # старый формат (на всякий случай)
+    docs = meta.get("docs")
+    if isinstance(docs, list):
+        for d in docs:
+            if isinstance(d, dict):
+                did = d.get("doc_id")
+                if isinstance(did, str):
+                    ids.add(did)
+
+    return ids
 
 
 def _ingest_single(
@@ -190,12 +194,12 @@ def _ingest_single(
 ) -> Dict[str, Any]:
     """
     Общий пайплайн для одного файла.
-    Возвращает dict с doc_id, токенами и пр.
 
-    Нормализацию для шинглов сейчас делаем ТОЛЬКО в C++-части (index_builder / search_core),
-    поэтому здесь normalize принудительно отключаем.
+    Нормализацию для шинглов сейчас делаем ТОЛЬКО в C++-части
+    (index_builder / search_core), поэтому здесь normalize принудительно
+    выключен.
     """
-    # временно полностью отключаем Python-нормализацию — всё делает C++
+    # Python-нормализация полностью выключена — всё делает C++
     normalize = False
 
     prefix = ""
@@ -208,7 +212,6 @@ def _ingest_single(
     ocr_workers = rt_cfg.ocr.workers
 
     ctype_guess = _guess_ext(fname)
-    text: str
 
     logger.info(
         "%s[ingest_single] start fname=%s, ext=%s, bytes=%d, normalize=%s, save_docx=%s, ocr=%s, ocr_mode=%s",
@@ -234,7 +237,7 @@ def _ingest_single(
             raise HTTPException(500, str(e))
 
     elif ctype_guess == "pdf":
-        # heavy PDF normalize for indexing (OCR, layout и т.п., НЕ шингловая нормализация)
+        # heavy PDF extract (OCR / layout), НЕ шингловая нормализация
         try:
             text = extract_and_normalize_pdf(
                 raw,
@@ -272,10 +275,6 @@ def _ingest_single(
         logger.error("%s[ingest_single] unsupported extension fname=%s", prefix, fname)
         raise HTTPException(400, f"unsupported file extension: {fname or 'unknown'}")
 
-    # 2) шингловая нормализация отключена в Python:
-    # if normalize:
-    #     text = normalize_for_shingles(text)
-
     if not text.strip():
         logger.warning("%s[ingest_single] empty text after extraction fname=%s", prefix, fname)
         raise HTTPException(400, "empty text after extraction")
@@ -294,7 +293,8 @@ def _ingest_single(
     CORPUS_JSONL.parent.mkdir(parents=True, exist_ok=True)
     doc_id = f"doc_{hashlib.sha256(text.encode('utf-8')).hexdigest()[:8]}"
 
-    with file_lock(CORPUS_JSONL.with_suffix(".lock")):
+    lock_path = CORPUS_JSONL.with_suffix(".lock")
+    with file_lock(lock_path):
         with open(CORPUS_JSONL, "ab") as f:
             f.write(
                 orjson.dumps(
@@ -308,7 +308,7 @@ def _ingest_single(
                 + b"\n"
             )
 
-    # токены считаем по сырым (для статистики, не для шинглов)
+    # токены считаем по сырым (для статистики)
     toks = simple_tokens(text)
 
     logger.info(
@@ -330,21 +330,6 @@ def _ingest_single(
         "bytes": len(raw),
         "tokens": len(toks),
     }
-
-
-def _iter_jsonl(path) -> Iterator[Dict[str, Any]]:
-    with open(path, "r", encoding="utf-8") as f:
-        for i, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-                if "doc_id" in obj and "text" in obj:
-                    obj["_line_no"] = i
-                    yield obj
-            except json.JSONDecodeError:
-                continue
 
 
 # ---------- routes ----------
@@ -480,7 +465,6 @@ async def upload_zip_admin(
     )
     log_mem("upload_zip_admin: start")
 
-    # ---------- Параметры отображения ----------
     def _short(name: str, maxlen: int = 30) -> str:
         """Обрезка длинных имён для логов."""
         return name if len(name) <= maxlen else name[:27] + "..."
@@ -692,13 +676,14 @@ def corpus_cleanup(
     if delete_all:
         log_mem("corpus_cleanup: delete_all")
 
-        removed: list[str] = []
+        removed: List[str] = []
         for p in (
-        CORPUS_JSONL,
-        INDEX_JSON,          # старый Python-индекс, можно оставить для совместимости
-        INDEX_NATIVE_META,
-        INDEX_JSON.parent / "index_native.bin",
-    ):
+            CORPUS_JSONL,
+            INDEX_JSON,               # старый Python-индекс (на всякий случай)
+            INDEX_NATIVE_META,
+            INDEX_JSON.parent / "index_native.bin",
+            INDEX_JSON.parent / "index_native_docids.json",
+        ):
             if p.exists():
                 try:
                     os.remove(p)
@@ -706,13 +691,91 @@ def corpus_cleanup(
                 except OSError as e:
                     raise HTTPException(500, f"cannot remove {p.name}: {e}")
 
-        clear_index_cache()  # можно оставить, ничего плохого не сделает
-
         logger.info("[corpus_cleanup] delete_all removed=%s", removed)
         log_mem("corpus_cleanup: delete_all done")
         return {
-        "status": "ok",
-        "mode": "all",
-        "removed": removed,
-    }
+            "status": "ok",
+            "mode": "all",
+            "removed": removed,
+        }
 
+    # ===================== ТОЛЬКО НЕИНДЕКСИРОВАННЫЕ =====================
+    log_mem("corpus_cleanup: unindexed_only")
+
+    corpus_lines_before, corpus_ids = _collect_corpus_stats()
+    index_ids = _collect_index_ids_safe()
+    unindexed = corpus_ids - index_ids
+
+    if not CORPUS_JSONL.exists() or not corpus_ids:
+        logger.info("[corpus_cleanup] nothing to clean: corpus empty")
+        return {
+            "status": "ok",
+            "mode": "unindexed",
+            "corpus_lines_before": corpus_lines_before,
+            "corpus_docs_before": len(corpus_ids),
+            "indexed_docs": len(index_ids),
+            "unindexed_docs": len(unindexed),
+            "corpus_lines_after": 0,
+            "corpus_docs_after": 0,
+        }
+
+    if not unindexed:
+        logger.info(
+            "[corpus_cleanup] nothing to remove: all docs are indexed (corpus_docs=%d)",
+            len(corpus_ids),
+        )
+        return {
+            "status": "ok",
+            "mode": "unindexed",
+            "corpus_lines_before": corpus_lines_before,
+            "corpus_docs_before": len(corpus_ids),
+            "indexed_docs": len(index_ids),
+            "unindexed_docs": 0,
+            "corpus_lines_after": corpus_lines_before,
+            "corpus_docs_after": len(corpus_ids),
+        }
+
+    # переписываем corpus.jsonl, оставляя только doc_id, которые есть в index_ids
+    lock_path = CORPUS_JSONL.with_suffix(".lock")
+    kept_lines = 0
+    kept_docs: Set[str] = set()
+
+    tmp_path = CORPUS_JSONL.with_suffix(".tmp")
+
+    with file_lock(lock_path):
+        with open(CORPUS_JSONL, "r", encoding="utf-8") as src, open(
+            tmp_path, "w", encoding="utf-8"
+        ) as dst:
+            for line in src:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    obj = json.loads(s)
+                except Exception:
+                    continue
+                did = obj.get("doc_id")
+                if isinstance(did, str) and did in index_ids:
+                    dst.write(line)
+                    kept_lines += 1
+                    kept_docs.add(did)
+
+        os.replace(tmp_path, CORPUS_JSONL)
+
+    logger.info(
+        "[corpus_cleanup] unindexed_only: removed=%d, kept=%d",
+        len(unindexed),
+        kept_lines,
+    )
+    log_mem("corpus_cleanup: unindexed_only done")
+
+    return {
+        "status": "ok",
+        "mode": "unindexed",
+        "corpus_lines_before": corpus_lines_before,
+        "corpus_docs_before": len(corpus_ids),
+        "indexed_docs": len(index_ids),
+        "unindexed_docs": len(unindexed),
+        "corpus_lines_after": kept_lines,
+        "corpus_docs_after": len(kept_docs),
+    }

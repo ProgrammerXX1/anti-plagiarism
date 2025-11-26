@@ -1,25 +1,94 @@
+import json
+from typing import Dict, Any, List
+
+from fastapi import APIRouter, HTTPException, Query, UploadFile, File
+from fastapi.responses import Response
+
 from ..routers.upload import _iter_jsonl
 from ..core.config import CORPUS_JSONL, INDEX_JSON, MANIFEST_JSON
-from collections import deque
-from typing import Dict, Any, List
 from ..core.runtime_cfg import get_runtime_cfg
-from fastapi import APIRouter, UploadFile, File, HTTPException, Query, logger
-from fastapi.responses import Response
+from ..core.logger import logger
 from ..services.helpers.normalizer import simple_tokens
 from ..services.converters.pdf_convert import smart_pdf_to_docx
-from ..services.search.index_search import load_index, load_index_cached
-
 
 router = APIRouter(prefix="/api", tags=["Base"])
 
+# meta-файл C++-индекса рядом с index.json (используем только как директорию)
+INDEX_NATIVE_META = INDEX_JSON.parent / "index_native_meta.json"
+
+
+# ---------- helpers ----------
+
+def _load_index_stats() -> tuple[int, int]:
+    """
+    Возвращает (indexed_docs, k13).
+
+    Читает ТОЛЬКО C++ meta: index_native_meta.json.
+    Ожидаемый формат (примерно):
+    {
+      "docs": [
+        {"doc_id": "doc_xxx", ...},
+        ...
+      ],
+      "stats": {
+        "k13": 123456,
+        ...
+      }
+    }
+    или вместо "docs" может быть "docs_meta".
+    Если файла нет или формат неожиданный — вернёт (0, 0).
+    """
+    if not INDEX_NATIVE_META.exists():
+        return 0, 0
+
+    try:
+        with open(INDEX_NATIVE_META, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except Exception as e:
+        logger.error("[_load_index_stats] failed to read INDEX_NATIVE_META: %s", e)
+        return 0, 0
+
+    # docs / docs_meta могут быть либо списком, либо dict — учитываем оба варианта
+    docs = meta.get("docs") or meta.get("docs_meta") or []
+    indexed = 0
+    if isinstance(docs, list):
+        indexed = sum(1 for d in docs if isinstance(d, dict) and d.get("doc_id"))
+    elif isinstance(docs, dict):
+        indexed = sum(1 for _ in docs.keys())
+
+    # k13 из stats или из корня meta
+    stats = meta.get("stats") or {}
+    k13_raw = (
+        stats.get("k13")
+        or stats.get("k13_unique")
+        or meta.get("k13")
+        or meta.get("k13_unique")
+        or 0
+    )
+    try:
+        k13 = int(k13_raw)
+    except (TypeError, ValueError):
+        k13 = 0
+
+    return indexed, k13
+
+
+# ---------- health ----------
+
 @router.get("/health")
 def health():
+    """
+    Простейший health-check по файлам корпуса/индекса.
+    """
     return {
         "corpus_exists": CORPUS_JSONL.exists(),
-        "index_exists": INDEX_JSON.exists(),
+        "index_native_meta_exists": INDEX_NATIVE_META.exists(),
         "manifest_exists": MANIFEST_JSON.exists(),
-        "index_path": str(INDEX_JSON)
+        "index_native_meta_path": str(INDEX_NATIVE_META),
     }
+
+
+# ---------- corpus text ----------
 
 @router.get("/corpus/text")
 def corpus_text(
@@ -115,13 +184,12 @@ def corpus_list(
     """
     Список документов из corpus.jsonl с пагинацией.
     Плюс:
-      - index: сколько документов сейчас проиндексировано (по docs_meta из index.json)
-      - k5/k9/k13: сколько уникальных шинглов сейчас в индексе
+      - index: сколько документов сейчас проиндексировано в C++-индексе
+      - k13: сколько уникальных шинглов k=13 (по данным C++)
     """
     if not CORPUS_JSONL.exists():
         raise HTTPException(404, "corpus.jsonl not found")
 
-    # собираем с пагинацией
     items: List[Dict[str, Any]] = []
     total = 0
 
@@ -130,7 +198,8 @@ def corpus_list(
         if total <= offset:
             continue
         if len(items) >= limit:
-            continue  # не прерываем, чтобы total был корректный
+            # не прерываем цикл, чтобы total был корректный
+            continue
 
         text = obj.get("text", "") or ""
         toks = simple_tokens(text)
@@ -148,39 +217,12 @@ def corpus_list(
             }
         )
 
-    # статы индекса ─ читаем СВЕЖИЙ index.json, без кэша
-    indexed = 0
-    k5 = k9 = k13 = 0
-
-    try:
-        idx = load_index()  # важно: не load_index_cached()
-        docs_meta = idx.get("docs_meta") or {}
-        indexed = len(docs_meta)
-
-        inv = idx.get("inverted_doc") or {}
-        inv5 = inv.get("k5") or {}
-        inv9 = inv.get("k9") or {}
-        inv13 = inv.get("k13") or {}
-
-        k5 = len(inv5)
-        k9 = len(inv9)
-        k13 = len(inv13)
-
-    except FileNotFoundError:
-        # индекса ещё нет — всё по нулям
-        indexed = 0
-        k5 = k9 = k13 = 0
-    except Exception as e:
-        logger.error(f"[corpus_list] cannot load index: {e}")
-        indexed = 0
-        k5 = k9 = k13 = 0
+    indexed, k13 = _load_index_stats()
 
     return {
         "total": total,      # всего документов в corpus.jsonl
-        "index": indexed,    # сколько документов есть в index.json (docs_meta)
-        "k5": k5,            # уникальные шинглы k=5
-        "k9": k9,            # уникальные шинглы k=9
-        "k13": k13,          # уникальные шинглы k=13
+        "index": indexed,    # сколько документов есть в C++-индексе
+        "k13": k13,          # уникальные шинглы k=13 (по данным C++)
         "offset": offset,
         "limit": limit,
         "items": items,
@@ -216,12 +258,13 @@ async def convert_pdf_to_docx(
         )
     except Exception as e:
         raise HTTPException(500, f"convert failed: {e}")
+
     return Response(
         content=docx,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={
             "Content-Disposition": (
-                f'attachment; filename="{(file.filename or "file").rsplit(".",1)[0]}.docx"'
+                f'attachment; filename="{(file.filename or "file").rsplit(".", 1)[0]}.docx"'
             )
         },
     )
