@@ -1,0 +1,14 @@
+runtime/
+nginx/
+test/
+
+__pycache__/
+*.log
+*.pdf
+*.docx
+*.zip
+*.pptx
+
+.git/
+.idea/
+.vscode/

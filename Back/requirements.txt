@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+orjson
+python-multipart
+pillow
+python-docx
+pdf2docx
+pdfminer.six
+pdf2image
+pytesseract
+httpx
+
+# === SEMANTIC + EMBEDDER ===
+torch                         # ставится под нужную CUDA отдельно
+sentence-transformers>=2.6
+transformers>=4.40
+numpy>=1.24

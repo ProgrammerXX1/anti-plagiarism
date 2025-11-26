@@ -1,0 +1,49 @@
+# === Global ignores ===
+*.log
+*.pyc
+__pycache__/
+.DS_Store
+Thumbs.db
+.env
+*.env
+.vscode/
+.idea/
+*.swp
+
+# === Backend ===
+Back/.venv/
+Back/instance/
+Back/env/
+Back/.pdm.toml
+Back/.pdm.lock
+Back/.ruff_cache/
+Back/.cache/
+Back/.pytest_cache/
+Back/.mypy_cache/
+Back/runtime/
+Back/uploads/
+Back/logs/
+Back/tmp/
+Back/cache/
+Back/data/
+
+# HuggingFace / models
+Back/**/*.safetensors
+Back/**/*.bin
+Back/**/*.pt
+Back/**/*.onnx
+
+# === Frontend ===
+Front/node_modules/
+Front/build/
+Front/dist/
+Front/coverage/
+Front/.next/
+Front/.turbo/
+Front/.parcel-cache/
+Front/npm-debug.log
+Front/yarn-debug.log
+Front/yarn-error.log
+Front/pnpm-debug.log
+Front/.eslintcache
+Front/.env*

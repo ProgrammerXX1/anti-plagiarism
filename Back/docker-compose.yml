@@ -1,0 +1,42 @@
+services:
+  plagio-search:
+    build: .
+    container_name: plagio-search
+    command: >
+      uvicorn app.main_search:app
+      --host 0.0.0.0
+      --port 8001
+      --workers 1
+    environment:
+      - PLAGIO_ROOT=/runtime
+      - PLAGIO_SEMANTIC_URL=http://plagio-semantic:8003
+      - PLAGIO_USE_SEMANTIC_RERANK=false
+    volumes:
+      - ./runtime:/runtime
+    ports:
+      - "8001:8001"
+    mem_limit: 24g
+    memswap_limit: 24g 
+    cpuset: "0-7"     # только эти ядра
+    cpus: "8"          # поиск ~30%
+
+  plagio-ops:
+    build: .
+    container_name: plagio-ops
+    command: >
+      uvicorn app.main_ops:app
+      --host 0.0.0.0
+      --port 8002
+      --workers 1
+    environment:
+      - PLAGIO_ROOT=/runtime
+      - PLAGIO_OCR_LANG=kaz+rus+eng
+      - PLAGIO_OCR_WORKERS=12       # под 70% мощности — 12 потоков идеал
+    volumes:
+      - ./runtime:/runtime
+    ports:
+      - "8002:8002"
+    mem_limit: 80g
+    memswap_limit: 80g 
+    cpuset: "8-23"
+    cpus: "16"         # индекс ~70%

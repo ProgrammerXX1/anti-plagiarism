@@ -1,0 +1,15 @@
+{
+  "w_min_doc": 8,
+  "w_min_query": 9,
+  "weights": {
+    "alpha": 0.60,
+    "w13": 0.85,
+    "w9": 0.90
+  },
+  "thresholds": {
+    "plag_thr": 0.70,
+    "partial_thr": 0.30
+  },
+  "fetch_per_k_doc": 64,
+  "max_cands_doc": 1000
+}
