@@ -79,38 +79,37 @@ def _load_doc_ids() -> List[str]:
 
 META_JSON = INDEX_DIR / "index_native_meta.json"
 
-def _load_meta_cfg() -> Dict[str, Any]:
+_meta_cache: Dict[str, Any] | None = None
+
+def _load_meta_cfg():
     global _meta_cache
     if _meta_cache is not None:
         return _meta_cache
-
-    path = META_JSON
-    with open(path, "rb") as f:
-        meta = orjson.loads(f.read() or b"{}")
-
-    # ожидаем уже структуру вида:
-    # { "docs_meta": {...}, "config": {...} }
-    meta.setdefault("docs_meta", {})
-    meta.setdefault("config", {})
-
-    _meta_cache = meta
-    return meta
+    if META_JSON.exists():
+        try:
+            with open(META_JSON, "r", encoding="utf-8") as f:
+                _meta_cache = orjson.loads(f.read())
+                return _meta_cache
+        except Exception as e:
+            logger.error(f"[search-native] meta broken: {e}")
+    # если меты нет, дефолты, но обязательно docs_meta пустой dict!
+    _meta_cache = {
+        "docs_meta": {},
+        "config": {},
+    }
+    return _meta_cache
 
 
 # ── API для FastAPI ─────────────────────────────────────────────────
 
 def native_load_index() -> None:
-    """
-    Вызываем при старте FastAPI (startup).
-    Поднимает C++-индекс и doc_ids.
-    """
     log_mem("[search-native] before se_load_index")
     rc = _lib.se_load_index(str(INDEX_DIR).encode("utf-8"))
     if rc != 0:
         raise RuntimeError(f"se_load_index failed: rc={rc}")
 
     _load_doc_ids()
-    _load_meta_cfg()
+    _load_meta_cfg()   # <==== ДОЛЖНО БЫТЬ
     log_mem("[search-native] after se_load_index + meta/doc_ids")
     logger.info("[search-native] C++ index loaded successfully")
 
@@ -143,8 +142,8 @@ def native_search(
 
     doc_ids = _load_doc_ids()
     meta_cfg = _load_meta_cfg()
-    docs_meta = meta_cfg["docs_meta"]
-    cfg = meta_cfg["config"] or {}
+    ocs_meta = meta_cfg.get("docs_meta") or {}
+    cfg = meta_cfg.get("config") or {}
 
     thresholds = (cfg.get("thresholds") or {})
     plag_thr = float(thresholds.get("plag_thr", 0.7))
@@ -178,7 +177,8 @@ def native_search(
         if allow is not None and did not in allow:
             continue
 
-        meta = docs_meta.get(did, {})
+        meta = ocs_meta.get(did, {})
+
 
         score = float(h.score)
         if score >= plag_thr:

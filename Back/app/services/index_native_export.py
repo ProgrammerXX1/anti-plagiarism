@@ -2,7 +2,7 @@
 import json
 import struct
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
 from ..core.config import INDEX_DIR, INDEX_JSON
 from ..core.logger import logger
@@ -14,29 +14,10 @@ VERSION = 1
 
 NATIVE_BIN = INDEX_DIR / "index_native.bin"
 DOCIDS_JSON = INDEX_DIR / "index_native_docids.json"
-
-
-def _split_simhash128(hex_str: str) -> tuple[int, int]:
-    """
-    simhash128 хранится как 32-символьная hex-строка.
-    Разбиваем на hi/lo по 64 бита.
-    """
-    if not hex_str:
-        return 0, 0
-    x = int(hex_str, 16) & ((1 << 128) - 1)
-    lo = x & ((1 << 64) - 1)
-    hi = (x >> 64) & ((1 << 64) - 1)
-    return hi, lo
-
-MAGIC = b"PLAG"
-VERSION = 1
-
-NATIVE_BIN = INDEX_DIR / "index_native.bin"
-DOCIDS_JSON = INDEX_DIR / "index_native_docids.json"
 META_JSON = INDEX_DIR / "index_native_meta.json"
 
 
-def _split_simhash128(hex_str: str) -> tuple[int, int]:
+def _split_simhash128(hex_str: str) -> Tuple[int, int]:
     """
     simhash128 хранится как 32-символьная hex-строка.
     Разбиваем на hi/lo по 64 бита.
@@ -61,7 +42,7 @@ def export_native_index() -> None:
         raise FileNotFoundError(f"index.json not found: {INDEX_JSON}")
 
     logger.info(f"[native-export] loading index from {INDEX_JSON}")
-    # здесь можно грузить тяжёлый index.json — это оффлайн-этап
+    # грузим тяжёлый index.json — это оффлайн-этап
     idx = load_index()  # уже валидированный и с нормализованным config
 
     docs_meta: Dict[str, Any] = idx["docs_meta"]
@@ -78,7 +59,7 @@ def export_native_index() -> None:
     doc2int: Dict[str, int] = {d: i for i, d in enumerate(doc_ids)}
 
     # собираем docs_meta для C++
-    docs_bin_meta: List[tuple[int, int, int]] = []
+    docs_bin_meta: List[Tuple[int, int, int]] = []
     for did in doc_ids:
         meta = docs_meta.get(did) or {}
         tok_len = int(meta.get("tok_len", 0))
@@ -87,7 +68,7 @@ def export_native_index() -> None:
         docs_bin_meta.append((tok_len, hi, lo))
 
     # postings k9/k13: "плоский" список (hash, doc_id_int)
-    post9: List[tuple[int, int]] = []
+    post9: List[Tuple[int, int]] = []
     for h_str, dlist in inv9.items():
         try:
             h = int(h_str)
@@ -99,7 +80,7 @@ def export_native_index() -> None:
                 continue
             post9.append((h, di))
 
-    post13: List[tuple[int, int]] = []
+    post13: List[Tuple[int, int]] = []
     for h_str, dlist in inv13.items():
         try:
             h = int(h_str)
@@ -112,7 +93,10 @@ def export_native_index() -> None:
             post13.append((h, di))
 
     logger.info(
-        f"[native-export] docs={N_docs}, post9={len(post9)}, post13={len(post13)}"
+        "[native-export] docs=%d, post9=%d, post13=%d",
+        N_docs,
+        len(post9),
+        len(post13),
     )
 
     # пишем binary
@@ -154,5 +138,8 @@ def export_native_index() -> None:
         json.dump(meta_out, f, ensure_ascii=False)
 
     logger.info(
-        f"[native-export] written {NATIVE_BIN}, {DOCIDS_JSON} and {META_JSON}"
+        "[native-export] written %s, %s and %s",
+        NATIVE_BIN,
+        DOCIDS_JSON,
+        META_JSON,
     )

@@ -30,12 +30,12 @@ struct Config {
 
     double alpha = 0.60;
     double w13   = 0.85;
-    double w9    = 0.90;
+    double w9    = 0.90;  // оставлено для совместимости с config, но не используется
 
     double plag_thr    = 0.70;
     double partial_thr = 0.30;
 
-    double simhash_bonus = 0.0;  // пока не используем simhash bonus
+    double simhash_bonus = 0.0;  // сейчас не используется
     int    fetch_per_k   = 64;
     int    max_cands_doc = 1000;
 };
@@ -47,8 +47,7 @@ Config g_cfg;
 
 // doc_id_int → Meta
 std::vector<DocMeta> g_docs;
-// hash -> [doc_id_int]
-std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> g_inv9;
+// hash -> [doc_id_int] — ТОЛЬКО k=13
 std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> g_inv13;
 // doc_id_int → doc_id (строка)
 std::vector<std::string> g_doc_ids;
@@ -75,7 +74,7 @@ static inline void jc_compute(
 
 // читаем index_config.json из каталога индекса
 static Config load_config_from_json(const std::string& index_dir) {
-    Config cfg; // дефолты как выше
+    Config cfg; // дефолты
 
     std::string path = index_dir + "/index_config.json";
     std::ifstream in(path);
@@ -98,7 +97,7 @@ static Config load_config_from_json(const std::string& index_dir) {
         auto w = j["weights"];
         if (w.contains("alpha")) cfg.alpha = w["alpha"].get<double>();
         if (w.contains("w13"))   cfg.w13   = w["w13"].get<double>();
-        if (w.contains("w9"))    cfg.w9    = w["w9"].get<double>();
+        if (w.contains("w9"))    cfg.w9    = w["w9"].get<double>(); // не используем в расчётах
     }
     if (j.contains("thresholds")) {
         auto t = j["thresholds"];
@@ -115,13 +114,22 @@ static Config load_config_from_json(const std::string& index_dir) {
 
 } // namespace
 
-// ── Загрузка индекса ──────────────────────────────────────────────────
-
+// ── Загрузка индекса ─────────────────────────────────────────────────-
+//
+// Формат index_native.bin (совместимый, k=13-only):
+//   magic[4] = "PLAG"
+//   u32 version = 1
+//   u32 N_docs
+//   u64 N_post9   (может быть 0; блок postings9 тогда отсутствует)
+//   u64 N_post13
+//   [N_docs * (u32 tok_len, u64 simhash_hi, u64 simhash_lo)]
+//   [N_post9 * (u64 hash9, u32 doc_id_int)]    // опционально, можем пропустить
+//   [N_post13 * (u64 hash13, u32 doc_id_int)]  // грузим в g_inv13
+//
 extern "C" int se_load_index(const char* index_dir_utf8) {
     std::call_once(g_init_flag, [&]() {
         g_index_loaded = false;
         g_docs.clear();
-        g_inv9.clear();
         g_inv13.clear();
         g_doc_ids.clear();
 
@@ -143,19 +151,34 @@ extern "C" int se_load_index(const char* index_dir_utf8) {
         }
 
         std::uint32_t version = 0;
-        std::uint32_t N_docs = 0;
-        std::uint64_t N_post9 = 0;
+        std::uint32_t N_docs  = 0;
+        std::uint64_t N_post9  = 0;
         std::uint64_t N_post13 = 0;
 
-        bin.read(reinterpret_cast<char*>(&version), sizeof(version));
-        bin.read(reinterpret_cast<char*>(&N_docs), sizeof(N_docs));
-        bin.read(reinterpret_cast<char*>(&N_post9), sizeof(N_post9));
+        bin.read(reinterpret_cast<char*>(&version),  sizeof(version));
+        bin.read(reinterpret_cast<char*>(&N_docs),   sizeof(N_docs));
+        bin.read(reinterpret_cast<char*>(&N_post9),  sizeof(N_post9));
         bin.read(reinterpret_cast<char*>(&N_post13), sizeof(N_post13));
         if (!bin || version != 1) {
             std::cerr << "[se_load_index] bad header or version\n";
             return;
         }
 
+        // Sanity-check, чтобы не раздувать память, если заголовок битый
+        const std::uint64_t MAX_DOCS      = 100000000ULL;   // 1e8
+        const std::uint64_t MAX_POSTINGS  = 5000000000ULL;  // 5e9
+
+        if (N_docs == 0 || N_docs > MAX_DOCS) {
+            std::cerr << "[se_load_index] suspicious N_docs=" << N_docs << ", abort\n";
+            return;
+        }
+        if (N_post13 > MAX_POSTINGS || N_post9 > MAX_POSTINGS) {
+            std::cerr << "[se_load_index] suspicious postings counts: "
+                      << "N_post9=" << N_post9 << " N_post13=" << N_post13 << ", abort\n";
+            return;
+        }
+
+        // docs_meta
         g_docs.resize(N_docs);
         for (std::uint32_t i = 0; i < N_docs; ++i) {
             DocMeta dm{};
@@ -169,44 +192,55 @@ extern "C" int se_load_index(const char* index_dir_utf8) {
             g_docs[i] = dm;
         }
 
-        g_inv9.clear();
-        g_inv13.clear();
-        g_inv9.reserve((std::size_t)N_post9 / 4 + 1);
-        g_inv13.reserve((std::size_t)N_post13 / 4 + 1);
-
+        // postings k9 — просто ПРОПУСКАЕМ, не грузим в память
         for (std::uint64_t i = 0; i < N_post9; ++i) {
             std::uint64_t h;
             std::uint32_t did;
-            bin.read(reinterpret_cast<char*>(&h), sizeof(h));
+            bin.read(reinterpret_cast<char*>(&h),   sizeof(h));
             bin.read(reinterpret_cast<char*>(&did), sizeof(did));
             if (!bin) {
                 std::cerr << "[se_load_index] truncated postings9\n";
                 return;
             }
-            g_inv9[h].push_back(did);
+        }
+
+        // postings k13 — грузим в g_inv13
+        g_inv13.clear();
+        if (N_post13 > 0) {
+            g_inv13.reserve(static_cast<std::size_t>(N_post13 / 4 + 1));
         }
 
         for (std::uint64_t i = 0; i < N_post13; ++i) {
             std::uint64_t h;
             std::uint32_t did;
-            bin.read(reinterpret_cast<char*>(&h), sizeof(h));
+            bin.read(reinterpret_cast<char*>(&h),   sizeof(h));
             bin.read(reinterpret_cast<char*>(&did), sizeof(did));
             if (!bin) {
                 std::cerr << "[se_load_index] truncated postings13\n";
                 return;
+            }
+            if (did >= N_docs) {
+                // защитимся от битого doc_id_int
+                continue;
             }
             g_inv13[h].push_back(did);
         }
 
         bin.close();
 
+        // doc_ids
         std::ifstream dj(docids_path);
         if (!dj) {
             std::cerr << "[se_load_index] cannot open " << docids_path << "\n";
             return;
         }
         json j;
-        dj >> j;
+        try {
+            dj >> j;
+        } catch (...) {
+            std::cerr << "[se_load_index] bad json in docids\n";
+            return;
+        }
         if (!j.is_array()) {
             std::cerr << "[se_load_index] docids json must be array\n";
             return;
@@ -220,19 +254,19 @@ extern "C" int se_load_index(const char* index_dir_utf8) {
             return;
         }
 
-        // грузим конфиг индекса
+        // конфиг индекса
         g_cfg = load_config_from_json(dir);
 
         g_index_loaded = true;
         std::cerr << "[se_load_index] loaded: docs=" << g_docs.size()
-                  << " inv9=" << g_inv9.size()
-                  << " inv13=" << g_inv13.size() << "\n";
+                  << " inv13=" << g_inv13.size()
+                  << " (post9 skipped in RAM)\n";
     });
 
     return g_index_loaded ? 0 : -1;
 }
 
-// ── Поиск по тексту ───────────────────────────────────────────────────
+// ── Поиск по тексту (ТОЛЬКО k=13) ────────────────────────────────────
 
 extern "C" SeSearchResult se_search_text(
     const char* text_utf8,
@@ -251,47 +285,27 @@ extern "C" SeSearchResult se_search_text(
     auto qtoks = simple_tokens(qnorm);
 
     const Config& cfg = g_cfg;
-    if ((int)qtoks.size() < cfg.w_min_query) {
+    if (static_cast<int>(qtoks.size()) < cfg.w_min_query) {
         return result;
     }
 
-    auto s9  = build_shingles(qtoks, 9);
+    // ТОЛЬКО k=13
     auto s13 = build_shingles(qtoks, 13);
-
-    const int qS9  = (int)s9.size();
-    const int qS13 = (int)s13.size();
-
-    if (qS9 <= 0 && qS13 <= 0) {
+    const int qS13 = static_cast<int>(s13.size());
+    if (qS13 <= 0) {
         return result;
     }
 
-    const int N_docs = (int)g_docs.size();
+    const int N_docs = static_cast<int>(g_docs.size());
     if (N_docs == 0) {
         return result;
     }
 
-    const int min_inter9  = (qS9 <= 8 ? 1 : 2);
-    const int min_inter13 = 1;
-
-    // cand_hits + флаг кандидата
-    std::vector<int> cand_hits(N_docs, 0);
+    std::vector<int>          cand_hits(N_docs, 0);
     std::vector<std::uint8_t> cand_mask(N_docs, 0);
 
-    const int fetch9  = std::min(cfg.fetch_per_k, qS9);
     const int fetch13 = std::min(cfg.fetch_per_k, qS13);
 
-    // кандидаты по k9
-    for (int i = 0; i < fetch9; ++i) {
-        auto h = s9[i];
-        auto it = g_inv9.find(h);
-        if (it == g_inv9.end()) continue;
-        const auto& lst = it->second;
-        for (auto did : lst) {
-            if ((int)did >= N_docs) continue;
-            cand_hits[did] += 1;
-            cand_mask[did] = 1;
-        }
-    }
     // кандидаты по k13
     for (int i = 0; i < fetch13; ++i) {
         auto h = s13[i];
@@ -299,14 +313,16 @@ extern "C" SeSearchResult se_search_text(
         if (it == g_inv13.end()) continue;
         const auto& lst = it->second;
         for (auto did : lst) {
-            if ((int)did >= N_docs) continue;
+            if (static_cast<int>(did) >= N_docs) continue;
             cand_hits[did] += 1;
             cand_mask[did] = 1;
         }
     }
 
     int cand_count = 0;
-    for (int i = 0; i < N_docs; ++i) if (cand_mask[i]) ++cand_count;
+    for (int i = 0; i < N_docs; ++i) {
+        if (cand_mask[i]) ++cand_count;
+    }
     if (cand_count == 0) {
         return result;
     }
@@ -319,11 +335,14 @@ extern "C" SeSearchResult se_search_text(
     cand_list.reserve(cand_count);
     for (int i = 0; i < N_docs; ++i) {
         if (cand_mask[i]) {
-            cand_list.push_back(CandTmp{(std::uint32_t)i, cand_hits[i]});
+            cand_list.push_back(CandTmp{
+                static_cast<std::uint32_t>(i),
+                cand_hits[i]
+            });
         }
     }
 
-    if ((int)cand_list.size() > cfg.max_cands_doc) {
+    if (static_cast<int>(cand_list.size()) > cfg.max_cands_doc) {
         std::nth_element(
             cand_list.begin(),
             cand_list.begin() + cfg.max_cands_doc,
@@ -335,30 +354,11 @@ extern "C" SeSearchResult se_search_text(
         cand_list.resize(cfg.max_cands_doc);
     }
 
-    // пересечения: hash -> docs → inter9/inter13 по кандидатам
-    std::vector<int> inter9(N_docs, 0);
-    std::vector<int> inter13(N_docs, 0);
-
-    // маска кандидатов
+    std::vector<int>          inter13(N_docs, 0);
     std::vector<std::uint8_t> is_cand(N_docs, 0);
     for (auto& c : cand_list) {
-        if ((int)c.did < N_docs) is_cand[c.did] = 1;
-    }
-
-    // уникальные шинглы запроса k9
-    {
-        std::unordered_map<std::uint64_t, bool> seen;
-        seen.reserve(s9.size() * 2);
-        for (auto h : s9) {
-            if (seen[h]) continue;
-            seen[h] = true;
-            auto it = g_inv9.find(h);
-            if (it == g_inv9.end()) continue;
-            for (auto did : it->second) {
-                if ((int)did < N_docs && is_cand[did]) {
-                    inter9[did] += 1;
-                }
-            }
+        if (static_cast<int>(c.did) < N_docs) {
+            is_cand[c.did] = 1;
         }
     }
 
@@ -372,18 +372,18 @@ extern "C" SeSearchResult se_search_text(
             auto it = g_inv13.find(h);
             if (it == g_inv13.end()) continue;
             for (auto did : it->second) {
-                if ((int)did < N_docs && is_cand[did]) {
+                if (static_cast<int>(did) < N_docs && is_cand[did]) {
                     inter13[did] += 1;
                 }
             }
         }
     }
 
-    // скоринг
     struct Scored {
         std::uint32_t did;
         double score;
-        double j9, c9, j13, c13;
+        double j13;
+        double c13;
         int    hits;
     };
     std::vector<Scored> scored;
@@ -391,46 +391,35 @@ extern "C" SeSearchResult se_search_text(
 
     const double alpha = cfg.alpha;
     const double w13   = cfg.w13;
-    const double w9    = cfg.w9;
 
-    const int tQ9  = qS9;
     const int tQ13 = qS13;
 
     for (const auto& c : cand_list) {
-        int did = (int)c.did;
+        int did = static_cast<int>(c.did);
         const DocMeta& dm = g_docs[did];
-        if ((int)dm.tok_len < cfg.w_min_doc) continue;
+        if (static_cast<int>(dm.tok_len) < cfg.w_min_doc) continue;
 
-        int tlen = (int)dm.tok_len;
-        int T9   = std::max(0, tlen - 9  + 1);
+        int tlen = static_cast<int>(dm.tok_len);
         int T13  = std::max(0, tlen - 13 + 1);
 
-        int i9  = inter9[did];
         int i13 = inter13[did];
-
-        if (i9 < min_inter9 && i13 < min_inter13) {
+        if (i13 < 1) {
+            // минимум 1 пересекающийся шингл k=13
             continue;
         }
 
-        double J9 = 0.0, C9 = 0.0;
         double J13 = 0.0, C13 = 0.0;
-
-        if (tQ9 > 0 && T9 > 0) {
-            jc_compute(i9, tQ9, T9, J9, C9);
-        }
         if (tQ13 > 0 && T13 > 0) {
             jc_compute(i13, tQ13, T13, J13, C13);
         }
 
-        double s13 = w13 * (alpha * J13 + (1.0 - alpha) * C13);
-        double s9  = w9  * (alpha * J9  + (1.0 - alpha) * C9);
-        double score = s13 > s9 ? s13 : s9;
+        double score = w13 * (alpha * J13 + (1.0 - alpha) * C13);
 
         scored.push_back(Scored{
-            (std::uint32_t)did,
+            static_cast<std::uint32_t>(did),
             score,
-            J9, C9,
-            J13, C13,
+            J13,
+            C13,
             c.hits
         });
     }
@@ -439,17 +428,22 @@ extern "C" SeSearchResult se_search_text(
         return result;
     }
 
-    std::sort(scored.begin(), scored.end(), [](const Scored& a, const Scored& b) {
-        return a.score > b.score;
-    });
+    std::sort(
+        scored.begin(),
+        scored.end(),
+        [](const Scored& a, const Scored& b) {
+            return a.score > b.score;
+        }
+    );
 
-    int keep = std::min(top_k, std::min(max_hits, (int)scored.size()));
+    int keep = std::min(top_k, std::min(max_hits, static_cast<int>(scored.size())));
     for (int i = 0; i < keep; ++i) {
         const auto& s = scored[i];
-        out_hits[i].doc_id_int = (int)s.did;
+        out_hits[i].doc_id_int = static_cast<int>(s.did);
         out_hits[i].score      = s.score;
-        out_hits[i].j9         = s.j9;
-        out_hits[i].c9         = s.c9;
+        // k=9 больше не считаем — нули для ABI с SeHit
+        out_hits[i].j9         = 0.0;
+        out_hits[i].c9         = 0.0;
         out_hits[i].j13        = s.j13;
         out_hits[i].c13        = s.c13;
         out_hits[i].cand_hits  = s.hits;

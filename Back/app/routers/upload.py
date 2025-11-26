@@ -18,17 +18,26 @@ from ..core.config import (
     OCR_LANG_DEFAULT,
     OCR_WORKERS_DEFAULT,
 )
+
+
 from ..core.io_utils import file_lock
 from ..core.logger import logger
 
 from ..services.indexing.index_build import build_index_json
-from ..services.search.index_search import clear_index_cache, get_index_cached, load_index, load_index_cached
+from ..services.search.index_search import (
+    clear_index_cache,
+    get_index_cached,
+    load_index,
+    load_index_cached,
+)
 from ..services.helpers.normalizer import normalize_for_shingles, simple_tokens
 from ..services.converters.pdf_heavy import extract_and_normalize_pdf
 from ..services.converters.pdf_convert import smart_pdf_to_docx
 from ..services.converters.docx_utils import extract_docx_text
 
 router = APIRouter(prefix="/api", tags=["Operations"])
+
+INDEX_NATIVE_META = INDEX_JSON.parent / "index_native_meta.json"
 
 # --- optional parsers ---
 try:
@@ -51,6 +60,7 @@ def _bytes_to_text_utf8(raw: bytes) -> str:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
         return raw.decode("utf-8", "ignore")
+
 
 def _build_native_index() -> None:
     """
@@ -93,7 +103,6 @@ def _build_native_index() -> None:
 
     log_mem("[index_build] native: after index_builder")
     logger.info("[index_build] NATIVE done")
-
 
 
 def _docx_to_text(raw: bytes) -> str:
@@ -141,18 +150,29 @@ def _collect_corpus_stats() -> Tuple[int, Set[str]]:
                 ids.add(did)
     return lines, ids
 
-
 def _collect_index_ids_safe() -> Set[str]:
-    """doc_id из текущего index.json, если он есть и валиден."""
-    if not INDEX_JSON.exists():
+    """
+    doc_id из C++ мета-файла index_native_meta.json, если он есть и валиден.
+    Python index.json больше не используем.
+    """
+    if not INDEX_NATIVE_META.exists():
         return set()
+
     try:
-        from ..services.search.index_search import load_index
-        idx = load_index()
+        with open(INDEX_NATIVE_META, "r", encoding="utf-8") as f:
+            meta = json.load(f)
     except Exception:
         return set()
-    docs_meta = idx.get("docs_meta") or {}
-    return set(docs_meta.keys())
+
+    # ожидаем что в meta есть либо "docs", либо "docs_meta"
+    docs = meta.get("docs") or meta.get("docs_meta") or []
+    ids: Set[str] = set()
+    for d in docs:
+        did = d.get("doc_id")
+        if isinstance(did, str):
+            ids.add(did)
+    return ids
+
 
 
 def _ingest_single(
@@ -164,12 +184,25 @@ def _ingest_single(
     ocr_mode: str,
     title: str | None = None,
     author: str | None = None,
+    *,
+    file_idx: int | None = None,
+    total_files: int | None = None,
 ) -> Dict[str, Any]:
     """
     Общий пайплайн для одного файла.
     Возвращает dict с doc_id, токенами и пр.
+
+    Нормализацию для шинглов сейчас делаем ТОЛЬКО в C++-части (index_builder / search_core),
+    поэтому здесь normalize принудительно отключаем.
     """
-    log_mem(f"ingest_single: start fname={fname}")
+    # временно полностью отключаем Python-нормализацию — всё делает C++
+    normalize = False
+
+    prefix = ""
+    if file_idx is not None and total_files is not None:
+        prefix = f"[{file_idx}/{total_files}] "
+
+    log_mem(f"{prefix}ingest_single: start fname={fname}")
     rt_cfg = get_runtime_cfg()
     ocr_lang = rt_cfg.ocr.lang
     ocr_workers = rt_cfg.ocr.workers
@@ -178,7 +211,8 @@ def _ingest_single(
     text: str
 
     logger.info(
-        "[ingest_single] start fname=%s, ext=%s, bytes=%d, normalize=%s, save_docx=%s, ocr=%s, ocr_mode=%s",
+        "%s[ingest_single] start fname=%s, ext=%s, bytes=%d, normalize=%s, save_docx=%s, ocr=%s, ocr_mode=%s",
+        prefix,
         fname,
         ctype_guess,
         len(raw),
@@ -196,11 +230,11 @@ def _ingest_single(
         try:
             text = extract_docx_text(raw)
         except RuntimeError as e:
-            logger.error("[ingest_single] docx extract failed: %s", e)
+            logger.error("%s[ingest_single] docx extract failed: %s", prefix, e)
             raise HTTPException(500, str(e))
 
     elif ctype_guess == "pdf":
-        # heavy PDF normalize for indexing
+        # heavy PDF normalize for indexing (OCR, layout и т.п., НЕ шингловая нормализация)
         try:
             text = extract_and_normalize_pdf(
                 raw,
@@ -213,7 +247,7 @@ def _ingest_single(
                 ocr_workers=ocr_workers,
             )
         except Exception as e:
-            logger.error("[ingest_single] PDF extract failed: %s", e)
+            logger.error("%s[ingest_single] PDF extract failed: %s", prefix, e)
             raise HTTPException(500, f"PDF extract failed: {e}")
 
         # сохранить DOCX-версию
@@ -232,18 +266,18 @@ def _ingest_single(
                 out_path = UPLOAD_DIR / f"{base}.docx"
                 out_path.write_bytes(docx_bytes)
             except Exception as e:
-                logger.error(f"docx conversion failed for {fname}: {e}")
+                logger.error("%sdocx conversion failed for %s: %s", prefix, fname, e)
 
     else:
-        logger.error("[ingest_single] unsupported extension fname=%s", fname)
+        logger.error("%s[ingest_single] unsupported extension fname=%s", prefix, fname)
         raise HTTPException(400, f"unsupported file extension: {fname or 'unknown'}")
 
-    # 2) нормализация
-    if normalize:
-        text = normalize_for_shingles(text)
+    # 2) шингловая нормализация отключена в Python:
+    # if normalize:
+    #     text = normalize_for_shingles(text)
 
     if not text.strip():
-        logger.warning("[ingest_single] empty text after extraction fname=%s", fname)
+        logger.warning("%s[ingest_single] empty text after extraction fname=%s", prefix, fname)
         raise HTTPException(400, "empty text after extraction")
 
     if not title:
@@ -256,7 +290,7 @@ def _ingest_single(
     if author is None:
         author = ""
 
-    # 3) запись в корпус
+    # 3) запись в корпус (сырые тексты, нормализация будет в C++)
     CORPUS_JSONL.parent.mkdir(parents=True, exist_ok=True)
     doc_id = f"doc_{hashlib.sha256(text.encode('utf-8')).hexdigest()[:8]}"
 
@@ -274,17 +308,19 @@ def _ingest_single(
                 + b"\n"
             )
 
+    # токены считаем по сырым (для статистики, не для шинглов)
     toks = simple_tokens(text)
 
     logger.info(
-        "[ingest_single] done doc_id=%s, filename=%s, title=%s, bytes=%d, tokens=%d",
+        "%s[ingest_single] done doc_id=%s, filename=%s, title=%s, bytes=%d, tokens=%d",
+        prefix,
         doc_id,
         fname,
         title,
         len(raw),
         len(toks),
     )
-    log_mem(f"ingest_single: done doc_id={doc_id}")
+    log_mem(f"{prefix}ingest_single: done doc_id={doc_id}")
 
     return {
         "doc_id": doc_id,
@@ -312,10 +348,14 @@ def _iter_jsonl(path) -> Iterator[Dict[str, Any]]:
 
 
 # ---------- routes ----------
+
 @router.post("/upload")
 async def upload_file(
     file: UploadFile = File(...),
-    normalize: bool = Query(True),
+    normalize: bool = Query(
+        False,
+        description="(зарезервировано) Python-нормализация отключена, используется C++",
+    ),
     save_docx: bool = Query(True),
     ocr: bool = Query(True, description="Включить OCR, если PDF пустой"),
     ocr_mode: str = Query(
@@ -368,10 +408,14 @@ async def upload_file(
 
 
 # ---------- массовая загрузка из ZIP ----------
+
 @router.post("/upload/zip_admin")
 async def upload_zip_admin(
     file: UploadFile = File(...),
-    normalize: bool = Query(True),
+    normalize: bool = Query(
+        False,
+        description="(зарезервировано) Python-нормализация отключена, используется C++",
+    ),
     save_docx: bool = Query(True),
     ocr: bool = Query(True, description="Включить OCR для PDF внутри архива"),
     ocr_mode: str = Query(
@@ -387,10 +431,16 @@ async def upload_zip_admin(
     ),
 ):
     """
-    Тяжёлый ZIP-роутер для себя: много файлов, может работать долго.
-    Обрабатывает архив батчами по batch_size файлов, между батчами делает gc.collect().
-    Логирует прогресс: N/total (~X.X%).
+    ZIP загрузка:
+      ✓ Батчи
+      ✓ Параллельное CPU/OCR
+      ✓ Красивые логи:  051/200  | OK      | book.docx   | doc_ab12ce
     """
+    import asyncio
+    import gc as _gc
+    from starlette.concurrency import run_in_threadpool
+
+    # ---------- открыть ZIP ----------
     try:
         file.file.seek(0)
         zf = zipfile.ZipFile(file.file)
@@ -398,18 +448,11 @@ async def upload_zip_admin(
         logger.error("[upload_zip_admin] not a valid ZIP: %s", e)
         raise HTTPException(400, f"not a valid ZIP: {e}")
 
-    from starlette.concurrency import run_in_threadpool
-    import gc as _gc
-
-    # сначала отфильтруем валидные entries, чтобы знать total
+    # ---------- собрать валидные файлы ----------
     infos: List[zipfile.ZipInfo] = []
     for info in zf.infolist():
         name = info.filename.rsplit("/", 1)[-1]
-        if info.is_dir():
-            continue
-        if not name:
-            continue
-        if name.startswith("__MACOSX"):
+        if not name or info.is_dir() or name.startswith("__MACOSX"):
             continue
         infos.append(info)
 
@@ -426,8 +469,7 @@ async def upload_zip_admin(
         }
 
     logger.info(
-        "[upload_zip_admin] start: archive=%s, files=%d, batch_size=%d, "
-        "normalize=%s, save_docx=%s, ocr=%s, ocr_mode=%s",
+        "[upload_zip_admin] START archive=%s, files=%d, batch_size=%d normalize=%s save_docx=%s ocr=%s mode=%s",
         file.filename,
         total,
         batch_size,
@@ -438,11 +480,21 @@ async def upload_zip_admin(
     )
     log_mem("upload_zip_admin: start")
 
+    # ---------- Параметры отображения ----------
+    def _short(name: str, maxlen: int = 30) -> str:
+        """Обрезка длинных имён для логов."""
+        return name if len(name) <= maxlen else name[:27] + "..."
+
     items: List[Dict[str, Any]] = []
     processed = 0
-    idx = 0  # глобальный счётчик по файлам
+    idx = 0
 
+    # ---------- обрабатываем батчами ----------
     for batch in _chunked(infos, batch_size):
+        tasks = []
+        meta: List[Tuple[int, str]] = []  # номер:имя
+
+        # --- подготовка задач ---
         for info in batch:
             idx += 1
             name = info.filename.rsplit("/", 1)[-1]
@@ -450,28 +502,21 @@ async def upload_zip_admin(
             try:
                 raw = zf.read(info)
             except Exception as e:
-                status = "error"
-                items.append(
-                    {
-                        "filename": name,
-                        "status": status,
-                        "error": f"cannot read from zip: {e}",
-                    }
-                )
                 pct = idx * 100.0 / total
                 logger.error(
-                    "[upload_zip_admin] %d/%d (%.1f%%) filename=%s, status=%s, err=%s",
+                    "[upload_zip_admin] %03d/%03d (%.1f%%) | ERROR   | %-30s | %s",
                     idx,
                     total,
                     pct,
-                    name,
-                    status,
-                    e,
+                    _short(name),
+                    f"read-failed: {e}",
                 )
+                items.append({"filename": name, "status": "error", "error": str(e)})
                 continue
 
-            try:
-                res = await run_in_threadpool(
+            meta.append((idx, name))
+            tasks.append(
+                run_in_threadpool(
                     _ingest_single,
                     raw,
                     name,
@@ -479,76 +524,77 @@ async def upload_zip_admin(
                     save_docx,
                     ocr,
                     ocr_mode,
-                    None,  # title
-                    None,  # author
+                    None,   # title
+                    None,   # author
+                    file_idx=idx,
+                    total_files=total,
                 )
-                processed += 1
-                res_out = dict(res)
-                res_out.setdefault("status", "ok")
-                items.append(res_out)
-                status = "ok"
-                pct = idx * 100.0 / total
-                logger.info(
-                    "[upload_zip_admin] %d/%d (%.1f%%) filename=%s, status=%s, doc_id=%s",
-                    idx,
-                    total,
-                    pct,
-                    name,
-                    status,
-                    res_out.get("doc_id"),
-                )
-            except HTTPException as e:
-                status = "skipped"
+            )
+
+        if not tasks:
+            _gc.collect()
+            continue
+
+        # --- Параллельно запускаем задачи ---
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # --- Разбираем результаты ---
+        for (n, name), res in zip(meta, results):
+            pct = n * 100.0 / total
+
+            if isinstance(res, HTTPException):
                 items.append(
-                    {
-                        "filename": name,
-                        "status": status,
-                        "error": e.detail,
-                    }
+                    {"filename": name, "status": "skipped", "error": res.detail}
                 )
-                pct = idx * 100.0 / total
                 logger.warning(
-                    "[upload_zip_admin] %d/%d (%.1f%%) filename=%s, status=%s, err=%s",
-                    idx,
+                    "[upload_zip_admin] %03d/%03d (%.1f%%) | SKIPPED | %-30s | %s",
+                    n,
                     total,
                     pct,
-                    name,
-                    status,
-                    e.detail,
+                    _short(name),
+                    res.detail,
                 )
-            except Exception as e:
-                status = "error"
+                continue
+
+            elif isinstance(res, Exception):
                 items.append(
-                    {
-                        "filename": name,
-                        "status": status,
-                        "error": str(e),
-                    }
+                    {"filename": name, "status": "error", "error": str(res)}
                 )
-                pct = idx * 100.0 / total
                 logger.error(
-                    "[upload_zip_admin] %d/%d (%.1f%%) filename=%s, status=%s, err=%s",
-                    idx,
+                    "[upload_zip_admin] %03d/%03d (%.1f%%) | ERROR   | %-30s | %s",
+                    n,
                     total,
                     pct,
-                    name,
-                    status,
-                    e,
+                    _short(name),
+                    res,
                 )
+                continue
 
-        # после каждого батча слегка чистим память
+            # ---------- SUCCESS ----------
+            processed += 1
+            obj = dict(res)
+            obj.setdefault("status", "ok")
+            items.append(obj)
+
+            logger.info(
+                "[upload_zip_admin] %03d/%03d (%.1f%%) | OK      | %-30s | %s",
+                n,
+                total,
+                pct,
+                _short(name),
+                obj.get("doc_id"),
+            )
+
+        # ---- GC после батча ----
         _gc.collect()
-        log_mem(
-            f"upload_zip_admin: after batch, processed={processed}/{total}"
-        )
+        log_mem(f"upload_zip_admin: after batch {processed}/{total}")
         logger.info(
-            "[upload_zip_admin] batch finished: processed=%d/%d",
-            processed,
-            total,
+            "[upload_zip_admin] batch done processed=%d/%d", processed, total
         )
 
+    # ---------- FINISH ----------
     logger.info(
-        "[upload_zip_admin] done: archive=%s, total=%d, processed=%d",
+        "[upload_zip_admin] DONE archive=%s total=%d processed=%d",
         file.filename,
         total,
         processed,
@@ -564,250 +610,58 @@ async def upload_zip_admin(
 
 
 @router.post("/build")
-def build_index(
-    mode: str = Query(
-        "incremental",
-        pattern="^(full|incremental)$",
-        description="full — пересобрать всё, incremental — дозалить поверх текущего",
-    ),
-    max_new_docs_per_build: int | None = Query(
-        None,
-        ge=1,
-        description=(
-            "Максимум НОВЫХ документов за один прогон build. "
-            "Используется как размер батча."
-        ),
-    ),
-    process_all_pending: bool = Query(
-        False,
-        description=(
-            "Если false — делаем ОДИН прогон build_index_json на max_new_docs_per_build.\n"
-            "Если true (только для incremental) — крутим несколько прогонов подряд, "
-            "каждый не больше max_new_docs_per_build, пока не закончатся "
-            "неиндексированные документы или батч перестанет что-то добавлять."
-        ),
-    ),
-):
-    rt_cfg = get_runtime_cfg()
+def build_index_native():
+    """
+    Строим ТОЛЬКО C++-индекс (index_native.*) поверх corpus.jsonl.
+    Python index.json больше не используем — вся тяжёлая работа в C++.
+    """
+    logger.info("[index_build_native] === /api/build called (native only) ===")
+    log_mem("index_build_native: STAGE 0 before stats")
 
-    logger.info(
-        "[index_build] === STAGE 0: API /build called ===\n"
-        "  mode=%s\n"
-        "  max_new_docs_per_build=%s\n"
-        "  process_all_pending=%s",
-        mode,
-        max_new_docs_per_build or "None",
-        process_all_pending,
-    )
-    log_mem("index_build: STAGE 0 before stats")
-
-    incremental = mode == "incremental"
-
-    # для full смысла в process_all_pending нет — всегда один большой прогон
-    if mode == "full" and process_all_pending:
-        logger.warning(
-            "[index_build] mode=full: process_all_pending=true не имеет смысла, "
-            "будет выполнен один полный прогон без батчинга"
-        )
-        process_all_pending = False
-
-    # ── STAGE 1: статы ДО ──────────────────────────────────────────────────────
+    # ── STAGE 1: статы ДО ────────────────────────────────────────────
     corpus_lines_before, corpus_ids = _collect_corpus_stats()
     index_ids_before = _collect_index_ids_safe()
     unindexed_before = corpus_ids - index_ids_before
 
     logger.info(
-        "[index_build] STAGE 1/3: BEFORE\n"
+        "[index_build_native] STAGE 1 BEFORE\n"
         "  corpus.jsonl: lines=%d, doc_ids=%d\n"
-        "  index.json:  indexed_docs=%d\n"
-        "  unindexed_docs=%d",
+        "  indexed_docs(native)=%d\n"
+        "  unindexed_docs(native)=%d",
         corpus_lines_before,
         len(corpus_ids),
         len(index_ids_before),
         len(unindexed_before),
     )
-    log_mem("index_build: STAGE 1 BEFORE")
+    log_mem("index_build_native: STAGE 1 BEFORE")
 
-    # safety: если просим process_all_pending=true, но не задали размер батча — заставим задать
-    if process_all_pending and max_new_docs_per_build is None and incremental:
-        raise HTTPException(
-            400,
-            "process_all_pending=true требует задать max_new_docs_per_build "
-            "для инкрементального режима",
-        )
+    # ── STAGE 2: C++ index_builder ───────────────────────────────────
+    log_mem("[index_build_native] STAGE 2 before index_builder")
+    _build_native_index()
+    log_mem("[index_build_native] STAGE 2 after index_builder")
 
-    # ── STAGE 2: BUILD (Python index.json) ─────────────────────────────────────
-    logger.info(
-        "[index_build] STAGE 2/3: BUILD start\n"
-        "  incremental=%s, max_new_docs_per_build=%s, process_all_pending=%s",
-        incremental,
-        max_new_docs_per_build or "None",
-        process_all_pending,
-    )
-    log_mem("index_build: STAGE 2 BUILD start")
-
-    last_idx = None
-    total_batches = 0
-
-    def _run_single_build(prev_docs_count: int | None = None) -> tuple[dict, int]:
-        """Запускает build_index_json и возвращает (idx, delta_new_docs)."""
-        log_mem("index_build: before build_index_json")
-        try:
-            idx = build_index_json(
-                cfg=rt_cfg.index.model_dump(),
-                incremental=incremental,
-                max_new_docs_per_build=max_new_docs_per_build,
-            )
-        except FileNotFoundError:
-            logger.error("[index_build] corpus.jsonl not found")
-            raise HTTPException(400, "corpus.jsonl not found")
-        except ValueError as e:
-            logger.error("[index_build] cannot build index: %s", e)
-            raise HTTPException(400, f"cannot build index: {e}")
-
-        log_mem("index_build: after build_index_json")
-
-        docs_meta = idx.get("docs_meta") or {}
-        cur_docs_count = len(docs_meta)
-        if prev_docs_count is None:
-            delta = 0
-        else:
-            delta = cur_docs_count - prev_docs_count
-
-        logger.info(
-            "[index_build] build pass done\n"
-            "  docs_meta=%d\n"
-            "  inverted.k9=%d\n"
-            "  inverted.k13=%d\n"
-            "  delta_new_docs=%d",
-            cur_docs_count,
-            len(idx["inverted_doc"].get("k9") or {}),
-            len(idx["inverted_doc"].get("k13") or {}),
-            delta,
-        )
-        log_mem("index_build: after build pass")
-        return idx, delta
-
-    # режим: либо один прогон, либо batched-multi-pass
-    if not process_all_pending or not incremental:
-        last_idx, _ = _run_single_build(prev_docs_count=len(index_ids_before))
-        total_batches = 1
-    else:
-        prev_count = len(index_ids_before)
-        max_loops = 10_000
-        for i in range(1, max_loops + 1):
-            logger.info(
-                "[index_build] === incremental batch #%d START ===", i
-            )
-            idx, delta = _run_single_build(prev_docs_count=prev_count)
-            last_idx = idx
-            total_batches = i
-
-            docs_meta = idx.get("docs_meta") or {}
-            cur_count = len(docs_meta)
-            prev_count = cur_count
-
-            index_ids_now = set(docs_meta.keys())
-            unindexed_now = corpus_ids - index_ids_now
-
-            logger.info(
-                "[index_build] incremental batch #%d AFTER\n"
-                "  indexed_docs=%d\n"
-                "  unindexed_docs=%d\n"
-                "  delta_new_docs=%d",
-                i,
-                len(index_ids_now),
-                len(unindexed_now),
-                delta,
-            )
-            log_mem(f"index_build: after incremental batch #{i}")
-
-            if delta <= 0 or not unindexed_now:
-                logger.info(
-                    "[index_build] incremental batches DONE at #%d: "
-                    "delta=%d, unindexed_left=%d",
-                    i,
-                    delta,
-                    len(unindexed_now),
-                )
-                break
-        else:
-            logger.warning(
-                "[index_build] reached max_loops in incremental batched mode"
-            )
-
-    idx = last_idx or {}
-
-    logger.info(
-        "[index_build] STAGE 2/3: BUILD done\n"
-        "  batches=%d\n"
-        "  docs_meta=%d\n"
-        "  inverted.k9=%d\n"
-        "  inverted.k13=%d",
-        total_batches,
-        len(idx.get("docs_meta") or {}),
-        len(idx.get("inverted_doc", {}).get("k9") or {}),
-        len(idx.get("inverted_doc", {}).get("k13") or {}),
-    )
-    log_mem("index_build: STAGE 2 BUILD done")
-
-    # ── STAGE 3: RELOAD Python-кэша ────────────────────────────────────────────
-    logger.info("[index_build] STAGE 3/3: RELOAD index cache (python)")
-    log_mem("index_build: STAGE 3 before clear_index_cache/load_index_cached")
-
-    clear_index_cache()
-    _ = load_index_cached()
-
-    log_mem("index_build: after load_index_cached")
-
+    # ── STAGE 3: статы ПОСЛЕ ────────────────────────────────────────
     index_ids_after = _collect_index_ids_safe()
     unindexed_after = corpus_ids - index_ids_after
     delta_indexed = len(index_ids_after) - len(index_ids_before)
 
     logger.info(
-        "[index_build] STAGE 3/3: AFTER (python index)\n"
+        "[index_build_native] STAGE 3 AFTER\n"
         "  corpus.jsonl: lines=%d, doc_ids=%d\n"
-        "  index.json:  indexed_docs=%d\n"
-        "  unindexed_docs=%d\n"
-        "  delta_indexed=%d\n"
-        "  batches=%d\n"
-        "  process_all_pending=%s\n"
-        "  max_new_docs_per_build=%s",
+        "  indexed_docs(native)=%d\n"
+        "  unindexed_docs(native)=%d\n"
+        "  delta_indexed=%d",
         corpus_lines_before,
         len(corpus_ids),
         len(index_ids_after),
         len(unindexed_after),
         delta_indexed,
-        total_batches,
-        process_all_pending,
-        max_new_docs_per_build or "None",
     )
-    log_mem("index_build: STAGE 3 AFTER")
-
-    # ── STAGE 4: C++ native index ──────────────────────────────────────────────
-    _build_native_index()
-
-    logger.info(
-        "[index_build] API /build finished: "
-        "docs=%d, k5=%d, k9=%d, k13=%d, mode=%s, "
-        "process_all_pending=%s, batches=%d, max_new_docs_per_build=%s",
-        len(idx.get("docs_meta") or {}),
-        len(idx.get("inverted_doc", {}).get("k5") or {}),
-        len(idx.get("inverted_doc", {}).get("k9") or {}),
-        len(idx.get("inverted_doc", {}).get("k13") or {}),
-        mode,
-        process_all_pending,
-        total_batches,
-        max_new_docs_per_build or "None",
-    )
-    log_mem("index_build: done")
+    log_mem("index_build_native: STAGE 3 AFTER")
 
     return {
-        "index_path": str(INDEX_JSON),
-        "mode": mode,
-        "max_new_docs_per_build": max_new_docs_per_build,
-        "process_all_pending": process_all_pending,
-        "batches": total_batches,
+        "index_dir": str(INDEX_JSON.parent),
+        "index_native_meta": str(INDEX_NATIVE_META),
         "stats_before": {
             "corpus_lines": corpus_lines_before,
             "corpus_docs": len(corpus_ids),
@@ -821,11 +675,9 @@ def build_index(
             "unindexed_docs": len(unindexed_after),
             "delta_indexed": delta_indexed,
         },
-        "docs": len(idx.get("docs_meta") or {}),
-        "k5": len(idx.get("inverted_doc", {}).get("k5") or {}),
-        "k9": len(idx.get("inverted_doc", {}).get("k9") or {}),
-        "k13": len(idx.get("inverted_doc", {}).get("k13") or {}),
     }
+
+
 @router.delete(
     "/corpus/cleanup",
     summary="Удалить полностью базу или только неиндексированные документы",
@@ -841,7 +693,12 @@ def corpus_cleanup(
         log_mem("corpus_cleanup: delete_all")
 
         removed: list[str] = []
-        for p in (CORPUS_JSONL, INDEX_JSON):
+        for p in (
+        CORPUS_JSONL,
+        INDEX_JSON,          # старый Python-индекс, можно оставить для совместимости
+        INDEX_NATIVE_META,
+        INDEX_JSON.parent / "index_native.bin",
+    ):
             if p.exists():
                 try:
                     os.remove(p)
@@ -849,85 +706,13 @@ def corpus_cleanup(
                 except OSError as e:
                     raise HTTPException(500, f"cannot remove {p.name}: {e}")
 
-        clear_index_cache()
+        clear_index_cache()  # можно оставить, ничего плохого не сделает
 
         logger.info("[corpus_cleanup] delete_all removed=%s", removed)
         log_mem("corpus_cleanup: delete_all done")
         return {
-            "status": "ok",
-            "mode": "all",
-            "removed": removed,
-        }
-
-    # ===================== УДАЛИТЬ ТОЛЬКО НЕИНДЕКСИРОВАННЫЕ =====================
-    log_mem("corpus_cleanup: unindexed")
-
-    if not CORPUS_JSONL.exists():
-        raise HTTPException(404, "corpus.jsonl not found")
-
-    try:
-        idx = load_index()
-    except FileNotFoundError:
-        raise HTTPException(400, "index not found — сначала построй индекс")
-    except Exception as e:
-        raise HTTPException(500, f"error loading index: {e}")
-
-    docs_meta = idx.get("docs_meta") or {}
-    indexed_ids = set(docs_meta.keys())
-    if not indexed_ids:
-        raise HTTPException(400, "index is empty, nothing to clean")
-
-    lock_path = CORPUS_JSONL.with_suffix(".lock")
-    tmp_path = CORPUS_JSONL.with_suffix(".tmp")
-
-    total_lines = 0
-    kept_lines = 0
-    removed_lines = 0
-    removed_ids: list[str] = []
-
-    with file_lock(lock_path):
-        with open(CORPUS_JSONL, "rb") as src, open(tmp_path, "wb") as dst:
-            for line in src:
-                line_stripped = line.strip()
-                if not line_stripped:
-                    continue
-
-                total_lines += 1
-
-                try:
-                    obj = orjson.loads(line_stripped)
-                except Exception:
-                    dst.write(line)
-                    kept_lines += 1
-                    continue
-
-                did = obj.get("doc_id")
-                if did and did not in indexed_ids:
-                    removed_lines += 1
-                    removed_ids.append(did)
-                    continue
-
-                dst.write(line)
-                kept_lines += 1
-
-        os.replace(tmp_path, CORPUS_JSONL)
-
-    logger.info(
-        "[corpus_cleanup] unindexed: total=%d kept=%d removed=%d",
-        total_lines,
-        kept_lines,
-        removed_lines,
-    )
-    log_mem("corpus_cleanup: unindexed done")
-
-    return {
         "status": "ok",
-        "mode": "unindexed",
-        "total": total_lines,
-        "kept": kept_lines,
-        "removed": removed_lines,
-        "removed_doc_ids_sample": removed_ids[:50],
+        "mode": "all",
+        "removed": removed,
     }
 
-
-# 2) ЧИСТАЯ СТАТИСТИКА

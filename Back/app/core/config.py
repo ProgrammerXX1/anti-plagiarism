@@ -88,7 +88,7 @@ class ThresholdsCfg(BaseModel):
 class IndexConfig(BaseModel):
     w_min_doc: int = Field(ge=1, default=8)
     w_min_query: int = Field(ge=1, default=9)
-    k_list: List[int] = Field(default_factory=lambda: [9, 13])
+    k_list: List[int] = Field(default_factory=lambda: [13])
     weights: WeightsCfg = WeightsCfg()
     thresholds: ThresholdsCfg = ThresholdsCfg()
     minhash: MinhashCfg = MinhashCfg()

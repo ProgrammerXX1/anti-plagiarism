@@ -11,7 +11,7 @@ pytesseract
 httpx
 
 # === SEMANTIC + EMBEDDER ===
-torch                         # ставится под нужную CUDA отдельно
-sentence-transformers>=2.6
-transformers>=4.40
+# torch                         # ставится под нужную CUDA отдельно
+# sentence-transformers>=2.6
+# transformers>=4.40
 numpy>=1.24
