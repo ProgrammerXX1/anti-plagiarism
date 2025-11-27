@@ -7,6 +7,7 @@
 #include <utility>
 #include <cstdint>
 #include <algorithm>
+#include <thread>
 
 #include <simdjson.h>
 #include <nlohmann/json.hpp>
@@ -17,7 +18,12 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr int K = 9;  // длина шингла k=9, k=13 больше не используем
+constexpr int K = 9;  // длина шингла k=9
+
+// лимиты для контроля монстров-документов
+constexpr std::uint32_t MAX_TOKENS_PER_DOC   = 100000;   // 0 = без лимита
+constexpr std::uint32_t MAX_SHINGLES_PER_DOC = 50000;    // 0 = без лимита
+constexpr int           SHINGLE_STRIDE       = 1;        // 1 = каждый шингл
 
 struct DocMeta {
     std::uint32_t tok_len;
@@ -25,31 +31,110 @@ struct DocMeta {
     std::uint64_t simhash_lo;
 };
 
-// Простой 128-битный simhash по токенам
-std::pair<std::uint64_t, std::uint64_t> simhash128_tokens(
-    const std::vector<std::string>& toks
+struct ThreadResult {
+    std::vector<DocMeta> docs;
+    std::vector<std::string> doc_ids;
+    // postings9: (hash, local_doc_idx)
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> postings9;
+};
+
+void process_range(
+    const std::vector<std::string>& lines,
+    std::size_t start,
+    std::size_t end,
+    ThreadResult& out
 ) {
-    long long v[128] = {0};
+    out.docs.clear();
+    out.doc_ids.clear();
+    out.postings9.clear();
 
-    for (const auto& t : toks) {
-        std::size_t h1 = std::hash<std::string>{}(t + std::string("#1"));
-        std::size_t h2 = std::hash<std::string>{}(t + std::string("#2"));
+    out.docs.reserve(end - start);
+    out.doc_ids.reserve(end - start);
+    out.postings9.reserve((end - start) * 64);
 
-        std::uint64_t lo = static_cast<std::uint64_t>(h1);
-        std::uint64_t hi = static_cast<std::uint64_t>(h2);
+    simdjson::dom::parser parser;
+    std::vector<TokenSpan> spans;
+    spans.reserve(128);
 
-        for (int i = 0; i < 64; ++i) {
-            v[i]      += ((lo >> i) & 1ull) ? 1 : -1;
-            v[64 + i] += ((hi >> i) & 1ull) ? 1 : -1;
+    for (std::size_t i = start; i < end; ++i) {
+        const std::string& line = lines[i];
+        if (line.empty()) {
+            continue;
+        }
+
+        simdjson::dom::element doc;
+        auto err = parser.parse(line).get(doc);
+        if (err) {
+            continue;
+        }
+
+        std::string_view did_sv;
+        err = doc["doc_id"].get(did_sv);
+        if (err || did_sv.empty()) {
+            continue;
+        }
+
+        std::string_view text_sv;
+        err = doc["text"].get(text_sv);
+        if (err || text_sv.empty()) {
+            continue;
+        }
+
+        std::string did{did_sv};
+        std::string text{text_sv};
+
+        std::string norm = normalize_for_shingles_simple(text);
+
+        spans.clear();
+        tokenize_spans(norm, spans);
+        if (spans.empty()) {
+            continue;
+        }
+
+        // лимитируем длину документа по токенам
+        if (MAX_TOKENS_PER_DOC > 0 &&
+            spans.size() > static_cast<std::size_t>(MAX_TOKENS_PER_DOC)) {
+            spans.resize(MAX_TOKENS_PER_DOC);
+        }
+
+        if (spans.size() < static_cast<std::size_t>(K)) {
+            continue;
+        }
+
+        const int n   = static_cast<int>(spans.size());
+        const int cnt = n - K + 1;
+        if (cnt <= 0) {
+            continue;
+        }
+
+        // simhash по укороченному списку токенов
+        auto [hi, lo] = simhash128_spans(norm, spans);
+
+        DocMeta dm{};
+        dm.tok_len    = static_cast<std::uint32_t>(spans.size());
+        dm.simhash_hi = hi;
+        dm.simhash_lo = lo;
+
+        std::uint32_t local_doc_id =
+            static_cast<std::uint32_t>(out.docs.size());
+
+        out.docs.push_back(dm);
+        out.doc_ids.push_back(std::move(did));
+
+        // шинглы прямо в postings9, без промежуточного вектора
+        const int step = (SHINGLE_STRIDE > 0 ? SHINGLE_STRIDE : 1);
+        std::uint32_t produced = 0;
+        const std::uint32_t max_sh =
+            (MAX_SHINGLES_PER_DOC > 0)
+                ? MAX_SHINGLES_PER_DOC
+                : static_cast<std::uint32_t>(cnt);
+
+        for (int pos = 0; pos < cnt && produced < max_sh; pos += step) {
+            std::uint64_t h = hash_shingle_tokens_spans(norm, spans, pos, K);
+            out.postings9.emplace_back(h, local_doc_id);
+            ++produced;
         }
     }
-
-    std::uint64_t hi = 0, lo = 0;
-    for (int i = 0; i < 64; ++i) {
-        if (v[i]      >= 0) lo |= (1ull << i);
-        if (v[64 + i] >= 0) hi |= (1ull << i);
-    }
-    return {hi, lo};
 }
 
 } // namespace
@@ -72,108 +157,114 @@ int main(int argc, char** argv) {
     std::ios::sync_with_stdio(false);
     std::cin.tie(nullptr);
 
-    std::vector<DocMeta>      docs;
-    std::vector<std::string>  doc_ids;
-    std::vector<std::pair<std::uint64_t, std::uint32_t>> postings9;
-
-    // Грубая оценка размеров по размеру файла
+    // 1) читаем corpus.jsonl в память
+    std::vector<std::string> lines;
     {
-        std::streampos cur = in.tellg();
-        in.seekg(0, std::ios::end);
-        std::streampos end = in.tellg();
-        in.seekg(cur);
-
-        if (end > 0) {
-            std::size_t fsize = static_cast<std::size_t>(end);
-            std::size_t est_docs = fsize / 2048;  // ~2 KB/док
-            if (est_docs < 1024) {
-                est_docs = 1024;
+        std::string line;
+        while (std::getline(in, line)) {
+            if (!line.empty()) {
+                lines.push_back(line);
             }
-            docs.reserve(est_docs);
-            doc_ids.reserve(est_docs);
-
-            std::size_t est_shingles_per_doc = 64;
-            postings9.reserve(est_docs * est_shingles_per_doc);
-        } else {
-            postings9.reserve(1024 * 1024);
         }
     }
 
-    simdjson::dom::parser parser;
-
-    std::string line;
-    std::uint32_t doc_id_int = 0;
-
-    while (std::getline(in, line)) {
-        if (line.empty()) {
-            continue;
-        }
-
-        // Парс одной JSON-строки через simdjson
-        simdjson::dom::element doc;
-        auto err = parser.parse(line).get(doc);
-        if (err) {
-            // битая строка — пропускаем
-            continue;
-        }
-
-        // doc_id
-        std::string_view did_sv;
-        err = doc["doc_id"].get(did_sv);
-        if (err || did_sv.empty()) {
-            continue;
-        }
-
-        // text
-        std::string_view text_sv;
-        err = doc["text"].get(text_sv);
-        if (err || text_sv.empty()) {
-            continue;
-        }
-
-        // Копируем в std::string (line переиспользуется)
-        std::string did{did_sv};
-        std::string text{text_sv};
-
-        // Нормализация и токены — тот же пайплайн, что в C++ поиске
-        std::string norm = normalize_for_shingles_simple(text);
-        auto toks = simple_tokens(norm);
-        if (toks.size() < static_cast<std::size_t>(K)) {
-            continue;
-        }
-
-        // Только k=9 — уже без конкатенации строк, через hash_shingle_tokens()
-        auto sh9 = build_shingles(toks, K);
-        if (sh9.empty()) {
-            continue;
-        }
-
-        auto [hi, lo] = simhash128_tokens(toks);
-
-        DocMeta dm{};
-        dm.tok_len    = static_cast<std::uint32_t>(toks.size());
-        dm.simhash_hi = hi;
-        dm.simhash_lo = lo;
-        docs.push_back(dm);
-
-        for (auto h : sh9) {
-            postings9.emplace_back(h, doc_id_int);
-        }
-
-        doc_ids.push_back(std::move(did));
-        ++doc_id_int;
+    if (lines.empty()) {
+        std::cerr << "corpus is empty: no lines\n";
+        return 1;
     }
 
-    const std::uint32_t N_docs   = static_cast<std::uint32_t>(docs.size());
-    const std::uint64_t N_post9  = static_cast<std::uint64_t>(postings9.size());
-    const std::uint64_t N_post13 = 0;  // k=13 не используем
+    const std::size_t total_lines = lines.size();
 
-    if (N_docs == 0) {
+    // 2) выбираем количество потоков (до 16)
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 4;
+    unsigned num_threads = std::min<unsigned>(hw, 16u);
+    if (num_threads > total_lines) {
+        num_threads = static_cast<unsigned>(total_lines);
+    }
+    if (num_threads == 0) num_threads = 1;
+
+    // 3) делим по чанкам
+    std::vector<ThreadResult> results(num_threads);
+    std::vector<std::thread>  workers;
+    workers.reserve(num_threads);
+
+    std::size_t chunk_size = (total_lines + num_threads - 1) / num_threads;
+    std::size_t cur_start = 0;
+
+    for (unsigned t = 0; t < num_threads; ++t) {
+        std::size_t start = cur_start;
+        std::size_t end   = std::min<std::size_t>(start + chunk_size, total_lines);
+        cur_start = end;
+
+        if (start >= end) break;
+
+        workers.emplace_back(
+            [&, start, end, t]() {
+                process_range(lines, start, end, results[t]);
+            }
+        );
+    }
+
+    const unsigned used_threads = static_cast<unsigned>(workers.size());
+    for (auto& th : workers) {
+        if (th.joinable()) th.join();
+    }
+
+    // 4) собираем результаты
+    std::uint64_t total_docs   = 0;
+    std::uint64_t total_posts9 = 0;
+    for (unsigned t = 0; t < used_threads; ++t) {
+        total_docs   += results[t].docs.size();
+        total_posts9 += results[t].postings9.size();
+    }
+
+    if (total_docs == 0) {
         std::cerr << "no valid docs in corpus (N_docs=0)\n";
         return 1;
     }
 
-    // Для лучшей локальности — отсортировать по hash9, затем по doc_id_int
+    std::vector<std::uint32_t> doc_id_offsets(used_threads, 0);
+    {
+        std::uint32_t acc = 0;
+        for (unsigned t = 0; t < used_threads; ++t) {
+            doc_id_offsets[t] = acc;
+            acc += static_cast<std::uint32_t>(results[t].docs.size());
+        }
+    }
+
+    std::vector<DocMeta> docs;
+    std::vector<std::string> doc_ids;
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> postings9;
+
+    docs.reserve(static_cast<std::size_t>(total_docs));
+    doc_ids.reserve(static_cast<std::size_t>(total_docs));
+    postings9.reserve(static_cast<std::size_t>(total_posts9));
+
+    for (unsigned t = 0; t < used_threads; ++t) {
+        auto& r = results[t];
+        for (std::size_t i = 0; i < r.docs.size(); ++i) {
+            docs.push_back(r.docs[i]);
+            doc_ids.push_back(std::move(r.doc_ids[i]));
+        }
+    }
+
+    for (unsigned t = 0; t < used_threads; ++t) {
+        const std::uint32_t base = doc_id_offsets[t];
+        auto& r = results[t];
+
+        for (const auto& p : r.postings9) {
+            std::uint64_t h      = p.first;
+            std::uint32_t local  = p.second;
+            std::uint32_t global = base + local;
+            postings9.emplace_back(h, global);
+        }
+    }
+
+    const std::uint32_t N_docs   = static_cast<std::uint32_t>(docs.size());
+    const std::uint64_t N_post9  = static_cast<std::uint64_t>(postings9.size());
+    const std::uint64_t N_post13 = 0;
+
     std::sort(
         postings9.begin(),
         postings9.end(),
@@ -184,8 +275,7 @@ int main(int argc, char** argv) {
         }
     );
 
-    // ── пишем бинарный индекс ─────────────────────────────────────
-
+    // 5) бинарный индекс
     const std::string bin_path = out_dir + "/index_native.bin";
     std::ofstream bout(bin_path, std::ios::binary);
     if (!bout) {
@@ -216,8 +306,7 @@ int main(int argc, char** argv) {
 
     bout.close();
 
-    // ── index_native_docids.json ──────────────────────────────────
-
+    // 6) docids
     const std::string docids_path = out_dir + "/index_native_docids.json";
     {
         std::ofstream dout(docids_path);
@@ -226,11 +315,11 @@ int main(int argc, char** argv) {
             return 1;
         }
         json docids_json(doc_ids);
-        dout << docids_json.dump(2);
+        // без отступов для компактности
+        dout << docids_json.dump();
     }
 
-    // ── index_native_meta.json ────────────────────────────────────
-
+    // 7) meta
     json j_docs_meta = json::object();
     for (std::size_t i = 0; i < doc_ids.size(); ++i) {
         const auto& did = doc_ids[i];
@@ -267,11 +356,16 @@ int main(int argc, char** argv) {
             std::cerr << "cannot open " << meta_path << " for write\n";
             return 1;
         }
-        mout << j_meta.dump(2);
+        // без отступов для компактности
+        mout << j_meta.dump();
     }
 
     std::cout << "[index_builder] built index_native.bin docs=" << N_docs
               << " post9=" << N_post9
-              << " (k13=0, k9-only, simdjson, no buf-concat)\n";
+              << " (k9-only, spans, parallel=" << used_threads
+              << ", max_tokens=" << MAX_TOKENS_PER_DOC
+              << ", max_shingles=" << MAX_SHINGLES_PER_DOC
+              << ")\n";
+
     return 0;
 }

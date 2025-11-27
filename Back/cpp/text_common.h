@@ -184,6 +184,25 @@ inline bool is_word_cp(std::uint32_t cp) {
 }
 
 // ───────────────────────────────────────────────────────────────
+// trim helper
+// ───────────────────────────────────────────────────────────────
+
+inline void trim_spaces(std::string& s) {
+    std::size_t start = 0;
+    std::size_t end   = s.size();
+
+    while (start < end && s[start] == ' ') ++start;
+    while (end > start && s[end - 1] == ' ') --end;
+
+    if (start == 0 && end == s.size()) return;
+    if (start >= end) {
+        s.clear();
+        return;
+    }
+    s = s.substr(start, end - start); // один memmove
+}
+
+// ───────────────────────────────────────────────────────────────
 // Нормализация под шинглы (UTF-8, ru+kk+tr friendly)
 // ───────────────────────────────────────────────────────────────
 
@@ -199,7 +218,18 @@ inline std::string normalize_for_shingles_simple(const std::string& in) {
 
     while (i < n) {
         std::uint32_t cp = 0;
-        bool ok = decode_utf8_cp(data, n, i, cp);
+        bool ok = false;
+
+        unsigned char c = data[i];
+        if (c < 0x80) {
+            // ASCII fast-path
+            cp = c;
+            ++i;
+            ok = true;
+        } else {
+            ok = decode_utf8_cp(data, n, i, cp);
+        }
+
         if (!ok) {
             if (!prev_space) {
                 out.push_back(' ');
@@ -209,7 +239,6 @@ inline std::string normalize_for_shingles_simple(const std::string& in) {
         }
 
         // ========= FIX 1: normalize special Unicode spaces =========
-        // NBSP, thin space, narrow no-break, en/em spaces
         if (cp == 0x00A0 || cp == 0x2009 || cp == 0x200A ||
             cp == 0x202F || cp == 0x2007 || cp == 0x2002 ||
             cp == 0x2003 || cp == 0x2001 || cp == 0x2004 ||
@@ -225,16 +254,14 @@ inline std::string normalize_for_shingles_simple(const std::string& in) {
         cp = fold_equiv(cp);
 
         // ========= FIX 2: fold Turkish/Kazakh dotless i =========
-        // ı (Latin small dotless i) -> normal 'i'
         if (cp == 0x0131) cp = 0x0069;
 
-        // combining accents: выкидываем (Python тоже выбрасывает до токенизации)
+        // combining accents: выкидываем
         if (cp >= 0x0300 && cp <= 0x036F) {
             continue;
         }
 
-        // ========= FIX 3: remove Extended Latin (Python strips it) =========
-        // диапазон U+00C0..U+02AF включает множество диакритических символов
+        // ========= FIX 3: remove Extended Latin =========
         if (cp >= 0x00C0 && cp <= 0x02AF) {
             if (!prev_space) {
                 out.push_back(' ');
@@ -254,22 +281,18 @@ inline std::string normalize_for_shingles_simple(const std::string& in) {
         }
     }
 
-    // trim right
-    while (!out.empty() && out.back() == ' ') out.pop_back();
-    // trim left
-    while (!out.empty() && out.front() == ' ') out.erase(out.begin());
-
+    trim_spaces(out);
     return out;
 }
 
 // ───────────────────────────────────────────────────────────────
-// Токенизация
+// СТАРАЯ токенизация (оставлена для совместимости)
 // ───────────────────────────────────────────────────────────────
 
 inline std::vector<std::string> simple_tokens(const std::string& text) {
     std::vector<std::string> toks;
     std::string cur;
-    toks.reserve(128); // небольшой стартовый запас
+    toks.reserve(128);
 
     for (unsigned char c : text) {
         if (c == ' ') {
@@ -286,14 +309,72 @@ inline std::vector<std::string> simple_tokens(const std::string& text) {
 }
 
 // ───────────────────────────────────────────────────────────────
+// НОВЫЙ формат токенов: spans (offset,len) по одному norm-буферу
+// ───────────────────────────────────────────────────────────────
+
+struct TokenSpan {
+    std::uint32_t off;
+    std::uint32_t len;
+};
+
+inline void tokenize_spans(
+    const std::string& text,
+    std::vector<TokenSpan>& toks
+) {
+    toks.clear();
+    toks.reserve(128);
+
+    const std::size_t n = text.size();
+    std::size_t i = 0;
+
+    while (i < n) {
+        while (i < n && text[i] == ' ') {
+            ++i;
+        }
+        if (i >= n) break;
+
+        std::size_t start = i;
+        while (i < n && text[i] != ' ') {
+            ++i;
+        }
+        std::size_t len = i - start;
+        if (len > 0) {
+            TokenSpan ts;
+            ts.off = static_cast<std::uint32_t>(start);
+            ts.len = static_cast<std::uint32_t>(len);
+            toks.push_back(ts);
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────
 // FNV-1a 64 и шинглы
 // ───────────────────────────────────────────────────────────────
 
-inline std::uint64_t fnv1a64_bytes(const unsigned char* data, std::size_t len) {
+// базовый FNV без seed (старый интерфейс)
+inline std::uint64_t fnv1a64_bytes(
+    const unsigned char* data,
+    std::size_t len
+) {
     const std::uint64_t FNV_OFFSET = 1469598103934665603ULL;
     const std::uint64_t FNV_PRIME  = 1099511628211ULL;
 
     std::uint64_t h = FNV_OFFSET;
+    for (std::size_t i = 0; i < len; ++i) {
+        h ^= data[i];
+        h *= FNV_PRIME;
+    }
+    return h;
+}
+
+// вариант с seed — для simhash
+inline std::uint64_t fnv1a64_bytes_seed(
+    const unsigned char* data,
+    std::size_t len,
+    std::uint64_t seed
+) {
+    const std::uint64_t FNV_PRIME  = 1099511628211ULL;
+    std::uint64_t h = seed;
     for (std::size_t i = 0; i < len; ++i) {
         h ^= data[i];
         h *= FNV_PRIME;
@@ -313,8 +394,7 @@ inline std::uint64_t hash_shingle(const std::string& s) {
     return fnv1a64(s);
 }
 
-// новый вариант: считаем тот же хэш шингла, что и для строки
-// "toks[i] + ' ' + toks[i+1] + ...", но без промежуточного буфера.
+// старый вариант: шинглы по vector<string>
 inline std::uint64_t hash_shingle_tokens(
     const std::vector<std::string>& toks,
     int start,
@@ -365,4 +445,105 @@ inline std::vector<std::uint64_t> build_shingles(
     }
 
     return out;
+}
+
+// ───────────────────────────────────────────────────────────────
+// НОВЫЕ шинглы по TokenSpan
+// ───────────────────────────────────────────────────────────────
+
+inline std::uint64_t fnv1a64_span(
+    const std::string& norm,
+    const TokenSpan& span,
+    std::uint64_t seed
+) {
+    const auto* data = reinterpret_cast<const unsigned char*>(
+        norm.data() + span.off
+    );
+    return fnv1a64_bytes_seed(data, span.len, seed);
+}
+
+// "toks[i] + ' ' + ... + toks[i+k-1]" без промежуточной строки
+inline std::uint64_t hash_shingle_tokens_spans(
+    const std::string& norm,
+    const std::vector<TokenSpan>& toks,
+    int start,
+    int k
+) {
+    const std::uint64_t FNV_OFFSET = 1469598103934665603ULL;
+    const std::uint64_t FNV_PRIME  = 1099511628211ULL;
+
+    std::uint64_t h = FNV_OFFSET;
+    bool first = true;
+
+    for (int j = 0; j < k; ++j) {
+        const TokenSpan& ts = toks[start + j];
+
+        if (!first) {
+            unsigned char sp = static_cast<unsigned char>(' ');
+            h ^= sp;
+            h *= FNV_PRIME;
+        } else {
+            first = false;
+        }
+
+        const auto* data = reinterpret_cast<const unsigned char*>(
+            norm.data() + ts.off
+        );
+        for (std::size_t i = 0; i < ts.len; ++i) {
+            h ^= data[i];
+            h *= FNV_PRIME;
+        }
+    }
+
+    return h;
+}
+
+inline std::vector<std::uint64_t> build_shingles_spans(
+    const std::string& norm,
+    const std::vector<TokenSpan>& toks,
+    int k
+) {
+    std::vector<std::uint64_t> out;
+    const int n = static_cast<int>(toks.size());
+    if (n < k) return out;
+
+    const int cnt = n - k + 1;
+    out.reserve(cnt);
+
+    for (int i = 0; i < cnt; ++i) {
+        out.push_back(hash_shingle_tokens_spans(norm, toks, i, k));
+    }
+
+    return out;
+}
+
+// ───────────────────────────────────────────────────────────────
+// simhash128 по TokenSpan (для index_builder / поиска)
+// ───────────────────────────────────────────────────────────────
+
+inline std::pair<std::uint64_t, std::uint64_t> simhash128_spans(
+    const std::string& norm,
+    const std::vector<TokenSpan>& toks
+) {
+    long long v[128] = {0};
+
+    constexpr std::uint64_t SEED1 = 1469598103934665603ULL; // offset
+    constexpr std::uint64_t SEED2 = 1099511628211ULL;       // prime
+
+    for (const auto& ts : toks) {
+        std::uint64_t lo = fnv1a64_span(norm, ts, SEED1);
+        std::uint64_t hi = fnv1a64_span(norm, ts, SEED2);
+
+        for (int i = 0; i < 64; ++i) {
+            v[i]      += ((lo >> i) & 1ull) ? 1 : -1;
+            v[64 + i] += ((hi >> i) & 1ull) ? 1 : -1;
+        }
+    }
+
+    std::uint64_t hi = 0, lo = 0;
+    for (int i = 0; i < 64; ++i) {
+        if (v[i]      >= 0) lo |= (1ull << i);
+        if (v[64 + i] >= 0) hi |= (1ull << i);
+    }
+    return {hi, lo};
 }
