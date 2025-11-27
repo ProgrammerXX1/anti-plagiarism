@@ -9,10 +9,10 @@ extern "C" {
 typedef struct {
     int    doc_id_int;   // индекс в массиве doc_ids
     double score;
-    double j9;
+    double j9;           // метрики для k=9
     double c9;
-    double j13;
-    double c13;
+    double j13;          // сейчас всегда 0
+    double c13;          // сейчас всегда 0
     int    cand_hits;
 } SeHit;
 

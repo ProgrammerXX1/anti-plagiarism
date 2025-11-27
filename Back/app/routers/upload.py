@@ -1,5 +1,4 @@
 import hashlib
-import io
 import os
 import json
 import zipfile
@@ -17,7 +16,7 @@ from ..core.memlog import log_mem
 
 from ..core.config import (
     CORPUS_JSONL,
-    INDEX_JSON,
+    INDEX_DIR,
     UPLOAD_DIR,
 )
 from ..core.io_utils import file_lock
@@ -30,7 +29,9 @@ from ..services.helpers.normalizer import simple_tokens
 
 router = APIRouter(prefix="/api", tags=["Operations"])
 
-INDEX_NATIVE_META = INDEX_JSON.parent / "index_native_meta.json"
+# C++ индексы лежат прямо в INDEX_DIR
+INDEX_NATIVE_META = INDEX_DIR / "index_native_meta.json"
+DOCIDS_NATIVE = INDEX_DIR / "index_native_docids.json"
 
 
 # ---------- helpers ----------
@@ -47,6 +48,7 @@ def _iter_jsonl(path) -> Iterator[Dict[str, Any]]:
                     yield obj
             except json.JSONDecodeError:
                 continue
+
 
 def _chunked(seq, size: int):
     """Разбивает последовательность на куски по size."""
@@ -72,7 +74,7 @@ def _build_native_index() -> None:
       - corpus_jsonl = CORPUS_JSONL
       - index_dir    = директория, в которой лежат index_native.* файлы
     """
-    index_dir = INDEX_JSON.parent
+    index_dir = INDEX_DIR
     index_dir.mkdir(parents=True, exist_ok=True)
 
     log_mem(
@@ -140,41 +142,55 @@ def _collect_corpus_stats() -> Tuple[int, Set[str]]:
 
 def _collect_index_ids_safe() -> Set[str]:
     """
-    doc_id из C++ мета-файла index_native_meta.json, если он есть и валиден.
-
-    Текущий формат meta в index_native_export.py:
-        {
-            "docs_meta": { "<doc_id>": { ... }, ... },
-            "config": { ... }
-        }
-
-    Также поддерживаем старый формат:
-        { "docs": [ {"doc_id": "...", ...}, ... ] }
+    doc_id из:
+      1) index_native_meta.json (если есть и что-то в нём есть),
+      2) fallback: index_native_docids.json (массива doc_id).
+    Если ничего нет — пустое множество.
     """
-    if not INDEX_NATIVE_META.exists():
-        return set()
-
-    try:
-        with open(INDEX_NATIVE_META, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-    except Exception:
-        return set()
-
     ids: Set[str] = set()
 
-    # новый формат
-    docs_meta = meta.get("docs_meta")
-    if isinstance(docs_meta, dict):
-        ids.update(str(did) for did in docs_meta.keys())
+    # --- 1) пробуем meta (docs_meta / docs) ---
+    if INDEX_NATIVE_META.exists():
+        try:
+            with open(INDEX_NATIVE_META, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception as e:
+            logger.error("[_collect_index_ids_safe] failed to read meta: %s", e)
+            meta = {}
 
-    # старый формат (на всякий случай)
-    docs = meta.get("docs")
-    if isinstance(docs, list):
-        for d in docs:
-            if isinstance(d, dict):
-                did = d.get("doc_id")
+        docs_meta = meta.get("docs_meta")
+        if isinstance(docs_meta, dict):
+            ids.update(str(did) for did in docs_meta.keys())
+
+        docs = meta.get("docs")
+        if isinstance(docs, list):
+            for d in docs:
+                if isinstance(d, dict):
+                    did = d.get("doc_id")
+                    if isinstance(did, str):
+                        ids.add(did)
+
+        if ids:
+            logger.info(
+                "[_collect_index_ids_safe] got %d ids from index_native_meta.json",
+                len(ids),
+            )
+            return ids
+
+    # --- 2) fallback: index_native_docids.json ---
+    if DOCIDS_NATIVE.exists():
+        try:
+            with open(DOCIDS_NATIVE, "r", encoding="utf-8") as f:
+                lst = json.load(f)
+            for did in lst:
                 if isinstance(did, str):
                     ids.add(did)
+            logger.info(
+                "[_collect_index_ids_safe] got %d ids from index_native_docids.json",
+                len(ids),
+            )
+        except Exception as e:
+            logger.error("[_collect_index_ids_safe] failed to read docids: %s", e)
 
     return ids
 
@@ -597,7 +613,7 @@ async def upload_zip_admin(
 def build_index_native():
     """
     Строим ТОЛЬКО C++-индекс (index_native.*) поверх corpus.jsonl.
-    Python index.json больше не используем — вся тяжёлая работа в C++.
+    Python-индексов не касаемся.
     """
     logger.info("[index_build_native] === /api/build called (native only) ===")
     log_mem("index_build_native: STAGE 0 before stats")
@@ -644,7 +660,7 @@ def build_index_native():
     log_mem("index_build_native: STAGE 3 AFTER")
 
     return {
-        "index_dir": str(INDEX_JSON.parent),
+        "index_dir": str(INDEX_DIR),
         "index_native_meta": str(INDEX_NATIVE_META),
         "stats_before": {
             "corpus_lines": corpus_lines_before,
@@ -669,7 +685,7 @@ def build_index_native():
 def corpus_cleanup(
     delete_all: bool = Query(
         False,
-        description="true — удалить ВСЮ базу и индекс; false — удалить только неиндексированные",
+        description="true — удалить ВСЮ базу и C++-индекс; false — удалить только неиндексированные",
     ),
 ):
     # ===================== ВЕСЬ CORPUS + INDEX =====================
@@ -679,10 +695,9 @@ def corpus_cleanup(
         removed: List[str] = []
         for p in (
             CORPUS_JSONL,
-            INDEX_JSON,               # старый Python-индекс (на всякий случай)
             INDEX_NATIVE_META,
-            INDEX_JSON.parent / "index_native.bin",
-            INDEX_JSON.parent / "index_native_docids.json",
+            INDEX_DIR / "index_native.bin",
+            INDEX_DIR / "index_native_docids.json",
         ):
             if p.exists():
                 try:

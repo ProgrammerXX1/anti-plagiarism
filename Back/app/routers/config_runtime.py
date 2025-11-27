@@ -1,4 +1,3 @@
-# app/routers/config_runtime.py
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
@@ -39,7 +38,7 @@ def patch_ocr(body: OCRUpdate):
 @router.put("/index", response_model=RuntimeConfig)
 def put_index(body: IndexConfig):
     """
-    Полностью задать IndexConfig (все веса, пороги, MinHash и т.д.).
+    Полностью задать IndexConfig (все пороги/веса/лимиты для C++-индекса k=9).
     Новый конфиг начнёт использоваться при следующем /build.
     """
     cfg = update_index_cfg(body.model_dump())

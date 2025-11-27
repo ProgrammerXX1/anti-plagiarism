@@ -17,9 +17,11 @@ using json = nlohmann::json;
 
 namespace {
 
+constexpr int K = 9;  // длина шингла
+
 struct DocMeta {
     std::uint32_t tok_len;
-    std::uint32_t bm25_len;   // пока не используем, но оставим на будущее под BM25
+    std::uint32_t bm25_len;   // пока не используем, но оставим под BM25
     std::uint64_t simhash_hi;
     std::uint64_t simhash_lo;
 };
@@ -29,8 +31,8 @@ struct Config {
     int  w_min_query = 9;
 
     double alpha = 0.60;
-    double w13   = 0.85;
-    double w9    = 0.90;  // чисто для совместимости с config, в расчётах не участвует
+    double w13   = 0.85;  // не используем
+    double w9    = 0.90;  // вес k=9
 
     double plag_thr    = 0.70;
     double partial_thr = 0.30;
@@ -40,9 +42,9 @@ struct Config {
     int    max_cands_doc = 1000;
 };
 
-// компактная структура postings k=13
-struct Posting13 {
-    std::uint64_t h;   // hash шингла k=13
+// компактная структура postings k=9
+struct Posting9 {
+    std::uint64_t h;   // hash шингла k=9
     std::uint32_t did; // doc_id_int
 };
 
@@ -53,8 +55,8 @@ Config g_cfg;
 
 // doc_id_int → Meta
 std::vector<DocMeta> g_docs;
-// ПЛОСКИЙ массив postings k=13, отсортированный по h (и did)
-std::vector<Posting13> g_post13;
+// ПЛОСКИЙ массив postings k=9, отсортированный по h (и did)
+std::vector<Posting9> g_post9;
 // doc_id_int → doc_id (строка)
 std::vector<std::string> g_doc_ids;
 
@@ -78,31 +80,31 @@ static inline void jc_compute(
     C = static_cast<double>(inter) / static_cast<double>(q_size);
 }
 
-// поиск диапазона postings для данного hash13 через lower/upper_bound
-static inline std::pair<std::size_t, std::size_t> find_postings13_range(std::uint64_t h) {
-    if (g_post13.empty()) return {0, 0};
+// поиск диапазона postings для данного hash9 через lower/upper_bound
+static inline std::pair<std::size_t, std::size_t> find_postings9_range(std::uint64_t h) {
+    if (g_post9.empty()) return {0, 0};
 
     auto lower = std::lower_bound(
-        g_post13.begin(),
-        g_post13.end(),
+        g_post9.begin(),
+        g_post9.end(),
         h,
-        [](const Posting13& p, std::uint64_t value) {
+        [](const Posting9& p, std::uint64_t value) {
             return p.h < value;
         }
     );
-    if (lower == g_post13.end() || lower->h != h) {
+    if (lower == g_post9.end() || lower->h != h) {
         return {0, 0};
     }
     auto upper = std::upper_bound(
         lower,
-        g_post13.end(),
+        g_post9.end(),
         h,
-        [](std::uint64_t value, const Posting13& p) {
+        [](std::uint64_t value, const Posting9& p) {
             return value < p.h;
         }
     );
-    return {static_cast<std::size_t>(lower - g_post13.begin()),
-            static_cast<std::size_t>(upper - g_post13.begin())};
+    return {static_cast<std::size_t>(lower - g_post9.begin()),
+            static_cast<std::size_t>(upper - g_post9.begin())};
 }
 
 // читаем index_config.json из каталога индекса
@@ -129,8 +131,8 @@ static Config load_config_from_json(const std::string& index_dir) {
     if (j.contains("weights")) {
         auto w = j["weights"];
         if (w.contains("alpha")) cfg.alpha = w["alpha"].get<double>();
-        if (w.contains("w13"))   cfg.w13   = w["w13"].get<double>();
-        if (w.contains("w9"))    cfg.w9    = w["w9"].get<double>(); // не используем
+        if (w.contains("w13"))   cfg.w13   = w["w13"].get<double>(); // не используем
+        if (w.contains("w9"))    cfg.w9    = w["w9"].get<double>();
     }
     if (j.contains("thresholds")) {
         auto t = j["thresholds"];
@@ -149,21 +151,21 @@ static Config load_config_from_json(const std::string& index_dir) {
 
 // ── Загрузка индекса ─────────────────────────────────────────────────-
 //
-// Формат index_native.bin (k=13-only, совместим с твоим index_builder):
+// Формат index_native.bin (k=9-only или k9+k13):
 //   magic[4] = "PLAG"
 //   u32 version = 1
 //   u32 N_docs
-//   u64 N_post9   (у тебя всегда 0)
+//   u64 N_post9
 //   u64 N_post13
 //   [N_docs * (u32 tok_len, u64 simhash_hi, u64 simhash_lo)]
-//   [N_post9 * (u64 hash9, u32 doc_id_int)]         // 0 записей
-//   [N_post13 * (u64 hash13, u32 doc_id_int)]       // читаем в g_post13, потом sort
+//   [N_post9 * (u64 hash9,  u32 doc_id_int)]         // читаем в g_post9
+//   [N_post13 * (u64 hash13, u32 doc_id_int)]        // сейчас просто пропускаем
 //
 extern "C" int se_load_index(const char* index_dir_utf8) {
     std::call_once(g_init_flag, [&]() {
         g_index_loaded = false;
         g_docs.clear();
-        g_post13.clear();
+        g_post9.clear();
         g_doc_ids.clear();
 
         std::string dir = index_dir_utf8 ? std::string(index_dir_utf8) : std::string(".");
@@ -204,7 +206,7 @@ extern "C" int se_load_index(const char* index_dir_utf8) {
             std::cerr << "[se_load_index] suspicious N_docs=" << N_docs << ", abort\n";
             return;
         }
-        if (N_post13 > MAX_POSTINGS || N_post9 > MAX_POSTINGS) {
+        if (N_post9 > MAX_POSTINGS || N_post13 > MAX_POSTINGS) {
             std::cerr << "[se_load_index] suspicious postings counts: "
                       << "N_post9=" << N_post9 << " N_post13=" << N_post13 << ", abort\n";
             return;
@@ -225,7 +227,10 @@ extern "C" int se_load_index(const char* index_dir_utf8) {
             g_docs[i] = dm;
         }
 
-        // postings k9 — просто пропускаем, их нет (N_post9=0), но код оставим
+        // postings k9 — читаем в плоский массив
+        g_post9.clear();
+        g_post9.reserve(static_cast<std::size_t>(N_post9));
+
         for (std::uint64_t i = 0; i < N_post9; ++i) {
             std::uint64_t h;
             std::uint32_t did;
@@ -235,12 +240,14 @@ extern "C" int se_load_index(const char* index_dir_utf8) {
                 std::cerr << "[se_load_index] truncated postings9\n";
                 return;
             }
+            if (did >= N_docs) {
+                // защита от битых doc_id_int
+                continue;
+            }
+            g_post9.push_back(Posting9{h, did});
         }
 
-        // postings k13 — читаем в плоский массив
-        g_post13.clear();
-        g_post13.reserve(static_cast<std::size_t>(N_post13));
-
+        // postings k13 — сейчас просто пропускаем, если есть
         for (std::uint64_t i = 0; i < N_post13; ++i) {
             std::uint64_t h;
             std::uint32_t did;
@@ -250,20 +257,15 @@ extern "C" int se_load_index(const char* index_dir_utf8) {
                 std::cerr << "[se_load_index] truncated postings13\n";
                 return;
             }
-            if (did >= N_docs) {
-                // защита от битых doc_id_int
-                continue;
-            }
-            g_post13.push_back(Posting13{h, did});
         }
 
         bin.close();
 
         // сортируем postings по hash, потом по doc_id_int
         std::sort(
-            g_post13.begin(),
-            g_post13.end(),
-            [](const Posting13& a, const Posting13& b) {
+            g_post9.begin(),
+            g_post9.end(),
+            [](const Posting9& a, const Posting9& b) {
                 if (a.h != b.h) return a.h < b.h;
                 return a.did < b.did;
             }
@@ -300,14 +302,14 @@ extern "C" int se_load_index(const char* index_dir_utf8) {
 
         g_index_loaded = true;
         std::cerr << "[se_load_index] loaded: docs=" << g_docs.size()
-                  << " post13=" << g_post13.size()
-                  << " (flat postings, no unordered_map)\n";
+                  << " post9=" << g_post9.size()
+                  << " (k=9 flat postings)\n";
     });
 
     return g_index_loaded ? 0 : -1;
 }
 
-// ── Поиск по тексту (ТОЛЬКО k=13, postings плоские) ─────────────────────────
+// ── Поиск по тексту (ТОЛЬКО k=9) ─────────────────────────
 
 extern "C" SeSearchResult se_search_text(
     const char* text_utf8,
@@ -330,10 +332,10 @@ extern "C" SeSearchResult se_search_text(
         return result;
     }
 
-    // ТОЛЬКО k=13
-    auto s13 = build_shingles(qtoks, 13);
-    const int qS13 = static_cast<int>(s13.size());
-    if (qS13 <= 0) {
+    // k=9
+    auto s9 = build_shingles(qtoks, K);
+    const int qS9 = static_cast<int>(s9.size());
+    if (qS9 <= 0) {
         return result;
     }
 
@@ -345,15 +347,15 @@ extern "C" SeSearchResult se_search_text(
     std::vector<int>          cand_hits(N_docs, 0);
     std::vector<std::uint8_t> cand_mask(N_docs, 0);
 
-    const int fetch13 = std::min(cfg.fetch_per_k, qS13);
+    const int fetch9 = std::min(cfg.fetch_per_k, qS9);
 
-    // кандидаты по k13: для первых fetch13 шинглов
-    for (int i = 0; i < fetch13; ++i) {
-        std::uint64_t h = s13[i];
-        auto [beg, end] = find_postings13_range(h);
+    // кандидаты по k9: для первых fetch9 шинглов
+    for (int i = 0; i < fetch9; ++i) {
+        std::uint64_t h = s9[i];
+        auto [beg, end] = find_postings9_range(h);
         if (beg == end) continue;
         for (std::size_t idx = beg; idx < end; ++idx) {
-            std::uint32_t did = g_post13[idx].did;
+            std::uint32_t did = g_post9[idx].did;
             if (static_cast<int>(did) >= N_docs) continue;
             cand_hits[did] += 1;
             cand_mask[did] = 1;
@@ -395,7 +397,7 @@ extern "C" SeSearchResult se_search_text(
         cand_list.resize(cfg.max_cands_doc);
     }
 
-    std::vector<int>          inter13(N_docs, 0);
+    std::vector<int>          inter9(N_docs, 0);
     std::vector<std::uint8_t> is_cand(N_docs, 0);
     for (auto& c : cand_list) {
         if (static_cast<int>(c.did) < N_docs) {
@@ -403,19 +405,19 @@ extern "C" SeSearchResult se_search_text(
         }
     }
 
-    // уникальные шинглы запроса k13 → пересечения по всем postings
+    // уникальные шинглы запроса k9 → пересечения по всем postings
     {
-        std::vector<std::uint64_t> uniq = s13;
+        std::vector<std::uint64_t> uniq = s9;
         std::sort(uniq.begin(), uniq.end());
         uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
 
         for (auto h : uniq) {
-            auto [beg, end] = find_postings13_range(h);
+            auto [beg, end] = find_postings9_range(h);
             if (beg == end) continue;
             for (std::size_t idx = beg; idx < end; ++idx) {
-                std::uint32_t did = g_post13[idx].did;
+                std::uint32_t did = g_post9[idx].did;
                 if (static_cast<int>(did) < N_docs && is_cand[did]) {
-                    inter13[did] += 1;
+                    inter9[did] += 1;
                 }
             }
         }
@@ -424,17 +426,17 @@ extern "C" SeSearchResult se_search_text(
     struct Scored {
         std::uint32_t did;
         double score;
-        double j13;
-        double c13;
+        double j9;
+        double c9;
         int    hits;
     };
     std::vector<Scored> scored;
     scored.reserve(cand_list.size());
 
     const double alpha = cfg.alpha;
-    const double w13   = cfg.w13;
+    const double w9    = cfg.w9;
 
-    const int tQ13 = qS13;
+    const int tQ9 = qS9;
 
     for (const auto& c : cand_list) {
         int did = static_cast<int>(c.did);
@@ -442,26 +444,26 @@ extern "C" SeSearchResult se_search_text(
         if (static_cast<int>(dm.tok_len) < cfg.w_min_doc) continue;
 
         int tlen = static_cast<int>(dm.tok_len);
-        int T13  = std::max(0, tlen - 13 + 1);
+        int T9   = std::max(0, tlen - K + 1);
 
-        int i13 = inter13[did];
-        if (i13 < 1) {
-            // минимум 1 пересекающийся шингл k=13
+        int i9 = inter9[did];
+        if (i9 < 1) {
+            // минимум 1 пересекающийся шингл k=9
             continue;
         }
 
-        double J13 = 0.0, C13 = 0.0;
-        if (tQ13 > 0 && T13 > 0) {
-            jc_compute(i13, tQ13, T13, J13, C13);
+        double J9 = 0.0, C9 = 0.0;
+        if (tQ9 > 0 && T9 > 0) {
+            jc_compute(i9, tQ9, T9, J9, C9);
         }
 
-        double score = w13 * (alpha * J13 + (1.0 - alpha) * C13);
+        double score = w9 * (alpha * J9 + (1.0 - alpha) * C9);
 
         scored.push_back(Scored{
             static_cast<std::uint32_t>(did),
             score,
-            J13,
-            C13,
+            J9,
+            C9,
             c.hits
         });
     }
@@ -483,11 +485,11 @@ extern "C" SeSearchResult se_search_text(
         const auto& s = scored[i];
         out_hits[i].doc_id_int = static_cast<int>(s.did);
         out_hits[i].score      = s.score;
-        // k=9 больше не считаем — нули для ABI с SeHit
-        out_hits[i].j9         = 0.0;
-        out_hits[i].c9         = 0.0;
-        out_hits[i].j13        = s.j13;
-        out_hits[i].c13        = s.c13;
+        // k=13 больше не считаем — нули для ABI с SeHit
+        out_hits[i].j9         = s.j9;
+        out_hits[i].c9         = s.c9;
+        out_hits[i].j13        = 0.0;
+        out_hits[i].c13        = 0.0;
         out_hits[i].cand_hits  = s.hits;
     }
 

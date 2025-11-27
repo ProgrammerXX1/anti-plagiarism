@@ -21,21 +21,21 @@ INDEX_NATIVE_META = INDEX_JSON.parent / "index_native_meta.json"
 
 def _load_index_stats() -> tuple[int, int]:
     """
-    Возвращает (indexed_docs, k13).
+    Возвращает (indexed_docs, k9).
 
     Читает ТОЛЬКО C++ meta: index_native_meta.json.
-    Ожидаемый формат (примерно):
+    Ожидаемый формат (упрощённо):
     {
-      "docs": [
-        {"doc_id": "doc_xxx", ...},
+      "docs_meta": {
+        "doc_...": {...},
         ...
-      ],
+      },
       "stats": {
-        "k13": 123456,
+        "k9": 123456,
         ...
       }
     }
-    или вместо "docs" может быть "docs_meta".
+
     Если файла нет или формат неожиданный — вернёт (0, 0).
     """
     if not INDEX_NATIVE_META.exists():
@@ -56,21 +56,21 @@ def _load_index_stats() -> tuple[int, int]:
     elif isinstance(docs, dict):
         indexed = sum(1 for _ in docs.keys())
 
-    # k13 из stats или из корня meta
+    # k9 из stats или из корня meta
     stats = meta.get("stats") or {}
-    k13_raw = (
-        stats.get("k13")
-        or stats.get("k13_unique")
-        or meta.get("k13")
-        or meta.get("k13_unique")
+    k9_raw = (
+        stats.get("k9")
+        or stats.get("k9_unique")
+        or meta.get("k9")
+        or meta.get("k9_unique")
         or 0
     )
     try:
-        k13 = int(k13_raw)
+        k9 = int(k9_raw)
     except (TypeError, ValueError):
-        k13 = 0
+        k9 = 0
 
-    return indexed, k13
+    return indexed, k9
 
 
 # ---------- health ----------
@@ -185,7 +185,7 @@ def corpus_list(
     Список документов из corpus.jsonl с пагинацией.
     Плюс:
       - index: сколько документов сейчас проиндексировано в C++-индексе
-      - k13: сколько уникальных шинглов k=13 (по данным C++)
+      - k9: сколько уникальных шинглов k=9 (по данным C++)
     """
     if not CORPUS_JSONL.exists():
         raise HTTPException(404, "corpus.jsonl not found")
@@ -217,12 +217,12 @@ def corpus_list(
             }
         )
 
-    indexed, k13 = _load_index_stats()
+    indexed, k9 = _load_index_stats()
 
     return {
         "total": total,      # всего документов в corpus.jsonl
         "index": indexed,    # сколько документов есть в C++-индексе
-        "k13": k13,          # уникальные шинглы k=13 (по данным C++)
+        "k9": k9,            # уникальные шинглы k=9 (по данным C++)
         "offset": offset,
         "limit": limit,
         "items": items,
