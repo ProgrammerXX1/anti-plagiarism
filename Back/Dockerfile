@@ -7,6 +7,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         build-essential \
         nlohmann-json3-dev \
+        libsimdjson-dev \
         tesseract-ocr \
         tesseract-ocr-eng \
         tesseract-ocr-rus \
@@ -23,17 +24,19 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Копируем весь проект (включая cpp/)
 COPY . .
 
-# Сборка C++-библиотеки и бинарника индексатора
+# Сборка C++-библиотеки (поиск) — simdjson тут не нужен
 RUN set -ex && \
     ls -R cpp && \
     g++ -O3 -std=c++17 -fPIC -shared \
         cpp/search_core.cpp \
         -o /usr/local/lib/libsearchcore.so
 
+# Сборка бинарника индексатора с simdjson
 RUN set -ex && \
     g++ -O3 -std=c++17 \
         cpp/index_builder.cpp \
-        -o /usr/local/bin/index_builder
+        -o /usr/local/bin/index_builder \
+        -lsimdjson
 
 ENV LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH}
 

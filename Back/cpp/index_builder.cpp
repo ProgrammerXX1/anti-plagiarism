@@ -2,12 +2,15 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <utility>
 #include <cstdint>
 #include <algorithm>
 
+#include <simdjson.h>
 #include <nlohmann/json.hpp>
+
 #include "text_common.h"
 
 using json = nlohmann::json;
@@ -66,16 +69,37 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Чтобы не тормозить на std::endl/синке
     std::ios::sync_with_stdio(false);
     std::cin.tie(nullptr);
 
-    std::vector<DocMeta> docs;
-    std::vector<std::string> doc_ids;
-
-    // Плоский список постингов k=9: (hash9, doc_id_int)
+    std::vector<DocMeta>      docs;
+    std::vector<std::string>  doc_ids;
     std::vector<std::pair<std::uint64_t, std::uint32_t>> postings9;
-    postings9.reserve(1024 * 1024); // стартовая оценка, потом сам вырастет
+
+    // Грубая оценка размеров по размеру файла
+    {
+        std::streampos cur = in.tellg();
+        in.seekg(0, std::ios::end);
+        std::streampos end = in.tellg();
+        in.seekg(cur);
+
+        if (end > 0) {
+            std::size_t fsize = static_cast<std::size_t>(end);
+            std::size_t est_docs = fsize / 2048;  // ~2 KB/док
+            if (est_docs < 1024) {
+                est_docs = 1024;
+            }
+            docs.reserve(est_docs);
+            doc_ids.reserve(est_docs);
+
+            std::size_t est_shingles_per_doc = 64;
+            postings9.reserve(est_docs * est_shingles_per_doc);
+        } else {
+            postings9.reserve(1024 * 1024);
+        }
+    }
+
+    simdjson::dom::parser parser;
 
     std::string line;
     std::uint32_t doc_id_int = 0;
@@ -85,29 +109,40 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        json j;
-        try {
-            j = json::parse(line);
-        } catch (...) {
+        // Парс одной JSON-строки через simdjson
+        simdjson::dom::element doc;
+        auto err = parser.parse(line).get(doc);
+        if (err) {
             // битая строка — пропускаем
             continue;
         }
 
-        std::string did  = j.value("doc_id", "");
-        std::string text = j.value("text", "");
-        if (did.empty() || text.empty()) {
+        // doc_id
+        std::string_view did_sv;
+        err = doc["doc_id"].get(did_sv);
+        if (err || did_sv.empty()) {
             continue;
         }
+
+        // text
+        std::string_view text_sv;
+        err = doc["text"].get(text_sv);
+        if (err || text_sv.empty()) {
+            continue;
+        }
+
+        // Копируем в std::string (line переиспользуется)
+        std::string did{did_sv};
+        std::string text{text_sv};
 
         // Нормализация и токены — тот же пайплайн, что в C++ поиске
         std::string norm = normalize_for_shingles_simple(text);
         auto toks = simple_tokens(norm);
         if (toks.size() < static_cast<std::size_t>(K)) {
-            // слишком короткий документ — пропускаем
             continue;
         }
 
-        // Только k=9
+        // Только k=9 — уже без конкатенации строк, через hash_shingle_tokens()
         auto sh9 = build_shingles(toks, K);
         if (sh9.empty()) {
             continue;
@@ -121,7 +156,6 @@ int main(int argc, char** argv) {
         dm.simhash_lo = lo;
         docs.push_back(dm);
 
-        // Записываем постинги в плоский вектор
         for (auto h : sh9) {
             postings9.emplace_back(h, doc_id_int);
         }
@@ -159,12 +193,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Заголовок совместим с se_load_index:
-    // magic[4] = "PLAG"
-    // u32 version
-    // u32 N_docs
-    // u64 N_post9
-    // u64 N_post13
     const char magic[4] = { 'P', 'L', 'A', 'G' };
     bout.write(magic, 4);
     std::uint32_t version = 1;
@@ -173,14 +201,12 @@ int main(int argc, char** argv) {
     bout.write(reinterpret_cast<const char*>(&N_post9), sizeof(N_post9));
     bout.write(reinterpret_cast<const char*>(&N_post13),sizeof(N_post13));
 
-    // docs_meta (в том же порядке, что doc_ids / doc_id_int)
     for (const auto& dm : docs) {
         bout.write(reinterpret_cast<const char*>(&dm.tok_len),    sizeof(dm.tok_len));
         bout.write(reinterpret_cast<const char*>(&dm.simhash_hi), sizeof(dm.simhash_hi));
         bout.write(reinterpret_cast<const char*>(&dm.simhash_lo), sizeof(dm.simhash_lo));
     }
 
-    // postings k9: (h9, doc_id_int) подряд
     for (const auto& p : postings9) {
         const std::uint64_t h   = p.first;
         const std::uint32_t did = p.second;
@@ -188,7 +214,6 @@ int main(int argc, char** argv) {
         bout.write(reinterpret_cast<const char*>(&did), sizeof(did));
     }
 
-    // postings k13 отсутствуют, т.к. N_post13 = 0
     bout.close();
 
     // ── index_native_docids.json ──────────────────────────────────
@@ -205,29 +230,6 @@ int main(int argc, char** argv) {
     }
 
     // ── index_native_meta.json ────────────────────────────────────
-    //
-    // Формат под твой Python:
-    // {
-    //   "docs_meta": {
-    //       "<doc_id>": {
-    //           "tok_len": 123,
-    //           "simhash_hi": "<uint64>",
-    //           "simhash_lo": "<uint64>"
-    //       },
-    //       ...
-    //   },
-    //   "config": {
-    //       "thresholds": {
-    //           "plag_thr": 0.7,
-    //           "partial_thr": 0.3
-    //       }
-    //   },
-    //   "stats": {
-    //       "docs": N_docs,
-    //       "k9": N_post9,
-    //       "k13": 0
-    //   }
-    // }
 
     json j_docs_meta = json::object();
     for (std::size_t i = 0; i < doc_ids.size(); ++i) {
@@ -236,7 +238,6 @@ int main(int argc, char** argv) {
 
         json mobj;
         mobj["tok_len"]    = dm.tok_len;
-        // Сохраняем simhash как uint64 (можно и строкой, но Pythonу всё равно — сейчас он их не использует)
         mobj["simhash_hi"] = dm.simhash_hi;
         mobj["simhash_lo"] = dm.simhash_lo;
 
@@ -246,7 +247,6 @@ int main(int argc, char** argv) {
     json j_meta;
     j_meta["docs_meta"] = std::move(j_docs_meta);
 
-    // базовые пороги на всякий случай (Python всё равно имеет дефолты)
     json j_cfg;
     json j_thr;
     j_thr["plag_thr"]    = 0.7;
@@ -272,6 +272,6 @@ int main(int argc, char** argv) {
 
     std::cout << "[index_builder] built index_native.bin docs=" << N_docs
               << " post9=" << N_post9
-              << " (k13=0, k9-only)\n";
+              << " (k13=0, k9-only, simdjson, no buf-concat)\n";
     return 0;
 }

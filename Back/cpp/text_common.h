@@ -201,9 +201,9 @@ inline std::string normalize_for_shingles_simple(const std::string& in) {
         std::uint32_t cp = 0;
         bool ok = decode_utf8_cp(data, n, i, cp);
         if (!ok) {
-            if (!prev_space) { 
-                out.push_back(' '); 
-                prev_space = true; 
+            if (!prev_space) {
+                out.push_back(' ');
+                prev_space = true;
             }
             continue;
         }
@@ -214,14 +214,12 @@ inline std::string normalize_for_shingles_simple(const std::string& in) {
             cp == 0x202F || cp == 0x2007 || cp == 0x2002 ||
             cp == 0x2003 || cp == 0x2001 || cp == 0x2004 ||
             cp == 0x2005 || cp == 0x2006) {
-            if (!prev_space) { 
-                out.push_back(' '); 
-                prev_space = true; 
+            if (!prev_space) {
+                out.push_back(' ');
+                prev_space = true;
             }
             continue;
         }
-
-        // ------------------------------------------------------------
 
         cp = to_lower_ru_kk_tr(cp);
         cp = fold_equiv(cp);
@@ -229,8 +227,6 @@ inline std::string normalize_for_shingles_simple(const std::string& in) {
         // ========= FIX 2: fold Turkish/Kazakh dotless i =========
         // ı (Latin small dotless i) -> normal 'i'
         if (cp == 0x0131) cp = 0x0069;
-
-        // ------------------------------------------------------------
 
         // combining accents: выкидываем (Python тоже выбрасывает до токенизации)
         if (cp >= 0x0300 && cp <= 0x036F) {
@@ -240,14 +236,12 @@ inline std::string normalize_for_shingles_simple(const std::string& in) {
         // ========= FIX 3: remove Extended Latin (Python strips it) =========
         // диапазон U+00C0..U+02AF включает множество диакритических символов
         if (cp >= 0x00C0 && cp <= 0x02AF) {
-            if (!prev_space) { 
-                out.push_back(' '); 
-                prev_space = true; 
+            if (!prev_space) {
+                out.push_back(' ');
+                prev_space = true;
             }
             continue;
         }
-
-        // ------------------------------------------------------------
 
         if (is_word_cp(cp)) {
             append_utf8_cp(out, cp);
@@ -260,21 +254,23 @@ inline std::string normalize_for_shingles_simple(const std::string& in) {
         }
     }
 
-    // trim left/right
+    // trim right
     while (!out.empty() && out.back() == ' ') out.pop_back();
+    // trim left
     while (!out.empty() && out.front() == ' ') out.erase(out.begin());
 
     return out;
 }
 
-
 // ───────────────────────────────────────────────────────────────
-// Токенизация и шинглы
+// Токенизация
 // ───────────────────────────────────────────────────────────────
 
 inline std::vector<std::string> simple_tokens(const std::string& text) {
     std::vector<std::string> toks;
     std::string cur;
+    toks.reserve(128); // небольшой стартовый запас
+
     for (unsigned char c : text) {
         if (c == ' ') {
             if (!cur.empty()) {
@@ -289,21 +285,68 @@ inline std::vector<std::string> simple_tokens(const std::string& text) {
     return toks;
 }
 
-// стабильный FNV-1a 64
-inline std::uint64_t fnv1a64(const std::string& s) {
+// ───────────────────────────────────────────────────────────────
+// FNV-1a 64 и шинглы
+// ───────────────────────────────────────────────────────────────
+
+inline std::uint64_t fnv1a64_bytes(const unsigned char* data, std::size_t len) {
     const std::uint64_t FNV_OFFSET = 1469598103934665603ULL;
     const std::uint64_t FNV_PRIME  = 1099511628211ULL;
 
     std::uint64_t h = FNV_OFFSET;
-    for (unsigned char c : s) {
-        h ^= c;
+    for (std::size_t i = 0; i < len; ++i) {
+        h ^= data[i];
         h *= FNV_PRIME;
     }
     return h;
 }
 
+// старый интерфейс для совместимости
+inline std::uint64_t fnv1a64(const std::string& s) {
+    return fnv1a64_bytes(
+        reinterpret_cast<const unsigned char*>(s.data()),
+        s.size()
+    );
+}
+
 inline std::uint64_t hash_shingle(const std::string& s) {
     return fnv1a64(s);
+}
+
+// новый вариант: считаем тот же хэш шингла, что и для строки
+// "toks[i] + ' ' + toks[i+1] + ...", но без промежуточного буфера.
+inline std::uint64_t hash_shingle_tokens(
+    const std::vector<std::string>& toks,
+    int start,
+    int k
+) {
+    const std::uint64_t FNV_OFFSET = 1469598103934665603ULL;
+    const std::uint64_t FNV_PRIME  = 1099511628211ULL;
+
+    std::uint64_t h = FNV_OFFSET;
+    bool first = true;
+
+    for (int j = 0; j < k; ++j) {
+        const std::string& token = toks[start + j];
+
+        if (!first) {
+            unsigned char sp = static_cast<unsigned char>(' ');
+            h ^= sp;
+            h *= FNV_PRIME;
+        } else {
+            first = false;
+        }
+
+        const unsigned char* data =
+            reinterpret_cast<const unsigned char*>(token.data());
+        const std::size_t len = token.size();
+        for (std::size_t i = 0; i < len; ++i) {
+            h ^= data[i];
+            h *= FNV_PRIME;
+        }
+    }
+
+    return h;
 }
 
 inline std::vector<std::uint64_t> build_shingles(
@@ -311,16 +354,15 @@ inline std::vector<std::uint64_t> build_shingles(
     int k
 ) {
     std::vector<std::uint64_t> out;
-    if ((int)toks.size() < k) return out;
-    std::string buf;
-    for (int i = 0; i <= (int)toks.size() - k; ++i) {
-        buf.clear();
-        for (int j = 0; j < k; ++j) {
-            if (j) buf.push_back(' ');
-            buf += toks[i + j];
-        }
-        out.push_back(hash_shingle(buf));
+    const int n = static_cast<int>(toks.size());
+    if (n < k) return out;
+
+    const int cnt = n - k + 1;
+    out.reserve(cnt);
+
+    for (int i = 0; i < cnt; ++i) {
+        out.push_back(hash_shingle_tokens(toks, i, k));
     }
+
     return out;
 }
-

@@ -18,7 +18,7 @@ services:
     mem_limit: 24g
     memswap_limit: 24g 
     cpuset: "0-7"     # только эти ядра
-    cpus: "8"          # поиск ~30%
+    cpus: "8"          # поиск ~1/3%
 
   plagio-ops:
     build: .
@@ -31,7 +31,7 @@ services:
     environment:
       - PLAGIO_ROOT=/runtime
       - PLAGIO_OCR_LANG=kaz+rus+eng
-      - PLAGIO_OCR_WORKERS=12       # под 70% мощности — 12 потоков идеал
+      - PLAGIO_OCR_WORKERS=8       # под 50% мощности — 8 потоков идеал
     volumes:
       - ./runtime:/runtime
     ports:
@@ -39,4 +39,4 @@ services:
     mem_limit: 80g
     memswap_limit: 80g 
     cpuset: "8-23"
-    cpus: "16"         # индекс ~70%
+    cpus: "16"         # индекс ~2/3%
