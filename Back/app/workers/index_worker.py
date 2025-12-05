@@ -11,6 +11,8 @@
    → создаёт связи в segment_docs
    → статус документов 'indexed'.
 """
+from app.core.config import INDEX_DIR, UPLOAD_DIR, CORPUS_JSONL
+from app.services.helpers.file_extract import extract_text_from_file_bytes, norm_for_local
 
 import asyncio
 import json
@@ -35,7 +37,11 @@ def utcnow() -> datetime:
 
 async def process_uploaded_docs() -> int:
     """
-    uploaded -> etl_ok + запись заглушек в corpus.jsonl
+    uploaded -> etl_ok + реальный ETL:
+      - читаем файл из UPLOAD_DIR
+      - вытаскиваем текст
+      - нормализуем
+      - пишем в corpus.jsonl
     """
     async with AsyncSessionLocal() as session:
         result = await session.execute(
@@ -51,14 +57,41 @@ async def process_uploaded_docs() -> int:
 
         print(f"[ETL] Обрабатываю {len(docs)} документ(ов)")
 
-        # простейшая заглушка ETL: пишем в corpus.jsonl фейковый текст
         with CORPUS_JSONL.open("a", encoding="utf-8") as f:
             for doc in docs:
+                if not doc.external_id:
+                    print(f"[ETL] WARNING: doc id={doc.id} без external_id, пропускаю")
+                    continue
+
+                file_path = UPLOAD_DIR / doc.external_id
+
+                if not file_path.exists():
+                    print(f"[ETL] WARNING: файл не найден: {file_path}, пропускаю doc id={doc.id}")
+                    continue
+
+                # читаем байты файла
+                try:
+                    raw_bytes = file_path.read_bytes()
+                except Exception as e:
+                    print(f"[ETL] ERROR: не удалось прочитать {file_path}: {e}")
+                    continue
+
+                # вытаскиваем текст (PDF/DOCX и т.п.)
+                try:
+                    raw_text = extract_text_from_file_bytes(raw_bytes, filename=str(file_path))
+                except Exception as e:
+                    print(f"[ETL] ERROR: extract_text для {file_path}: {e}")
+                    continue
+
+                # нормализация под шинглы (та же, что для онлайновой проверки)
+                norm_text = norm_for_local(raw_text)
+
+                # пишем в corpus.jsonl
                 rec = {
                     "doc_id": doc.id,
                     "external_id": doc.external_id,
                     "shard_id": doc.shard_id,
-                    "text": f"Dummy text for doc {doc.id} (заглушка ETL)",
+                    "text": norm_text,
                 }
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
@@ -98,6 +131,10 @@ async def build_first_segment() -> int:
 
         now = utcnow()
 
+        # путь директории сегмента на диске
+        segment_dir = INDEX_DIR / f"shard_{shard_id}" / f"segment_{shard_id}_{int(now.timestamp())}"
+        segment_dir.mkdir(parents=True, exist_ok=True)
+
         # создаём сегмент (заглушка, path пока фиктивный)
         segment = Segment(
             shard_id=shard_id,
@@ -116,6 +153,22 @@ async def build_first_segment() -> int:
 
         print(f"[SEGMENT] Создан сегмент id={segment.id}, shard_id={shard_id}")
 
+                # meta.json (пока минимальный)
+        meta = {
+            "segment_id": segment.id,
+            "shard_id": shard_id,
+            "level": 1,
+            "doc_count": len(docs),
+            "created_at": now.isoformat(),
+            "documents": [d.id for d in docs],
+        }
+        meta_path = segment_dir / "meta.json"
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        # заглушки под бинарники (пустые файлы)
+        for fname in ("postings.bin", "lexicon.bin", "docs_meta.bin"):
+            (segment_dir / fname).touch()
+
         # связи документ ↔ сегмент
         for doc in docs:
             doc.segment_id = segment.id
@@ -128,6 +181,13 @@ async def build_first_segment() -> int:
                 shard_id=doc.shard_id,
             )
             session.add(sd)
+
+        # обновим size_bytes по факту
+        size_bytes = sum(
+            (segment_dir / fn).stat().st_size
+            for fn in ("meta.json", "postings.bin", "lexicon.bin", "docs_meta.bin")
+        )
+        segment.size_bytes = size_bytes
 
         await session.commit()
         print(f"[SEGMENT] Документов привязано к сегменту: {len(docs)}")

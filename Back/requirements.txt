@@ -9,11 +9,14 @@ pdfminer.six
 pdf2image
 pytesseract
 httpx
+numpy>=1.24
+sqlalchemy
+asyncpg
+pymupdf
+beautifulsoup4
 
 # === SEMANTIC + EMBEDDER ===
 # torch                         # ставится под нужную CUDA отдельно
 # sentence-transformers>=2.6
 # transformers>=4.40
-numpy>=1.24
-sqlalchemy
-asyncpg
+
