@@ -11,7 +11,7 @@ from sqlalchemy import (
     BigInteger,
     DateTime,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
 
@@ -38,4 +38,14 @@ class Segment(Base):
     )
     last_access_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+
+    documents: Mapped[list["Document"]] = relationship(
+        "Document",
+        back_populates="segment",
+    )
+    segment_docs: Mapped[list["SegmentDoc"]] = relationship(
+        "SegmentDoc",
+        back_populates="segment",
+        cascade="all, delete-orphan",
     )

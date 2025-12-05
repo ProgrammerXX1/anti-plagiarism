@@ -51,4 +51,13 @@ class Document(Base):
     faculty: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     group_name: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    segment: Mapped["Segment"] = relationship("Segment", backref="documents")
+    segment: Mapped["Segment"] = relationship(
+        "Segment",
+        back_populates="documents",
+    )
+
+    segment_docs: Mapped[list["SegmentDoc"]] = relationship(
+        "SegmentDoc",
+        back_populates="document",
+        cascade="all, delete-orphan",
+    )
