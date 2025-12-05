@@ -1,42 +1,23 @@
 services:
-  plagio-search:
+  plagio-worker:
     build: .
-    container_name: plagio-search
-    command: >
-      uvicorn app.main_search:app
-      --host 0.0.0.0
-      --port 8001
-      --workers 1
+    container_name: plagio-worker
+    command: ["python", "-m", "app.workers.index_worker"]
     environment:
-      - PLAGIO_ROOT=/runtime
-      - PLAGIO_SEMANTIC_URL=http://plagio-semantic:8003
-      - PLAGIO_USE_SEMANTIC_RERANK=false
-    volumes:
-      - ./runtime:/runtime
-    ports:
-      - "8001:8001"
-    mem_limit: 24g
-    memswap_limit: 24g 
-    cpuset: "0-7"     # только эти ядра
-    cpus: "8"          # поиск ~1/3%
+      - PG_HOST=192.168.75.70
+      - PG_PORT=5432
+      - PG_DB=oysyn
+      - PG_USER=oysyn
+      - PG_PASS=2123
+    # НИКАКИХ depends_on: postgres тут не нужно
 
-  plagio-ops:
+  plagio-enqueue:
     build: .
-    container_name: plagio-ops
-    command: >
-      uvicorn app.main_ops:app
-      --host 0.0.0.0
-      --port 8002
-      --workers 1
+    command: ["python", "-m", "app.scripts.enqueue_test_tasks"]
     environment:
-      - PLAGIO_ROOT=/runtime
-      - PLAGIO_OCR_LANG=kaz+rus+eng
-      - PLAGIO_OCR_WORKERS=8       # под 50% мощности — 8 потоков идеал
-    volumes:
-      - ./runtime:/runtime
-    ports:
-      - "8002:8002"
-    mem_limit: 80g
-    memswap_limit: 80g 
-    cpuset: "8-23"
-    cpus: "16"         # индекс ~2/3%
+      - PG_HOST=192.168.75.70
+      - PG_PORT=5432
+      - PG_DB=oysyn
+      - PG_USER=oysyn
+      - PG_PASS=2123
+    # тоже без depends_on: postgres

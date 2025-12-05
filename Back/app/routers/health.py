@@ -1,7 +1,7 @@
 import json
 from typing import Dict, Any, List
 
-from fastapi import APIRouter, HTTPException, Query, UploadFile, File
+from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Depends
 from fastapi.responses import Response
 
 from ..routers.upload import _iter_jsonl
@@ -10,6 +10,9 @@ from ..core.runtime_cfg import get_runtime_cfg
 from ..core.logger import logger
 from ..services.helpers.normalizer import simple_tokens
 from ..services.converters.pdf_convert import smart_pdf_to_docx
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func
+
 
 router = APIRouter(prefix="/api", tags=["Base"])
 
