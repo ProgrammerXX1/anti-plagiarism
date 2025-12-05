@@ -1,6 +1,6 @@
 # app/models/segment.py
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
 from sqlalchemy import (
     BigInteger,
@@ -8,7 +8,6 @@ from sqlalchemy import (
     SmallInteger,
     String,
     Text,
-    BigInteger,
     DateTime,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -40,11 +39,8 @@ class Segment(Base):
         DateTime(timezone=True), nullable=True
     )
 
-    documents: Mapped[list["Document"]] = relationship(
-        "Document",
-        back_populates="segment",
-    )
-    segment_docs: Mapped[list["SegmentDoc"]] = relationship(
+    # связь с SegmentDoc
+    segment_docs: Mapped[List["SegmentDoc"]] = relationship(
         "SegmentDoc",
         back_populates="segment",
         cascade="all, delete-orphan",

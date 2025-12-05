@@ -1,6 +1,6 @@
 # app/models/document.py
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
 from sqlalchemy import (
     BigInteger,
@@ -21,7 +21,6 @@ class Document(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
 
     external_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-
     shard_id: Mapped[int] = mapped_column(Integer, nullable=False)
 
     segment_id: Mapped[Optional[int]] = mapped_column(
@@ -51,12 +50,10 @@ class Document(Base):
     faculty: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     group_name: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    segment: Mapped["Segment"] = relationship(
-        "Segment",
-        back_populates="documents",
-    )
+    segment: Mapped[Optional["Segment"]] = relationship("Segment", backref="documents")
 
-    segment_docs: Mapped[list["SegmentDoc"]] = relationship(
+    # связь с SegmentDoc
+    segment_docs: Mapped[List["SegmentDoc"]] = relationship(
         "SegmentDoc",
         back_populates="document",
         cascade="all, delete-orphan",
