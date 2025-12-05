@@ -6,7 +6,7 @@ from .core.logger import logger
 from .routers import search, config_runtime, health, experiment
 from .services.search_native import native_load_index
 from .core.memlog import log_mem
-from .routers import upload, config_runtime, health  # upload = твой "Operations" router
+from .routers import upload, config_runtime, health, document_upload  # upload = твой "Operations" router
 
 app = FastAPI(
     title="Plagiarism Operations API",
@@ -35,6 +35,7 @@ logger.info("=== main_ops started ===")
 
 
 app.include_router(experiment.router)
+app.include_router(document_upload.router)
 # app.include_router(upload.router)
 # app.include_router(search.router)
 # app.include_router(config_runtime.router)

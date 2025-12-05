@@ -21,3 +21,24 @@ services:
       - PG_USER=oysyn
       - PG_PASS=2123
     # тоже без depends_on: postgres
+
+  plagio-ops:
+    build: .
+    container_name: plagio-ops
+    command: >
+      uvicorn app.main_ops:app
+      --host 0.0.0.0
+      --port 8002
+      --workers 1
+    environment:
+      - PLAGIO_ROOT=/runtime
+      - PLAGIO_OCR_LANG=kaz+rus+eng
+      - PLAGIO_OCR_WORKERS=8       # под 50% мощности — 8 потоков идеал
+    volumes:
+      - ./runtime:/runtime
+    ports:
+      - "8002:8002"
+    mem_limit: 80g
+    memswap_limit: 80g 
+    cpuset: "8-23"
+    cpus: "16"         # индекс ~2/3%
