@@ -74,6 +74,7 @@ PG_PORT = int(os.getenv("PG_PORT", "5432"))
 PG_DB   = os.getenv("PG_DB", "oysyn")
 PG_USER = os.getenv("PG_USER", "oysyn")
 PG_PASS = os.getenv("PG_PASS", "2123")
+N_SHARDS = int(os.environ.get("PLAGIO_N_SHARDS", "4"))
 
 # классический URL для SQLAlchemy
 DATABASE_URL_SYNC  = os.getenv(
