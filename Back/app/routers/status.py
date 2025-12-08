@@ -25,7 +25,7 @@ class DocumentStatusResponse(BaseModel):
     updated_at: datetime
     last_checked_at: Optional[datetime]
 
-    segment_level: Optional[int] = None
+    segment_level: Optional[int] = 0
     segment_status: Optional[str] = None
     segment_path: Optional[str] = None
 

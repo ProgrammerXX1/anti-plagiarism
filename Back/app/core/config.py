@@ -69,7 +69,7 @@ SEMANTIC_TOP_K = int(os.environ.get("PLAGIO_SEMANTIC_TOP_K", "20"))
 # максимум фрагментов на документ, которые шлём в реранкер
 SEMANTIC_FRAG_PER_DOC = int(os.environ.get("PLAGIO_SEMANTIC_FRAG_PER_DOC", "3"))
 # деление уровня на файлы
-DOCS_PER_L1_SEGMENT = int(os.getenv("PLAGIO_DOCS_PER_L1", "3"))
+DOCS_PER_L1_SEGMENT = int(os.getenv("PLAGIO_DOCS_PER_L1", "20"))
 # деление по шардингу
 N_SHARDS = int(os.environ.get("PLAGIO_N_SHARDS", "1"))
 
