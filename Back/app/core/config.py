@@ -10,17 +10,17 @@ load_dotenv()
 ROOT = Path(
     os.environ.get(
         "PLAGIO_ROOT",
-        Path(__file__).resolve().parents[2] / "runtime"
+        Path(__file__).resolve().parents[2] / "runtime",
     )
 )
 
 UPLOAD_DIR = ROOT / "uploads"
 CORPUS_DIR = ROOT / "corpus"
-INDEX_DIR  = ROOT / "index" / "current"
-SNAP_DIR   = ROOT / "index" / "snapshots"
-QUEUE_DIR  = ROOT / "queue"
-LOGS_DIR   = ROOT / "logs"
-LOCKS_DIR  = ROOT / "locks"
+INDEX_DIR = ROOT / "index" / "current"
+SNAP_DIR = ROOT / "index" / "snapshots"
+QUEUE_DIR = ROOT / "queue"
+LOGS_DIR = ROOT / "logs"
+LOCKS_DIR = ROOT / "locks"
 
 # ensure dirs
 for p in (
@@ -36,18 +36,18 @@ for p in (
     p.mkdir(parents=True, exist_ok=True)
 
 # files
-CORPUS_JSONL  = CORPUS_DIR / "corpus.jsonl"
-INDEX_JSON    = INDEX_DIR / "index.json"           # используется только как "маяк" директории
+CORPUS_JSONL = CORPUS_DIR / "corpus.jsonl"
+INDEX_JSON = INDEX_DIR / "index.json"        # используется только как "маяк" директории
 MANIFEST_JSON = INDEX_DIR / "manifest.json"
 
-# ограничитель индексирований по батчам
+# ограничитель индексирований по батчам (если где-то используешь)
 MAX_NEW_DOCS_PER_BUILD = int(os.environ.get("PLAGIO_MAX_NEW_DOCS_PER_BUILD", "100"))
 
 # ── BM25 индекс (если используешь BM25 как кандидат-генератор) ───────────────
 BM25_INDEX = INDEX_DIR / "bm25_index.pkl.gz"  # бинарный, сжатый
 
 BM25_K1 = float(os.environ.get("PLAGIO_BM25_K1", "1.5"))
-BM25_B  = float(os.environ.get("PLAGIO_BM25_B", "0.75"))
+BM25_B = float(os.environ.get("PLAGIO_BM25_B", "0.75"))
 BM25_MAX_DOCS = int(os.environ.get("PLAGIO_BM25_MAX_DOCS", "200"))  # сколько доков отдавать кандидатом
 
 # ── OCR дефолты ───────────────────────────────────────────────────────────────
@@ -57,31 +57,64 @@ OCR_WORKERS_DEFAULT = int(os.environ.get("PLAGIO_OCR_WORKERS", "12"))
 # ── Semantic / Reranker config ────────────────────────────────────────────────
 SEMANTIC_BASE_URL = os.environ.get("PLAGIO_SEMANTIC_URL", "http://localhost:8003")
 USE_SEMANTIC_RERANK = os.environ.get("PLAGIO_USE_SEMANTIC_RERANK", "false").lower() in {
-    "1", "true", "yes", "y",
+    "1",
+    "true",
+    "yes",
+    "y",
 }
 USE_SEMANTIC_EMBED = os.environ.get("PLAGIO_USE_SEMANTIC_EMBED", "false").lower() in {
-    "1", "true", "yes", "y",
+    "1",
+    "true",
+    "yes",
+    "y",
 }
+
 # коэффициент смешивания шинглового и семантического скорa
 SEMANTIC_ALPHA = float(os.environ.get("PLAGIO_SEMANTIC_ALPHA", "0.7"))
 # максимум документов, которые отправляем в реранкер поверх top
 SEMANTIC_TOP_K = int(os.environ.get("PLAGIO_SEMANTIC_TOP_K", "20"))
 # максимум фрагментов на документ, которые шлём в реранкер
 SEMANTIC_FRAG_PER_DOC = int(os.environ.get("PLAGIO_SEMANTIC_FRAG_PER_DOC", "3"))
+
+# ── Multi-level index config ─────────────────────────────────────────────────
+
 # деление уровня на файлы
-DOCS_PER_L1_SEGMENT = int(os.getenv("PLAGIO_DOCS_PER_L1", "20"))
+ETL_BATCH_SIZE: int = int(os.environ.get("PLAGIO_ETL_BATCH_SIZE", "100"))
+DOCS_PER_L1_SEGMENT: int = int(os.environ.get("PLAGIO_DOCS_PER_L1", "10"))
+MAX_AUTO_LEVEL: int = int(os.environ.get("PLAGIO_MAX_AUTO_LEVEL", "4"))  # до какого уровня авто-компактим
+
+# сколько L1/L2/L3 сегментов сливаем в один сегмент следующего уровня
+SEGMENTS_PER_L2_COMPACT: int = int(os.environ.get("PLAGIO_SEGMENTS_PER_L2", "10"))
+SEGMENTS_PER_L3_COMPACT: int = int(os.environ.get("PLAGIO_SEGMENTS_PER_L3", "10"))
+SEGMENTS_PER_L4_COMPACT: int = int(os.environ.get("PLAGIO_SEGMENTS_PER_L4", "10"))
+
+
+def segments_per_compact(level: int) -> int:
+    """
+    Сколько сегментов уровня `level` нужно для компакции в следующий уровень.
+    L1 -> L2, L2 -> L3, L3 -> L4.
+    """
+    if level == 1:
+        return SEGMENTS_PER_L2_COMPACT
+    if level == 2:
+        return SEGMENTS_PER_L3_COMPACT
+    if level == 3:
+        return SEGMENTS_PER_L4_COMPACT
+    # дефолт на всякий случай
+    return SEGMENTS_PER_L2_COMPACT
+
+
 # деление по шардингу
 N_SHARDS = int(os.environ.get("PLAGIO_N_SHARDS", "1"))
 
 PG_HOST = os.getenv("PG_HOST", "192.168.75.70")
 PG_PORT = int(os.getenv("PG_PORT", "5432"))
-PG_DB   = os.getenv("PG_DB", "oysyn")
+PG_DB = os.getenv("PG_DB", "oysyn")
 PG_USER = os.getenv("PG_USER", "oysyn")
 PG_PASS = os.getenv("PG_PASS", "2123")
 
-
 # классический URL для SQLAlchemy
-DATABASE_URL_SYNC  = os.getenv(
+DATABASE_URL_SYNC = os.getenv(
     "DATABASE_URL_SYNC",
     f"postgresql://{PG_USER}:{PG_PASS}@{PG_HOST}:{PG_PORT}/{PG_DB}",
 )
@@ -92,6 +125,7 @@ DATABASE_URL_ASYNC = os.getenv(
 )
 
 # ── Pydantic-конфиг индекса (под чистый C++ k=9) ─────────────────────────────
+
 
 class WeightsCfg(BaseModel):
     # общий коэффициент смешивания интерпретируем на стороне C++

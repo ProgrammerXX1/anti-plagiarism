@@ -1,133 +1,122 @@
-# app/api/routes/status.py
-from datetime import datetime
-from typing import Optional, List
-
-from fastapi import APIRouter, Depends, HTTPException, Query
+from typing import List
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
 from app.models.document import Document
 from app.models.segment import Segment
 
-router = APIRouter(tags=["Document status"])
+from app.core.config import (
+    ETL_BATCH_SIZE,
+    DOCS_PER_L1_SEGMENT,
+    MAX_AUTO_LEVEL,
+    SEGMENTS_PER_L2_COMPACT,
+    SEGMENTS_PER_L3_COMPACT,
+    SEGMENTS_PER_L4_COMPACT,
+)
+
+router = APIRouter(tags=["Admin-levels"])
 
 
-class DocumentStatusResponse(BaseModel):
-    id: int
-    status: str
+# ───────────────────────── schemas ───────────────────────── #
+
+class LevelSegmentItem(BaseModel):
+    segment_id: int
     shard_id: int
-    segment_id: Optional[int]
-
-    created_at: datetime
-    updated_at: datetime
-    last_checked_at: Optional[datetime]
-
-    segment_level: Optional[int] = 0
-    segment_status: Optional[str] = None
-    segment_path: Optional[str] = None
+    level: int
+    status: str
+    doc_count: int
+    size_bytes: int
+    path: str
 
 
-# ───────────────────────────────────────────────────────────────
-# Статус одного документа
-# ───────────────────────────────────────────────────────────────
+class LevelsConfigResponse(BaseModel):
+    etl_batch_size: int
+    docs_per_l1_segment: int
+    max_auto_level: int
+    segments_per_l2_compact: int
+    segments_per_l3_compact: int
+    segments_per_l4_compact: int
 
-@router.get("/status/{doc_id}", response_model=DocumentStatusResponse)
-async def get_document_status(
-    doc_id: int,
-    db: AsyncSession = Depends(get_db),
-) -> DocumentStatusResponse:
-    result = await db.execute(
-        select(Document).where(Document.id == doc_id)
-    )
-    doc: Optional[Document] = result.scalars().first()
 
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
+class LevelsStatusResponse(BaseModel):
+    level0_docs: int
+    level1_segments: List[LevelSegmentItem]
+    level2_segments: List[LevelSegmentItem]
+    level3_segments: List[LevelSegmentItem]
+    level4_segments: List[LevelSegmentItem]
 
-    seg_level = None
-    seg_status = None
-    seg_path = None
 
-    if doc.segment_id is not None:
-        seg_result = await db.execute(
-            select(Segment).where(Segment.id == doc.segment_id)
-        )
-        segment: Optional[Segment] = seg_result.scalars().first()
-        if segment:
-            seg_level = segment.level
-            seg_status = segment.status
-            seg_path = segment.path
+class LevelsFullResponse(BaseModel):
+    config: LevelsConfigResponse
+    status: LevelsStatusResponse
 
-    return DocumentStatusResponse(
-        id=doc.id,
-        status=doc.status,
-        shard_id=doc.shard_id,
-        segment_id=doc.segment_id,
-        created_at=doc.created_at,
-        updated_at=doc.updated_at,
-        last_checked_at=doc.last_checked_at,
-        segment_level=seg_level,
-        segment_status=seg_status,
-        segment_path=seg_path,
+
+# ───────────────────────── endpoints ───────────────────────── #
+
+@router.get("/levels/config", response_model=LevelsConfigResponse)
+async def get_levels_config() -> LevelsConfigResponse:
+    """
+    Показывает ТЕКУЩИЕ конфиги, которые реально используются воркером (env).
+    """
+    return LevelsConfigResponse(
+        etl_batch_size=ETL_BATCH_SIZE,
+        docs_per_l1_segment=DOCS_PER_L1_SEGMENT,
+        max_auto_level=MAX_AUTO_LEVEL,
+        segments_per_l2_compact=SEGMENTS_PER_L2_COMPACT,
+        segments_per_l3_compact=SEGMENTS_PER_L3_COMPACT,
+        segments_per_l4_compact=SEGMENTS_PER_L4_COMPACT,
     )
 
 
-# ───────────────────────────────────────────────────────────────
-# Список документов (все/по шардy) с пагинацией
-# ───────────────────────────────────────────────────────────────
-
-@router.get("/status", response_model=List[DocumentStatusResponse])
-async def list_document_statuses(
-    shard_id: Optional[int] = Query(None, description="Фильтр по shard_id"),
-    limit: int = Query(100, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
+@router.get("/levels/status", response_model=LevelsStatusResponse)
+async def get_levels_status(
     db: AsyncSession = Depends(get_db),
-) -> List[DocumentStatusResponse]:
-    stmt = select(Document)
+) -> LevelsStatusResponse:
+    """
+    Текущий статус уровней в БД.
+    """
 
-    if shard_id is not None:
-        stmt = stmt.where(Document.shard_id == shard_id)
+    # 0 уровень — ещё не индексированы
+    level0_stmt = select(func.count(Document.id)).where(
+        Document.status.in_(["uploaded", "etl_ok"]),
+        Document.segment_id.is_(None),
+    )
+    level0_count = (await db.execute(level0_stmt)).scalar_one()
 
-    stmt = stmt.order_by(Document.id.desc()).limit(limit).offset(offset)
-
-    result = await db.execute(stmt)
-    docs: List[Document] = list(result.scalars())
-
-    if not docs:
-        return []
-
-    # Собираем все segment_id и грузим сегменты одним запросом
-    segment_ids = {d.segment_id for d in docs if d.segment_id is not None}
-    segments_by_id: dict[int, Segment] = {}
-
-    if segment_ids:
-        seg_result = await db.execute(
-            select(Segment).where(Segment.id.in_(segment_ids))
-        )
-        segments = list(seg_result.scalars())
-        segments_by_id = {s.id: s for s in segments}
-
-    out: List[DocumentStatusResponse] = []
-
-    for doc in docs:
-        seg = segments_by_id.get(doc.segment_id) if doc.segment_id else None
-
-        out.append(
-            DocumentStatusResponse(
-                id=doc.id,
-                status=doc.status,
-                shard_id=doc.shard_id,
-                segment_id=doc.segment_id,
-                created_at=doc.created_at,
-                updated_at=doc.updated_at,
-                last_checked_at=doc.last_checked_at,
-                segment_level=seg.level if seg else None,
-                segment_status=seg.status if seg else None,
-                segment_path=seg.path if seg else None,
+    async def load_level(level: int):
+        stmt = (
+            select(Segment)
+            .where(
+                Segment.level == level,
+                Segment.status == "ready",
             )
+            .order_by(Segment.id)
+        )
+        return list((await db.execute(stmt)).scalars())
+
+    l1_segments = await load_level(1)
+    l2_segments = await load_level(2)
+    l3_segments = await load_level(3)
+    l4_segments = await load_level(4)
+
+    def to_item(s: Segment) -> LevelSegmentItem:
+        return LevelSegmentItem(
+            segment_id=s.id,
+            shard_id=s.shard_id,
+            level=s.level,
+            status=s.status,
+            doc_count=s.doc_count,
+            size_bytes=s.size_bytes or 0,
+            path=s.path or "",
         )
 
-    return out
+    return LevelsStatusResponse(
+        level0_docs=level0_count,
+        level1_segments=[to_item(s) for s in l1_segments],
+        level2_segments=[to_item(s) for s in l2_segments],
+        level3_segments=[to_item(s) for s in l3_segments],
+        level4_segments=[to_item(s) for s in l4_segments],
+    )

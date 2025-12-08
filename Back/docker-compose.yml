@@ -11,10 +11,19 @@ services:
       - PG_PASS=2123
       # чтобы INDEX_DIR/UPLOAD_DIR знали, где runtime
       - PLAGIO_ROOT=/runtime
+      
       # пороги сегментации (можно и по дефолту оставить)
-      - PLAGIO_DOCS_PER_L1=3
-      - PLAGIO_SEGMENTS_PER_COMPACT=3
-      - PLAGIO_MAX_LEVEL=4
+      - PLAGIO_ETL_BATCH_SIZE=100
+      # сколько файлов в L1-сегменте
+      - PLAGIO_DOCS_PER_L1=10
+      # до какого уровня авто-компактим
+      - PLAGIO_MAX_AUTO_LEVEL=4
+      # сколько сегментов нижнего уровня сливаем
+      # (для твоего случая: 10 L1 -> 1 L2, 10 L2 -> 1 L3, и т.д.)
+      - PLAGIO_SEGMENTS_PER_L2=10
+      - PLAGIO_SEGMENTS_PER_L3=10
+      - PLAGIO_SEGMENTS_PER_L4=10
+
     volumes:
       - ./runtime:/runtime
     restart: always
