@@ -10,6 +10,22 @@ from sqlalchemy import select, update
 from app.models.document import Document
 from app.core.settings_index import calc_shard_id_from_meta
 
+async def list_unsegmented_docs_for_shard(
+    db: AsyncSession,
+    shard_id: int,
+    limit: int,
+) -> list[Document]:
+    res = await db.execute(
+        select(Document)
+        .where(
+            Document.shard_id == shard_id,
+            Document.segment_id.is_(None),
+            Document.status == "uploaded",  # или "normalized"
+        )
+        .order_by(Document.id)
+        .limit(limit)
+    )
+    return list(res.scalars().all())
 
 async def create_document(
     db: AsyncSession,

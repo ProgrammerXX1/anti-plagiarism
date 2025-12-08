@@ -68,13 +68,17 @@ SEMANTIC_ALPHA = float(os.environ.get("PLAGIO_SEMANTIC_ALPHA", "0.7"))
 SEMANTIC_TOP_K = int(os.environ.get("PLAGIO_SEMANTIC_TOP_K", "20"))
 # максимум фрагментов на документ, которые шлём в реранкер
 SEMANTIC_FRAG_PER_DOC = int(os.environ.get("PLAGIO_SEMANTIC_FRAG_PER_DOC", "3"))
+# деление уровня на файлы
+DOCS_PER_L1_SEGMENT = int(os.getenv("PLAGIO_DOCS_PER_L1", "3"))
+# деление по шардингу
+N_SHARDS = int(os.environ.get("PLAGIO_N_SHARDS", "1"))
 
 PG_HOST = os.getenv("PG_HOST", "192.168.75.70")
 PG_PORT = int(os.getenv("PG_PORT", "5432"))
 PG_DB   = os.getenv("PG_DB", "oysyn")
 PG_USER = os.getenv("PG_USER", "oysyn")
 PG_PASS = os.getenv("PG_PASS", "2123")
-N_SHARDS = int(os.environ.get("PLAGIO_N_SHARDS", "4"))
+
 
 # классический URL для SQLAlchemy
 DATABASE_URL_SYNC  = os.getenv(

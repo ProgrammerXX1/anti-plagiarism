@@ -3,10 +3,9 @@ from fastapi import FastAPI
 from fastapi.responses import ORJSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from .core.logger import logger 
-from .routers import search, config_runtime, health, experiment
 from .services.search_native import native_load_index
 from .core.memlog import log_mem
-from .routers import upload, config_runtime, health, document_upload, status, search_segments  # upload = твой "Operations" router
+from .routers import status, search, upload, admin_levels
 
 app = FastAPI(
     title="Plagiarism Operations API",
@@ -34,19 +33,8 @@ logger.info("=== main_ops started ===")
 # тяжёлые штуки: OCR, загрузка, билд индекса, corpus list/text
 
 
-app.include_router(experiment.router)
-app.include_router(document_upload.router)
+app.include_router(upload.router)
 app.include_router(status.router)
-app.include_router(search_segments.router)
-# app.include_router(upload.router)
-# app.include_router(search.router)
-# app.include_router(config_runtime.router)
-# app.include_router(health.router)
+app.include_router(search.router)
+app.include_router(admin_levels.router)
 
-
-# опционально health
-# try:
-#     from .routers import health
-#     app.include_router(health.router)
-# except ImportError:
-#     pass

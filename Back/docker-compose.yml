@@ -9,18 +9,15 @@ services:
       - PG_DB=oysyn
       - PG_USER=oysyn
       - PG_PASS=2123
-    # НИКАКИХ depends_on: postgres тут не нужно
-
-  plagio-enqueue:
-    build: .
-    command: ["python", "-m", "app.scripts.enqueue_test_tasks"]
-    environment:
-      - PG_HOST=192.168.75.70
-      - PG_PORT=5432
-      - PG_DB=oysyn
-      - PG_USER=oysyn
-      - PG_PASS=2123
-    # тоже без depends_on: postgres
+      # чтобы INDEX_DIR/UPLOAD_DIR знали, где runtime
+      - PLAGIO_ROOT=/runtime
+      # пороги сегментации (можно и по дефолту оставить)
+      - PLAGIO_DOCS_PER_L1=3
+      - PLAGIO_SEGMENTS_PER_COMPACT=3
+      - PLAGIO_MAX_LEVEL=4
+    volumes:
+      - ./runtime:/runtime
+    restart: always
 
   plagio-ops:
     build: .
@@ -33,12 +30,30 @@ services:
     environment:
       - PLAGIO_ROOT=/runtime
       - PLAGIO_OCR_LANG=kaz+rus+eng
-      - PLAGIO_OCR_WORKERS=8       # под 50% мощности — 8 потоков идеал
+      - PLAGIO_OCR_WORKERS=8
+      - PG_HOST=192.168.75.70
+      - PG_PORT=5432
+      - PG_DB=oysyn
+      - PG_USER=oysyn
+      - PG_PASS=2123
     volumes:
       - ./runtime:/runtime
     ports:
       - "8002:8002"
     mem_limit: 80g
-    memswap_limit: 80g 
+    memswap_limit: 80g
     cpuset: "8-23"
-    cpus: "16"         # индекс ~2/3%
+    cpus: "16"
+    restart: always
+
+  # НЕОБЯЗАТЕЛЬНО, ТОЛЬКО ДЛЯ ОДНОРАЗОВЫХ ЗАПУСКОВ
+  # plagio-enqueue:
+  #   build: .
+  #   command: ["python", "-m", "app.scripts.enqueue_test_tasks"]
+  #   environment:
+  #     - PG_HOST=192.168.75.70
+  #     - PG_PORT=5432
+  #     - PG_DB=oysyn
+  #     - PG_USER=oysyn
+  #     - PG_PASS=2123
+  #   restart: "no"
