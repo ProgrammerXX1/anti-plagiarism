@@ -1,4 +1,4 @@
-# app/services/indexing/bm25_index.py
+# app/services/level5/bm25_index.py
 
 import json
 import gzip

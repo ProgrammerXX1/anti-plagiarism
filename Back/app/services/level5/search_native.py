@@ -1,4 +1,4 @@
-# app/services/search_native.py
+# app/services/level5/search_native.py
 import ctypes
 from ctypes import c_char_p, c_int, c_double
 from pathlib import Path
@@ -6,9 +6,9 @@ from typing import Dict, Any, List, Set
 
 import orjson
 
-from ..core.logger import logger
-from ..core.config import INDEX_DIR, INDEX_JSON
-from ..core.memlog import log_mem
+from ...core.logger import logger
+from ...core.config import INDEX_DIR, INDEX_JSON
+from ...core.memlog import log_mem
 
 # ── пути к .so ──────────────────────────────────────────────────────
 

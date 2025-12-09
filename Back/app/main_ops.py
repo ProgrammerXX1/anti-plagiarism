@@ -3,7 +3,7 @@ from fastapi import FastAPI
 from fastapi.responses import ORJSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from .core.logger import logger 
-from .services.search_native import native_load_index
+from .services.level5.search_native import native_load_index
 from .core.memlog import log_mem
 from .routers import status, search, upload, admin_levels
 

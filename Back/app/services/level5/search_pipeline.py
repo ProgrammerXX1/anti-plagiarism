@@ -1,8 +1,8 @@
-# app/services/search/search_pipeline.py
+# app/services/level5/search_pipeline.py
 from typing import Dict, Any, List, Set, Tuple
 
-from ..indexing.bm25_index import bm25_candidates
-from ..search_native import native_search
+from ..level5.bm25_index import bm25_candidates
+from .search_native import native_search
 
 
 def search_bm25_native(

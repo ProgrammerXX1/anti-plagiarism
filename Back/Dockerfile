@@ -25,17 +25,21 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Сборка C++ частей
+# Сборка C++ частей
 RUN set -ex && \
     ls -R cpp && \
     g++ -O3 -std=c++17 -fPIC -shared \
-        cpp/search_core.cpp \
+        cpp/common/search_core.cpp \
+        -Icpp/common \
         -o /usr/local/lib/libsearchcore.so && \
     g++ -O3 -std=c++17 \
-        cpp/index_builder.cpp \
+        cpp/level5/index_builder.cpp \
+        -Icpp/common \
         -o /usr/local/bin/index_builder \
         -lsimdjson && \
     g++ -O3 -std=c++17 \
-        cpp/etl_index_builder.cpp \
+        cpp/levels_0_4/etl_index_builder.cpp \
+        -Icpp/common \
         -o /usr/local/bin/etl_index_builder \
         -lsimdjson
 

@@ -1,12 +1,12 @@
-# app/services/index_native_export.py
+# app/services/level5/index_native_export.py
 import json
 import struct
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
 
-from ..core.config import INDEX_DIR, INDEX_JSON
-from ..core.logger import logger
-from .search.index_search import load_index  # НЕ cached, чтобы точно с диска
+from ...core.config import INDEX_DIR, INDEX_JSON
+from ...core.logger import logger
+from index_native_export import load_index  # если search/index_search лежит в app/services
 
 
 MAGIC = b"PLAG"
