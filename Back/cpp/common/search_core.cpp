@@ -1,4 +1,4 @@
-// cpp/search_core.cpp
+// cpp/common/search_core.cpp
 #include "search_core.h"
 
 #include <vector>
@@ -48,17 +48,18 @@ struct Posting9 {
     std::uint32_t did; // doc_id_int
 };
 
-std::once_flag g_init_flag;
+// Глобальное состояние индекса
+static std::mutex g_index_mutex;
 bool g_index_loaded = false;
 
 Config g_cfg;
 
 // doc_id_int → Meta
-std::vector<DocMeta> g_docs;
+std::vector<DocMeta>      g_docs;
 // ПЛОСКИЙ массив postings k=9, отсортированный по h (и did)
-std::vector<Posting9> g_post9;
+std::vector<Posting9>     g_post9;
 // doc_id_int → doc_id (строка)
-std::vector<std::string> g_doc_ids;
+std::vector<std::string>  g_doc_ids;
 
 // ── служебка ─────────────────────────────────────────────────────────
 
@@ -103,8 +104,10 @@ static inline std::pair<std::size_t, std::size_t> find_postings9_range(std::uint
             return value < p.h;
         }
     );
-    return {static_cast<std::size_t>(lower - g_post9.begin()),
-            static_cast<std::size_t>(upper - g_post9.begin())};
+    return {
+        static_cast<std::size_t>(lower - g_post9.begin()),
+        static_cast<std::size_t>(upper - g_post9.begin())
+    };
 }
 
 // читаем index_config.json из каталога индекса
@@ -162,151 +165,152 @@ static Config load_config_from_json(const std::string& index_dir) {
 //   [N_post13 * (u64 hash13, u32 doc_id_int)]        // сейчас просто пропускаем
 //
 extern "C" int se_load_index(const char* index_dir_utf8) {
-    std::call_once(g_init_flag, [&]() {
-        g_index_loaded = false;
-        g_docs.clear();
-        g_post9.clear();
-        g_doc_ids.clear();
+    std::lock_guard<std::mutex> lock(g_index_mutex);
 
-        std::string dir = index_dir_utf8 ? std::string(index_dir_utf8) : std::string(".");
-        std::string bin_path    = dir + "/index_native.bin";
-        std::string docids_path = dir + "/index_native_docids.json";
+    g_index_loaded = false;
+    g_docs.clear();
+    g_post9.clear();
+    g_doc_ids.clear();
 
-        std::ifstream bin(bin_path, std::ios::binary);
+    std::string dir = index_dir_utf8 ? std::string(index_dir_utf8) : std::string(".");
+
+    std::string bin_path    = dir + "/index_native.bin";
+    std::string docids_path = dir + "/index_native_docids.json";
+
+    std::ifstream bin(bin_path, std::ios::binary);
+    if (!bin) {
+        std::cerr << "[se_load_index] cannot open " << bin_path << "\n";
+        return -1;
+    }
+
+    char magic[4];
+    bin.read(magic, 4);
+    if (!bin || magic[0] != 'P' || magic[1] != 'L' || magic[2] != 'A' || magic[3] != 'G') {
+        std::cerr << "[se_load_index] bad magic\n";
+        return -1;
+    }
+
+    std::uint32_t version = 0;
+    std::uint32_t N_docs  = 0;
+    std::uint64_t N_post9  = 0;
+    std::uint64_t N_post13 = 0;
+
+    bin.read(reinterpret_cast<char*>(&version),  sizeof(version));
+    bin.read(reinterpret_cast<char*>(&N_docs),   sizeof(N_docs));
+    bin.read(reinterpret_cast<char*>(&N_post9),  sizeof(N_post9));
+    bin.read(reinterpret_cast<char*>(&N_post13), sizeof(N_post13));
+    if (!bin || version != 1) {
+        std::cerr << "[se_load_index] bad header or version\n";
+        return -1;
+    }
+
+    const std::uint64_t MAX_DOCS     = 100000000ULL;   // 1e8
+    const std::uint64_t MAX_POSTINGS = 5000000000ULL;  // 5e9
+
+    if (N_docs == 0 || N_docs > MAX_DOCS) {
+        std::cerr << "[se_load_index] suspicious N_docs=" << N_docs << ", abort\n";
+        return -1;
+    }
+    if (N_post9 > MAX_POSTINGS || N_post13 > MAX_POSTINGS) {
+        std::cerr << "[se_load_index] suspicious postings counts: "
+                  << "N_post9=" << N_post9 << " N_post13=" << N_post13 << ", abort\n";
+        return -1;
+    }
+
+    // docs_meta
+    g_docs.resize(N_docs);
+    for (std::uint32_t i = 0; i < N_docs; ++i) {
+        DocMeta dm{};
+        bin.read(reinterpret_cast<char*>(&dm.tok_len),    sizeof(dm.tok_len));
+        bin.read(reinterpret_cast<char*>(&dm.simhash_hi), sizeof(dm.simhash_hi));
+        bin.read(reinterpret_cast<char*>(&dm.simhash_lo), sizeof(dm.simhash_lo));
         if (!bin) {
-            std::cerr << "[se_load_index] cannot open " << bin_path << "\n";
-            return;
+            std::cerr << "[se_load_index] truncated docs_meta\n";
+            return -1;
         }
+        dm.bm25_len = dm.tok_len; // пока копируем, под BM25 пригодится
+        g_docs[i] = dm;
+    }
 
-        char magic[4];
-        bin.read(magic, 4);
-        if (!bin || magic[0] != 'P' || magic[1] != 'L' || magic[2] != 'A' || magic[3] != 'G') {
-            std::cerr << "[se_load_index] bad magic\n";
-            return;
+    // postings k9 — читаем в плоский массив
+    g_post9.clear();
+    g_post9.reserve(static_cast<std::size_t>(N_post9));
+
+    for (std::uint64_t i = 0; i < N_post9; ++i) {
+        std::uint64_t h;
+        std::uint32_t did;
+        bin.read(reinterpret_cast<char*>(&h),   sizeof(h));
+        bin.read(reinterpret_cast<char*>(&did), sizeof(did));
+        if (!bin) {
+            std::cerr << "[se_load_index] truncated postings9\n";
+            return -1;
         }
-
-        std::uint32_t version = 0;
-        std::uint32_t N_docs  = 0;
-        std::uint64_t N_post9  = 0;
-        std::uint64_t N_post13 = 0;
-
-        bin.read(reinterpret_cast<char*>(&version),  sizeof(version));
-        bin.read(reinterpret_cast<char*>(&N_docs),   sizeof(N_docs));
-        bin.read(reinterpret_cast<char*>(&N_post9),  sizeof(N_post9));
-        bin.read(reinterpret_cast<char*>(&N_post13), sizeof(N_post13));
-        if (!bin || version != 1) {
-            std::cerr << "[se_load_index] bad header or version\n";
-            return;
+        if (did >= N_docs) {
+            // защита от битых doc_id_int
+            continue;
         }
+        g_post9.push_back(Posting9{h, did});
+    }
 
-        const std::uint64_t MAX_DOCS     = 100000000ULL;   // 1e8
-        const std::uint64_t MAX_POSTINGS = 5000000000ULL;  // 5e9
-
-        if (N_docs == 0 || N_docs > MAX_DOCS) {
-            std::cerr << "[se_load_index] suspicious N_docs=" << N_docs << ", abort\n";
-            return;
+    // postings k13 — сейчас просто пропускаем, если есть
+    for (std::uint64_t i = 0; i < N_post13; ++i) {
+        std::uint64_t h;
+        std::uint32_t did;
+        bin.read(reinterpret_cast<char*>(&h),   sizeof(h));
+        bin.read(reinterpret_cast<char*>(&did), sizeof(did));
+        if (!bin) {
+            std::cerr << "[se_load_index] truncated postings13\n";
+            return -1;
         }
-        if (N_post9 > MAX_POSTINGS || N_post13 > MAX_POSTINGS) {
-            std::cerr << "[se_load_index] suspicious postings counts: "
-                      << "N_post9=" << N_post9 << " N_post13=" << N_post13 << ", abort\n";
-            return;
+    }
+
+    bin.close();
+
+    // сортируем postings по hash, потом по doc_id_int
+    std::sort(
+        g_post9.begin(),
+        g_post9.end(),
+        [](const Posting9& a, const Posting9& b) {
+            if (a.h != b.h) return a.h < b.h;
+            return a.did < b.did;
         }
+    );
 
-        // docs_meta
-        g_docs.resize(N_docs);
-        for (std::uint32_t i = 0; i < N_docs; ++i) {
-            DocMeta dm{};
-            bin.read(reinterpret_cast<char*>(&dm.tok_len),    sizeof(dm.tok_len));
-            bin.read(reinterpret_cast<char*>(&dm.simhash_hi), sizeof(dm.simhash_hi));
-            bin.read(reinterpret_cast<char*>(&dm.simhash_lo), sizeof(dm.simhash_lo));
-            if (!bin) {
-                std::cerr << "[se_load_index] truncated docs_meta\n";
-                return;
-            }
-            dm.bm25_len = dm.tok_len; // пока копируем, под BM25 пригодится
-            g_docs[i] = dm;
-        }
+    // doc_ids
+    std::ifstream dj(docids_path);
+    if (!dj) {
+        std::cerr << "[se_load_index] cannot open " << docids_path << "\n";
+        return -1;
+    }
+    json j;
+    try {
+        dj >> j;
+    } catch (...) {
+        std::cerr << "[se_load_index] bad json in docids\n";
+        return -1;
+    }
+    if (!j.is_array()) {
+        std::cerr << "[se_load_index] docids json must be array\n";
+        return -1;
+    }
+    g_doc_ids.clear();
+    for (auto& v : j) {
+        g_doc_ids.push_back(v.get<std::string>());
+    }
+    if (g_doc_ids.size() != g_docs.size()) {
+        std::cerr << "[se_load_index] docids size mismatch\n";
+        return -1;
+    }
 
-        // postings k9 — читаем в плоский массив
-        g_post9.clear();
-        g_post9.reserve(static_cast<std::size_t>(N_post9));
+    // конфиг индекса
+    g_cfg = load_config_from_json(dir);
 
-        for (std::uint64_t i = 0; i < N_post9; ++i) {
-            std::uint64_t h;
-            std::uint32_t did;
-            bin.read(reinterpret_cast<char*>(&h),   sizeof(h));
-            bin.read(reinterpret_cast<char*>(&did), sizeof(did));
-            if (!bin) {
-                std::cerr << "[se_load_index] truncated postings9\n";
-                return;
-            }
-            if (did >= N_docs) {
-                // защита от битых doc_id_int
-                continue;
-            }
-            g_post9.push_back(Posting9{h, did});
-        }
+    g_index_loaded = true;
+    std::cerr << "[se_load_index] loaded: docs=" << g_docs.size()
+              << " post9=" << g_post9.size()
+              << " (k=9 flat postings) from " << dir << "\n";
 
-        // postings k13 — сейчас просто пропускаем, если есть
-        for (std::uint64_t i = 0; i < N_post13; ++i) {
-            std::uint64_t h;
-            std::uint32_t did;
-            bin.read(reinterpret_cast<char*>(&h),   sizeof(h));
-            bin.read(reinterpret_cast<char*>(&did), sizeof(did));
-            if (!bin) {
-                std::cerr << "[se_load_index] truncated postings13\n";
-                return;
-            }
-        }
-
-        bin.close();
-
-        // сортируем postings по hash, потом по doc_id_int
-        std::sort(
-            g_post9.begin(),
-            g_post9.end(),
-            [](const Posting9& a, const Posting9& b) {
-                if (a.h != b.h) return a.h < b.h;
-                return a.did < b.did;
-            }
-        );
-
-        // doc_ids
-        std::ifstream dj(docids_path);
-        if (!dj) {
-            std::cerr << "[se_load_index] cannot open " << docids_path << "\n";
-            return;
-        }
-        json j;
-        try {
-            dj >> j;
-        } catch (...) {
-            std::cerr << "[se_load_index] bad json in docids\n";
-            return;
-        }
-        if (!j.is_array()) {
-            std::cerr << "[se_load_index] docids json must be array\n";
-            return;
-        }
-        g_doc_ids.clear();
-        for (auto& v : j) {
-            g_doc_ids.push_back(v.get<std::string>());
-        }
-        if (g_doc_ids.size() != g_docs.size()) {
-            std::cerr << "[se_load_index] docids size mismatch\n";
-            return;
-        }
-
-        // конфиг индекса
-        g_cfg = load_config_from_json(dir);
-
-        g_index_loaded = true;
-        std::cerr << "[se_load_index] loaded: docs=" << g_docs.size()
-                  << " post9=" << g_post9.size()
-                  << " (k=9 flat postings)\n";
-    });
-
-    return g_index_loaded ? 0 : -1;
+    return 0;
 }
 
 // ── Поиск по тексту (ТОЛЬКО k=9) ─────────────────────────

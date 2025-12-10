@@ -18,8 +18,9 @@ from app.core.config import (
     SEGMENTS_PER_L2_COMPACT,
     SEGMENTS_PER_L3_COMPACT,
     SEGMENTS_PER_L4_COMPACT,
-    INDEX_DIR,           # <- добавили
+    L5_SHARDS_DIR,
 )
+from app.schemas.level5 import Level5BaseInfo
 
 router = APIRouter(tags=["Admin-levels"])
 
@@ -46,21 +47,122 @@ class LevelsConfigResponse(BaseModel):
 
 
 class LevelsStatusResponse(BaseModel):
-    # уровни 0–4 (как было)
+    # уровни 0–4
     level0_docs: int
     level1_segments: List[LevelSegmentItem]
     level2_segments: List[LevelSegmentItem]
     level3_segments: List[LevelSegmentItem]
     level4_segments: List[LevelSegmentItem]
 
-    # уровень 5 (новое)
-    level5_waiting_docs: int   # сколько доков помечено под L5, но ещё не в индексе
-    level5_indexed_docs: int   # сколько доков в текущем L5-индексе (index_native)
+    # уровень 5 (подробно)
+    level5_waiting_docs: int   # l5_uploaded, которых нет ни в одной базе
+    level5_indexed_docs: int   # уникальные doc_id, присутствующие в L5-базах
+    level5_bases: List[Level5BaseInfo]  # список баз L5 (каждая индексация отдельно)
 
 
 class LevelsFullResponse(BaseModel):
     config: LevelsConfigResponse
     status: LevelsStatusResponse
+
+
+# ───────────────────────── helpers ───────────────────────── #
+
+def _iter_l5_doc_ids() -> set[int]:
+    """
+    Собираем уникальные doc_id из всех index_native_docids.json всех баз L5.
+    Предполагаем, что doc_id там лежат как строки ID документов.
+    """
+    ids: set[int] = set()
+
+    if not L5_SHARDS_DIR.exists():
+        return ids
+
+    for shard_dir in L5_SHARDS_DIR.glob("shard_*"):
+        if not shard_dir.is_dir():
+            continue
+        idx_dir = shard_dir / "current"
+        if not idx_dir.is_dir():
+            continue
+
+        docids_path: Path = idx_dir / "index_native_docids.json"
+        if not docids_path.exists():
+            continue
+
+        try:
+            data = json.loads(docids_path.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                for v in data:
+                    try:
+                        ids.add(int(v))
+                    except (TypeError, ValueError):
+                        continue
+        except Exception:
+            continue
+
+    return ids
+
+
+def _iter_l5_bases() -> List[Level5BaseInfo]:
+    """
+    Возвращает список баз уровня 5 по всем shard_*.
+
+    Каталог базы:
+      L5_SHARDS_DIR / shard_<id> / current
+
+    Метрики:
+      - has_index: наличие index_native.bin + index_native_docids.json
+      - docs: количество doc_id в index_native_docids.json
+      - size_bytes: суммарный размер bin/docids/meta
+    """
+    bases: List[Level5BaseInfo] = []
+
+    if not L5_SHARDS_DIR.exists():
+        return bases
+
+    for shard_dir in sorted(L5_SHARDS_DIR.glob("shard_*")):
+        if not shard_dir.is_dir():
+            continue
+
+        try:
+            shard_id = int(shard_dir.name.split("_", 1)[1])
+        except (IndexError, ValueError):
+            continue
+
+        idx_dir = shard_dir / "current"
+        docids_path = idx_dir / "index_native_docids.json"
+        bin_path = idx_dir / "index_native.bin"
+        meta_path = idx_dir / "index_native_meta.json"
+
+        has_index = bin_path.exists() and docids_path.exists()
+
+        docs = 0
+        if docids_path.exists():
+            try:
+                data = json.loads(docids_path.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    docs = len(data)
+            except Exception:
+                docs = 0
+
+        size = 0
+        for p in (bin_path, docids_path, meta_path):
+            if p.exists():
+                try:
+                    size += p.stat().st_size
+                except OSError:
+                    continue
+
+        bases.append(
+            Level5BaseInfo(
+                shard_id=shard_id,
+                path=str(idx_dir),
+                has_index=has_index,
+                docs=docs,
+                size_bytes=size,
+            )
+        )
+
+    return bases
 
 
 # ───────────────────────── endpoints ───────────────────────── #
@@ -85,7 +187,7 @@ async def get_levels_status(
     db: AsyncSession = Depends(get_db),
 ) -> LevelsStatusResponse:
     """
-    Текущий статус уровней в БД + состояние уровня 5.
+    Текущий статус уровней в БД + детализированное состояние уровня 5.
     """
 
     # 0 уровень — ещё не индексированы (обычный пайплайн)
@@ -122,33 +224,20 @@ async def get_levels_status(
             path=s.path or "",
         )
 
-    # ── L5: читаем текущий индекс ────────────────────────────────
-    docids_path: Path = INDEX_DIR / "index_native_docids.json"
-    indexed_ids: set[int] = set()
+    # ── L5: базы (каждая индексация отдельно) ──────────────────────
+    level5_bases = _iter_l5_bases()
 
-    if docids_path.exists():
-        try:
-            data = json.loads(docids_path.read_text(encoding="utf-8"))
-            if isinstance(data, list):
-                for v in data:
-                    try:
-                        indexed_ids.add(int(v))
-                    except (TypeError, ValueError):
-                        continue
-        except Exception:
-            indexed_ids = set()
-
+    # ── L5: глобальный список индексированных doc_id ──────────────
+    indexed_ids = _iter_l5_doc_ids()
     level5_indexed = len(indexed_ids)
 
-    # ── L5: документы, которые ждут индексации ───────────────────
-    # ждущие = l5_uploaded, которых НЕТ в current-индексе
+    # ── L5: документы, которые ждут индексации ────────────────────
     if indexed_ids:
         l5_wait_stmt = select(func.count(Document.id)).where(
             Document.status == "l5_uploaded",
             ~Document.id.in_(indexed_ids),
         )
     else:
-        # если индекса ещё нет — все l5_uploaded считаем ждущими
         l5_wait_stmt = select(func.count(Document.id)).where(
             Document.status == "l5_uploaded",
         )
@@ -163,4 +252,5 @@ async def get_levels_status(
         level4_segments=[to_item(s) for s in l4_segments],
         level5_waiting_docs=level5_waiting,
         level5_indexed_docs=level5_indexed,
+        level5_bases=level5_bases,
     )

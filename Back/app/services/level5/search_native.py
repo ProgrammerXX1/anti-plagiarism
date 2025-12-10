@@ -1,3 +1,6 @@
+# app/services/level5/search_native.py
+from __future__ import annotations
+
 import ctypes
 from ctypes import c_char_p, c_int, c_double
 from pathlib import Path
@@ -5,9 +8,9 @@ from typing import Dict, Any, List, Set
 
 import orjson
 
-from ...core.logger import logger
-from ...core.config import INDEX_DIR
-from ...core.memlog import log_mem
+from app.core.logger import logger
+from app.core.config import INDEX_DIR
+from app.core.memlog import log_mem
 
 # ── пути к .so ──────────────────────────────────────────────────────
 
@@ -60,22 +63,27 @@ _lib.se_search_text.restype = SeSearchResult
 
 SE_MAX_HITS = 4096
 
-# ── doc_ids + лёгкий meta/cfg ──────────────────────────────────────
+# ── текущее местоположение индекса + кэши ───────────────────────────
+
+CURRENT_INDEX_DIR: Path = INDEX_DIR
 
 _doc_ids: List[str] | None = None
 _meta_cache: Dict[str, Any] | None = None
-
-META_JSON = INDEX_DIR / "index_native_meta.json"
 
 
 def _load_doc_ids() -> List[str]:
     global _doc_ids
     if _doc_ids is not None:
         return _doc_ids
-    path = INDEX_DIR / "index_native_docids.json"
+
+    path = CURRENT_INDEX_DIR / "index_native_docids.json"
     with open(path, "r", encoding="utf-8") as f:
         _doc_ids = orjson.loads(f.read())
-    logger.info("[search-native] loaded doc_ids: %d", len(_doc_ids))
+    logger.info(
+        "[search-native] loaded doc_ids: %d from %s",
+        len(_doc_ids),
+        path,
+    )
     return _doc_ids
 
 
@@ -83,14 +91,17 @@ def _load_meta_cfg() -> Dict[str, Any]:
     global _meta_cache
     if _meta_cache is not None:
         return _meta_cache
-    if META_JSON.exists():
+
+    path = CURRENT_INDEX_DIR / "index_native_meta.json"
+    if path.exists():
         try:
-            with open(META_JSON, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 _meta_cache = orjson.loads(f.read())
                 return _meta_cache
         except Exception as e:
-            logger.error("[search-native] meta broken: %s", e)
-    # если меты нет, дефолты, но обязательно docs_meta пустой dict!
+            logger.error("[search-native] meta broken (%s): %s", path, e)
+
+    # если меты нет, дефолты, но обязательно docs_meta = {}
     _meta_cache = {
         "docs_meta": {},
         "config": {},
@@ -100,14 +111,25 @@ def _load_meta_cfg() -> Dict[str, Any]:
 
 # ── API для FastAPI / пайплайна ─────────────────────────────────────
 
+def native_load_index(index_dir: Path) -> None:
+    """
+    Загружает C++ индекс из директории index_dir.
+    Одновременно обновляет CURRENT_INDEX_DIR и сбрасывает кэши.
+    """
+    global CURRENT_INDEX_DIR, _doc_ids, _meta_cache
 
-def native_load_index() -> None:
-    index_dir = INDEX_DIR
+    index_dir = Path(index_dir)
+    CURRENT_INDEX_DIR = index_dir
+    _doc_ids = None
+    _meta_cache = None
 
-    # диагностический лог перед вызовом C++
-    from pathlib import Path
     logger.info("[search-native] trying to load index from %s", index_dir)
-    for name in ["index_native.bin", "index_native_docids.json", "index_native_meta.json", "index_config.json"]:
+    for name in [
+        "index_native.bin",
+        "index_native_docids.json",
+        "index_native_meta.json",
+        "index_config.json",
+    ]:
         path = index_dir / name
         exists = path.exists()
         size = path.stat().st_size if exists else None
@@ -184,14 +206,13 @@ def native_search(
         if allow is not None and did not in allow:
             continue
 
-        meta = docs_meta.get(did, {})  # фикс: docs_meta
+        meta = docs_meta.get(did, {})
 
         score = float(h.score)
         if score >= plag_thr:
             decision = "plagiarism"
         elif score >= partial_thr:
             decision = "partial"
-            # TODO: можно добавить отдельный тип решения "suspicious"
         else:
             decision = "original"
 

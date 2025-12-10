@@ -4,6 +4,7 @@ from typing import Dict, Any
 
 from app.core.config import DEFAULT_CFG_OBJ, ensure_index_cfg
 
+
 def write_l5_index_config(index_dir: Path, cfg: Dict[str, Any] | None = None) -> None:
     """
     Пишет index_config.json в формате, который читает C++ (search_core.cpp).
@@ -13,7 +14,6 @@ def write_l5_index_config(index_dir: Path, cfg: Dict[str, Any] | None = None) ->
 
     cfg_norm = ensure_index_cfg(cfg)
 
-    # Приводим к "узкому" формату, который знает C++
     out = {
         "w_min_doc": cfg_norm["w_min_doc"],
         "w_min_query": cfg_norm["w_min_query"],

@@ -1,14 +1,15 @@
-# app/schemas/level5.py
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
+
 class Level5ReindexBaseRequest(BaseModel):
     shard_id: int = 0
     rebuild_corpus: bool = True
     rebuild_index: bool = True
-    load_after: bool = True   # загружать ли сразу в C++ ядро
+    load_after: bool = True
+
 
 class Level5BaseInfo(BaseModel):
     shard_id: int
@@ -17,30 +18,36 @@ class Level5BaseInfo(BaseModel):
     docs: int
     size_bytes: int
 
+
 class Level5ReindexRequest(BaseModel):
     """
-    Параметры пересборки монолитного индекса (уровень 5).
+    Параметры пересборки индекса уровня 5.
+
+    Старые поля оставлены для совместимости схем, но фактически не используются:
+      - incremental
+      - max_new_docs_per_build
+      - rebuild_bm25
     """
     incremental: bool = Field(
         default=True,
-        description="Инкрементальная сборка по существующему index.json"
+        description="Не используется, оставлено для совместимости",
     )
     max_new_docs_per_build: Optional[int] = Field(
         default=None,
-        description="Лимит новых документов за один прогон (0/None = без лимита)"
+        description="Не используется, оставлено для совместимости",
     )
-    rebuild_corpus: bool = True 
+    rebuild_corpus: bool = True
     rebuild_bm25: bool = Field(
         default=True,
-        description="Пересобирать BM25-индекс"
+        description="Не используется, оставлено для совместимости",
     )
     rebuild_main_index: bool = Field(
         default=True,
-        description="Пересобирать MinHash/inverted index.json"
+        description="Пересобирать C++ индекс (index_native.bin)",
     )
     export_native: bool = Field(
         default=True,
-        description="Перегенерировать index_native.bin + docids + meta для C++"
+        description="Загрузить индекс в C++ после сборки",
     )
 
 
@@ -57,14 +64,7 @@ class Level5DocDetails(BaseModel):
     max_score: float
     originality_pct: float
     decision: str
-    details: Dict[str, Any]  # raw details из native_search
-
-
-class Level5SearchRequest(BaseModel):
-    query: str = Field(..., description="Текст запроса для монолитного поиска")
-    bm25_top: int = Field(300, ge=1, le=5000)
-    shingle_top: int = Field(50, ge=1, le=2000)
-    final_top: int = Field(10, ge=1, le=200)
+    details: Dict[str, Any]
 
 
 class Level5SearchResponse(BaseModel):
