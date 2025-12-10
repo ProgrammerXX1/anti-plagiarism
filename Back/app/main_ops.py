@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .core.logger import logger 
 from .services.level5.search_native import native_load_index
 from .core.memlog import log_mem
-from .routers import status, search, upload, admin_levels
+from .routers import status, level5, upload, admin_levels
 
 app = FastAPI(
     title="Plagiarism Operations API",
@@ -35,6 +35,6 @@ logger.info("=== main_ops started ===")
 
 app.include_router(upload.router)
 app.include_router(status.router)
-app.include_router(search.router)
+app.include_router(level5.router)
 app.include_router(admin_levels.router)
 

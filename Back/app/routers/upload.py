@@ -2,7 +2,10 @@
 import os
 import zlib
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List
+from io import BytesIO
+import uuid
+import zipfile
 
 from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException
 from pydantic import BaseModel
@@ -57,13 +60,19 @@ async def upload_document(
     faculty: Optional[str] = Form(None),
     group_name: Optional[str] = Form(None),
 
+    # False → обычный конвейер 0–4 уровней
+    # True  → только для L5 (giant index), worker L0–L4 такие документы не трогает
+    for_level5: bool = Form(False),
+
     db: AsyncSession = Depends(get_db),
 ) -> UploadResponse:
     """
     Загружаем файл, кладём его в UPLOAD_DIR,
-    создаём запись в documents со статусом 'uploaded'.
+    создаём запись в documents.
+
+    - Если for_level5 = False → status='uploaded' (pipeline L0–L4).
+    - Если for_level5 = True  → status='l5_uploaded' (монолитный индекс L5).
     """
-    # читаем содержимое файла
     try:
         content = await file.read()
     except Exception as e:
@@ -72,10 +81,9 @@ async def upload_document(
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
 
-    # считаем shard_id
+    # считаем shard_id (для L5 можно тоже использовать, не мешает)
     shard_id = compute_shard_id(university, faculty, group_name, N_SHARDS)
 
-    # делаем external_id = "doc_<timestamp>_<pid>.<ext>"
     _, ext = os.path.splitext(file.filename or "")
     if not ext:
         ext = ".bin"
@@ -83,7 +91,6 @@ async def upload_document(
     ts = int(utcnow().timestamp())
     external_id = f"doc_{ts}_{os.getpid()}{ext}"
 
-    # сохраняем файл на диск
     upload_path = UPLOAD_DIR / external_id
     try:
         upload_path.write_bytes(content)
@@ -92,11 +99,13 @@ async def upload_document(
 
     now = utcnow()
 
+    status = "l5_uploaded" if for_level5 else "uploaded"
+
     doc = Document(
         external_id=external_id,
         shard_id=shard_id,
         segment_id=None,
-        status="uploaded",
+        status=status,
         simhash_hi=None,
         simhash_lo=None,
         created_at=now,
@@ -120,11 +129,6 @@ async def upload_document(
         external_id=doc.external_id,
     )
 
-import zipfile
-import uuid
-from io import BytesIO
-from typing import List
-
 
 class ZipUploadResponseItem(BaseModel):
     doc_id: int
@@ -139,17 +143,23 @@ class ZipUploadResponse(BaseModel):
 @router.post("/upload-zip", response_model=ZipUploadResponse)
 async def upload_zip_archive(
     file: UploadFile = File(...),
+
+    # По умолчанию ZIP считаем «гигантским архивом» для L5
+    for_level5: bool = Form(True),
+
     db: AsyncSession = Depends(get_db),
 ) -> ZipUploadResponse:
     """
     Принимает ZIP-архив.
+
     Каждый файл внутри:
       - сохраняется в UPLOAD_DIR
       - получает случайное external_id
-      - создаётся Document со status='uploaded'
-      - shard_id всегда = 0
-    """
+      - создаётся Document
 
+    - Если for_level5 = True  → status='l5_uploaded', shard_id=0, L5 монолит.
+    - Если for_level5 = False → status='uploaded', shard_id=0, пойдёт в L0–L4.
+    """
     if not file.filename.lower().endswith(".zip"):
         raise HTTPException(status_code=400, detail="Only .zip архивы разрешены")
 
@@ -163,8 +173,10 @@ async def upload_zip_archive(
     now = utcnow()
     created: List[ZipUploadResponseItem] = []
 
+    status = "l5_uploaded" if for_level5 else "uploaded"
+
     for name in zf.namelist():
-        # пропускаем директории
+        # пропускаем директории и мусор
         if name.endswith("/") or name.startswith("__MACOSX"):
             continue
 
@@ -180,7 +192,6 @@ async def upload_zip_archive(
         if not ext:
             ext = ".bin"
 
-        # ✅ полностью случайное имя
         external_id = f"zip_{uuid.uuid4().hex}{ext}"
         upload_path = UPLOAD_DIR / external_id
 
@@ -191,9 +202,9 @@ async def upload_zip_archive(
 
         doc = Document(
             external_id=external_id,
-            shard_id=0,                 # ✅ шардинг отключён
+            shard_id=0,          # zip в любом случае кладём в shard 0
             segment_id=None,
-            status="uploaded",
+            status=status,
             simhash_hi=None,
             simhash_lo=None,
             created_at=now,
@@ -207,7 +218,7 @@ async def upload_zip_archive(
         )
 
         db.add(doc)
-        await db.flush()  # получаем doc.id без commit
+        await db.flush()
 
         created.append(
             ZipUploadResponseItem(

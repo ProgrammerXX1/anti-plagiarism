@@ -1,13 +1,12 @@
 # app/services/level5/index_native_export.py
 import json
+import gzip
 import struct
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
 
 from ...core.config import INDEX_DIR, INDEX_JSON
 from ...core.logger import logger
-from index_native_export import load_index  # если search/index_search лежит в app/services
-
 
 MAGIC = b"PLAG"
 VERSION = 1
@@ -30,6 +29,30 @@ def _split_simhash128(hex_str: str) -> Tuple[int, int]:
     return hi, lo
 
 
+def load_index() -> Dict[str, Any]:
+    """
+    Грузим тяжёлый index.json / index.json.gz, который сделал build_index_json().
+    Ожидаем как минимум ключи: docs_meta, inverted_doc, config.
+    """
+    if not INDEX_JSON.exists():
+        raise FileNotFoundError(f"index.json not found: {INDEX_JSON}")
+
+    # поддержка как обычного JSON, так и gzip-версии
+    if INDEX_JSON.suffix == ".gz":
+        with gzip.open(INDEX_JSON, "rt", encoding="utf-8") as f:
+            idx = json.load(f)
+    else:
+        with open(INDEX_JSON, "r", encoding="utf-8") as f:
+            idx = json.load(f)
+
+    # лёгкая валидация
+    for key in ("docs_meta", "inverted_doc", "config"):
+        if key not in idx:
+            raise ValueError(f"invalid index.json: missing key '{key}'")
+
+    return idx
+
+
 def export_native_index() -> None:
     """
     Генерит:
@@ -43,7 +66,7 @@ def export_native_index() -> None:
 
     logger.info(f"[native-export] loading index from {INDEX_JSON}")
     # грузим тяжёлый index.json — это оффлайн-этап
-    idx = load_index()  # уже валидированный и с нормализованным config
+    idx = load_index()  # уже провалиденный и с config
 
     docs_meta: Dict[str, Any] = idx["docs_meta"]
     inv: Dict[str, Dict[str, List[str]]] = idx["inverted_doc"]
