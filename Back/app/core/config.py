@@ -22,6 +22,20 @@ QUEUE_DIR = ROOT / "queue"
 LOGS_DIR = ROOT / "logs"
 LOCKS_DIR = ROOT / "locks"
 
+L5_ROOT = ROOT / "index5"               # базовая директория для 5 уровня
+L5_SHARDS_DIR = L5_ROOT / "shards"      # тут шардовые индексы
+L5_SNAP_DIR = L5_ROOT / "snapshots"     # будущие снапшоты, если надо
+
+# хотя бы 1 шард по умолчанию
+L5_N_SHARDS = int(os.environ.get("PLAGIO_L5_N_SHARDS", "1"))
+
+for p in (L5_ROOT, L5_SHARDS_DIR, L5_SNAP_DIR):
+    p.mkdir(parents=True, exist_ok=True)
+
+def l5_index_dir_for_shard(shard_id: int) -> Path:
+    return L5_SHARDS_DIR / f"shard_{shard_id}" / "current"
+
+
 # ensure dirs
 for p in (
     UPLOAD_DIR,

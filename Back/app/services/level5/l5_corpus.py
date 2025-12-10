@@ -1,4 +1,3 @@
-# app/services/level5/l5_corpus.py
 from __future__ import annotations
 
 import json
@@ -23,20 +22,19 @@ async def rebuild_l5_corpus(db: AsyncSession) -> Dict[str, Any]:
     """
     Собирает монолитный corpus.jsonl для L5.
 
-    Сейчас берём ВСЕ документы из таблицы Document.
-    При желании можешь сузить фильтр, например:
-      - только определённый university/faculty;
-      - только статус 'l5_uploaded' и т.п.
+    Для L5 берём только документы со статусом 'l5_uploaded'.
+    Это те, которые были загружены с for_level5=True или через upload-zip.
     """
-    # TODO: при необходимости подправь фильтр под свои правила L5
-    result = await db.execute(select(Document))
+    result = await db.execute(
+        select(Document).where(Document.status == "l5_uploaded")
+    )
     docs: List[Document] = list(result.scalars())
 
     if not docs:
         logger.info("[L5] нет документов для корпуса L5")
         return {"docs_total": 0, "corpus_docs": 0}
 
-    logger.info("[L5] документов для L5 корпуса: %d", len(docs))
+    logger.info("[L5] документов для L5 корпуса (status='l5_uploaded'): %d", len(docs))
 
     CORPUS_JSONL.parent.mkdir(parents=True, exist_ok=True)
     written = 0

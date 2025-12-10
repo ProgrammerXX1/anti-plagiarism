@@ -4,6 +4,18 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
+class Level5ReindexBaseRequest(BaseModel):
+    shard_id: int = 0
+    rebuild_corpus: bool = True
+    rebuild_index: bool = True
+    load_after: bool = True   # загружать ли сразу в C++ ядро
+
+class Level5BaseInfo(BaseModel):
+    shard_id: int
+    path: str
+    has_index: bool
+    docs: int
+    size_bytes: int
 
 class Level5ReindexRequest(BaseModel):
     """

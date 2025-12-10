@@ -45,4 +45,4 @@ RUN set -ex && \
 
 ENV LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH}
 
-CMD ["uvicorn", "app.main_ops:app", "--host", "0.0.0.0", "--port", "8002"]
+CMD ["uvicorn", "app.main_ops:app", "--host", "0.0.0.0", "--port", "8000"]

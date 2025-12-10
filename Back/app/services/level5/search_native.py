@@ -1,4 +1,3 @@
-# app/services/level5/search_native.py
 import ctypes
 from ctypes import c_char_p, c_int, c_double
 from pathlib import Path
@@ -7,7 +6,7 @@ from typing import Dict, Any, List, Set
 import orjson
 
 from ...core.logger import logger
-from ...core.config import INDEX_DIR, INDEX_JSON
+from ...core.config import INDEX_DIR
 from ...core.memlog import log_mem
 
 # ── пути к .so ──────────────────────────────────────────────────────
@@ -39,7 +38,7 @@ def _load_lib():
     for p in LIB_PATHS:
         try:
             lib = ctypes.CDLL(p)
-            logger.info(f"[search-native] loaded libsearchcore.so from {p}")
+            logger.info("[search-native] loaded libsearchcore.so from %s", p)
             return lib
         except OSError as e:
             last_err = e
@@ -52,7 +51,7 @@ _lib.se_load_index.argtypes = [c_char_p]
 _lib.se_load_index.restype = c_int
 
 _lib.se_search_text.argtypes = [
-    c_char_p,                    # text_utf8 text_utf8 (сырой UTF-8, нормализуем в C++)
+    c_char_p,                    # text_utf8 (сырой UTF-8, нормализуем в C++)
     c_int,                       # top_k
     ctypes.POINTER(SeHit),       # out_hits
     c_int,                       # max_hits
@@ -66,6 +65,8 @@ SE_MAX_HITS = 4096
 _doc_ids: List[str] | None = None
 _meta_cache: Dict[str, Any] | None = None
 
+META_JSON = INDEX_DIR / "index_native_meta.json"
+
 
 def _load_doc_ids() -> List[str]:
     global _doc_ids
@@ -77,11 +78,8 @@ def _load_doc_ids() -> List[str]:
     logger.info("[search-native] loaded doc_ids: %d", len(_doc_ids))
     return _doc_ids
 
-META_JSON = INDEX_DIR / "index_native_meta.json"
 
-_meta_cache: Dict[str, Any] | None = None
-
-def _load_meta_cfg():
+def _load_meta_cfg() -> Dict[str, Any]:
     global _meta_cache
     if _meta_cache is not None:
         return _meta_cache
@@ -91,7 +89,7 @@ def _load_meta_cfg():
                 _meta_cache = orjson.loads(f.read())
                 return _meta_cache
         except Exception as e:
-            logger.error(f"[search-native] meta broken: {e}")
+            logger.error("[search-native] meta broken: %s", e)
     # если меты нет, дефолты, но обязательно docs_meta пустой dict!
     _meta_cache = {
         "docs_meta": {},
@@ -100,28 +98,38 @@ def _load_meta_cfg():
     return _meta_cache
 
 
-# ── API для FastAPI ─────────────────────────────────────────────────
+# ── API для FastAPI / пайплайна ─────────────────────────────────────
+
 
 def native_load_index() -> None:
+    index_dir = INDEX_DIR
+
+    # диагностический лог перед вызовом C++
+    from pathlib import Path
+    logger.info("[search-native] trying to load index from %s", index_dir)
+    for name in ["index_native.bin", "index_native_docids.json", "index_native_meta.json", "index_config.json"]:
+        path = index_dir / name
+        exists = path.exists()
+        size = path.stat().st_size if exists else None
+        logger.info(
+            "[search-native] check %s exists=%s size=%s",
+            path,
+            exists,
+            size,
+        )
+
     log_mem("[search-native] before se_load_index")
-    rc = _lib.se_load_index(str(INDEX_DIR).encode("utf-8"))
+    rc = _lib.se_load_index(str(index_dir).encode("utf-8"))
     if rc != 0:
         raise RuntimeError(f"se_load_index failed: rc={rc}")
 
     _load_doc_ids()
-    _load_meta_cfg()   # <==== ДОЛЖНО БЫТЬ
+    _load_meta_cfg()
     log_mem("[search-native] after se_load_index + meta/doc_ids")
     logger.info("[search-native] C++ index loaded successfully")
 
 
 def native_search(
-    # Чистый C++-поиск.
-
-    # 1) Передаем сырой текст запроса в C++.
-    # 2) Вызываем se_search_text.
-    # 3) Фильтруем по allowed_doc_ids (если передано).
-    # 4) Обогащаем метаданными из docs_meta + thresholds из config.      
-    
     q: str,
     top: int = 10,
     allowed_doc_ids: Set[str] | None = None,
@@ -129,7 +137,7 @@ def native_search(
     """
     Чистый C++-поиск.
 
-    1) Нормализуем запрос тем же пайплайном, что и тексты при индексации.
+    1) Передаём сырой текст запроса в C++.
     2) Вызываем se_search_text.
     3) Фильтруем по allowed_doc_ids (если передано).
     4) Обогащаем метаданными из docs_meta + thresholds из config.
@@ -142,13 +150,12 @@ def native_search(
 
     doc_ids = _load_doc_ids()
     meta_cfg = _load_meta_cfg()
-    ocs_meta = meta_cfg.get("docs_meta") or {}
+    docs_meta = meta_cfg.get("docs_meta") or {}
     cfg = meta_cfg.get("config") or {}
 
-    thresholds = (cfg.get("thresholds") or {})
+    thresholds = cfg.get("thresholds") or {}
     plag_thr = float(thresholds.get("plag_thr", 0.7))
     partial_thr = float(thresholds.get("partial_thr", 0.3))
-
 
     hits = (SeHit * SE_MAX_HITS)()
 
@@ -177,14 +184,14 @@ def native_search(
         if allow is not None and did not in allow:
             continue
 
-        meta = ocs_meta.get(did, {})
-
+        meta = docs_meta.get(did, {})  # фикс: docs_meta
 
         score = float(h.score)
         if score >= plag_thr:
             decision = "plagiarism"
         elif score >= partial_thr:
             decision = "partial"
+            # TODO: можно добавить отдельный тип решения "suspicious"
         else:
             decision = "original"
 
@@ -195,7 +202,8 @@ def native_search(
                 "author": meta.get("author"),
                 "max_score": score,
                 "originality_pct": round(
-                    (1.0 - min(max(score, 0.0), 1.0)) * 100.0, 1
+                    (1.0 - min(max(score, 0.0), 1.0)) * 100.0,
+                    1,
                 ),
                 "decision": decision,
                 "details": {
