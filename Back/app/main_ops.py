@@ -7,7 +7,7 @@ from .core.logger import logger
 from .core.memlog import log_mem
 from .core.config import INDEX_DIR
 from .services.level5.search_native import native_load_index
-from .routers import status, level5, upload, admin_levels
+from .routers import status, level5, upload, admin_levels, levels0_4_search
 
 app = FastAPI(
     title="Plagiarism Operations API",
@@ -42,3 +42,4 @@ app.include_router(upload.router)
 app.include_router(status.router)
 app.include_router(level5.router)
 app.include_router(admin_levels.router)
+app.include_router(levels0_4_search.router)

@@ -23,6 +23,7 @@ services:
       - PLAGIO_SEGMENTS_PER_L2=10
       - PLAGIO_SEGMENTS_PER_L3=10
       - PLAGIO_SEGMENTS_PER_L4=10
+      - PLAGIO_SEGMENTS_SO=/usr/local/lib/libplagio_segments.so
 
     volumes:
       - ./runtime:/runtime
@@ -45,6 +46,7 @@ services:
       - PG_DB=oysyn
       - PG_USER=oysyn
       - PG_PASS=2123
+      - PLAGIO_SEGMENTS_SO=/usr/local/lib/libplagio_segments.so
     volumes:
       - ./runtime:/runtime
     ports:
