@@ -63,6 +63,18 @@ std::vector<std::string>  g_doc_ids;
 
 // ── служебка ─────────────────────────────────────────────────────────
 
+static inline double clamp01(double x) {
+    if (x < 0.0) return 0.0;
+    if (x > 1.0) return 1.0;
+    return x;
+}
+
+static inline int clamp_int(int x, int lo, int hi) {
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+}
+
 static inline void jc_compute(
     int inter,
     int q_size,
@@ -120,6 +132,7 @@ static Config load_config_from_json(const std::string& index_dir) {
         std::cerr << "[config] no index_config.json, using defaults\n";
         return cfg;
     }
+
     json j;
     try {
         in >> j;
@@ -146,6 +159,16 @@ static Config load_config_from_json(const std::string& index_dir) {
         cfg.fetch_per_k = j["fetch_per_k_doc"].get<int>();
     if (j.contains("max_cands_doc"))
         cfg.max_cands_doc = j["max_cands_doc"].get<int>();
+
+    // защита от мусорных значений
+    cfg.w_min_doc   = clamp_int(cfg.w_min_doc, 1, 1000000);
+    cfg.w_min_query = clamp_int(cfg.w_min_query, 1, 1000000);
+
+    cfg.alpha = clamp01(cfg.alpha);
+    cfg.w9    = clamp01(cfg.w9);
+
+    cfg.fetch_per_k   = clamp_int(cfg.fetch_per_k, 1, 1000000);
+    cfg.max_cands_doc = clamp_int(cfg.max_cands_doc, 1, 100000000);
 
     return cfg;
 }
@@ -246,8 +269,7 @@ extern "C" int se_load_index(const char* index_dir_utf8) {
             return -1;
         }
         if (did >= N_docs) {
-            // защита от битых doc_id_int
-            continue;
+            continue; // защита от битых doc_id_int
         }
         g_post9.push_back(Posting9{h, did});
     }
@@ -294,6 +316,7 @@ extern "C" int se_load_index(const char* index_dir_utf8) {
         return -1;
     }
     g_doc_ids.clear();
+    g_doc_ids.reserve(j.size());
     for (auto& v : j) {
         g_doc_ids.push_back(v.get<std::string>());
     }
@@ -326,43 +349,72 @@ extern "C" SeSearchResult se_search_text(
         return result;
     }
 
+    // ограничиваем выдачу
+    const int want = std::min(top_k, max_hits);
+    if (want <= 0) return result;
+
     const std::string qraw(text_utf8);
+
     // нормализация/токенизация/шинглы — из text_common.h
-    std::string qnorm = normalize_for_shingles_simple(qraw);
-    auto qtoks = simple_tokens(qnorm);
+    const std::string qnorm = normalize_for_shingles_simple(qraw);
+    const auto qtoks = simple_tokens(qnorm);
 
     const Config& cfg = g_cfg;
-    if (static_cast<int>(qtoks.size()) < cfg.w_min_query) {
+    const int q_tokens = static_cast<int>(qtoks.size());
+    if (q_tokens < cfg.w_min_query) {
         return result;
     }
 
     // k=9
-    auto s9 = build_shingles(qtoks, K);
+    const auto s9 = build_shingles(qtoks, K);
     const int qS9 = static_cast<int>(s9.size());
     if (qS9 <= 0) {
         return result;
     }
 
     const int N_docs = static_cast<int>(g_docs.size());
-    if (N_docs == 0) {
+    if (N_docs <= 0) {
         return result;
     }
 
+    // NOTE: для больших N_docs это станет дорого по памяти.
+    // Пока оставляем как есть (минимальные правки), но кандидатов улучшаем.
     std::vector<int>          cand_hits(N_docs, 0);
     std::vector<std::uint8_t> cand_mask(N_docs, 0);
 
+    // clamp fetch per query-size
     const int fetch9 = std::min(cfg.fetch_per_k, qS9);
 
-    // кандидаты по k9: для первых fetch9 шинглов
-    for (int i = 0; i < fetch9; ++i) {
-        std::uint64_t h = s9[i];
+    // ──────────────────────────────────────────────────────
+    // FIX: кандидаты не по первым shingle, а равномерно по всему запросу
+    // ──────────────────────────────────────────────────────
+    if (fetch9 == 1) {
+        const std::uint64_t h = s9[0];
         auto [beg, end] = find_postings9_range(h);
-        if (beg == end) continue;
         for (std::size_t idx = beg; idx < end; ++idx) {
-            std::uint32_t did = g_post9[idx].did;
-            if (static_cast<int>(did) >= N_docs) continue;
+            const std::uint32_t did = g_post9[idx].did;
+            if (did >= static_cast<std::uint32_t>(N_docs)) continue;
             cand_hits[did] += 1;
             cand_mask[did] = 1;
+        }
+    } else {
+        for (int t = 0; t < fetch9; ++t) {
+            // равномерный индекс по диапазону [0..qS9-1]
+            const int i = static_cast<int>(
+                (static_cast<long long>(t) * static_cast<long long>(qS9 - 1)) /
+                static_cast<long long>(fetch9 - 1)
+            );
+
+            const std::uint64_t h = s9[i];
+            auto [beg, end] = find_postings9_range(h);
+            if (beg == end) continue;
+
+            for (std::size_t idx = beg; idx < end; ++idx) {
+                const std::uint32_t did = g_post9[idx].did;
+                if (did >= static_cast<std::uint32_t>(N_docs)) continue;
+                cand_hits[did] += 1;
+                cand_mask[did] = 1;
+            }
         }
     }
 
@@ -378,8 +430,9 @@ extern "C" SeSearchResult se_search_text(
         std::uint32_t did;
         int hits;
     };
+
     std::vector<CandTmp> cand_list;
-    cand_list.reserve(cand_count);
+    cand_list.reserve(static_cast<std::size_t>(cand_count));
     for (int i = 0; i < N_docs; ++i) {
         if (cand_mask[i]) {
             cand_list.push_back(CandTmp{
@@ -389,22 +442,24 @@ extern "C" SeSearchResult se_search_text(
         }
     }
 
+    // ограничиваем кандидатов
     if (static_cast<int>(cand_list.size()) > cfg.max_cands_doc) {
+        const int k = cfg.max_cands_doc;
         std::nth_element(
             cand_list.begin(),
-            cand_list.begin() + cfg.max_cands_doc,
+            cand_list.begin() + k,
             cand_list.end(),
             [](const CandTmp& a, const CandTmp& b) {
                 return a.hits > b.hits;
             }
         );
-        cand_list.resize(cfg.max_cands_doc);
+        cand_list.resize(static_cast<std::size_t>(k));
     }
 
     std::vector<int>          inter9(N_docs, 0);
     std::vector<std::uint8_t> is_cand(N_docs, 0);
-    for (auto& c : cand_list) {
-        if (static_cast<int>(c.did) < N_docs) {
+    for (const auto& c : cand_list) {
+        if (c.did < static_cast<std::uint32_t>(N_docs)) {
             is_cand[c.did] = 1;
         }
     }
@@ -415,12 +470,12 @@ extern "C" SeSearchResult se_search_text(
         std::sort(uniq.begin(), uniq.end());
         uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
 
-        for (auto h : uniq) {
+        for (const auto h : uniq) {
             auto [beg, end] = find_postings9_range(h);
             if (beg == end) continue;
             for (std::size_t idx = beg; idx < end; ++idx) {
-                std::uint32_t did = g_post9[idx].did;
-                if (static_cast<int>(did) < N_docs && is_cand[did]) {
+                const std::uint32_t did = g_post9[idx].did;
+                if (did < static_cast<std::uint32_t>(N_docs) && is_cand[did]) {
                     inter9[did] += 1;
                 }
             }
@@ -434,34 +489,32 @@ extern "C" SeSearchResult se_search_text(
         double c9;
         int    hits;
     };
+
     std::vector<Scored> scored;
     scored.reserve(cand_list.size());
 
-    const double alpha = cfg.alpha;
-    const double w9    = cfg.w9;
+    const double alpha = clamp01(cfg.alpha);
+    const double w9    = clamp01(cfg.w9);
 
     const int tQ9 = qS9;
 
     for (const auto& c : cand_list) {
-        int did = static_cast<int>(c.did);
+        const int did = static_cast<int>(c.did);
         const DocMeta& dm = g_docs[did];
         if (static_cast<int>(dm.tok_len) < cfg.w_min_doc) continue;
 
-        int tlen = static_cast<int>(dm.tok_len);
-        int T9   = std::max(0, tlen - K + 1);
+        const int tlen = static_cast<int>(dm.tok_len);
+        const int T9   = std::max(0, tlen - K + 1);
 
-        int i9 = inter9[did];
-        if (i9 < 1) {
-            // минимум 1 пересекающийся шингл k=9
-            continue;
-        }
+        const int i9 = inter9[did];
+        if (i9 < 1) continue;
 
         double J9 = 0.0, C9 = 0.0;
         if (tQ9 > 0 && T9 > 0) {
             jc_compute(i9, tQ9, T9, J9, C9);
         }
 
-        double score = w9 * (alpha * J9 + (1.0 - alpha) * C9);
+        const double score = w9 * (alpha * J9 + (1.0 - alpha) * C9);
 
         scored.push_back(Scored{
             static_cast<std::uint32_t>(did),
@@ -484,12 +537,11 @@ extern "C" SeSearchResult se_search_text(
         }
     );
 
-    int keep = std::min(top_k, std::min(max_hits, static_cast<int>(scored.size())));
+    const int keep = std::min(want, static_cast<int>(scored.size()));
     for (int i = 0; i < keep; ++i) {
         const auto& s = scored[i];
         out_hits[i].doc_id_int = static_cast<int>(s.did);
         out_hits[i].score      = s.score;
-        // k=13 больше не считаем — нули для ABI с SeHit
         out_hits[i].j9         = s.j9;
         out_hits[i].c9         = s.c9;
         out_hits[i].j13        = 0.0;
