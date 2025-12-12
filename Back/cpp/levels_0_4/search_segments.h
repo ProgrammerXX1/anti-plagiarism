@@ -5,7 +5,7 @@
 extern "C" {
 #endif
 
-// возвращает malloc-строку JSON; освобождать seg_free()
+// malloc-строка JSON; освобождать seg_free()
 char* seg_search_many_json(
     const char* query_utf8,
     int top_k,
