@@ -4,8 +4,8 @@ from __future__ import annotations
 import asyncio
 
 from app.core.config import MAX_AUTO_LEVEL
-from app.services.levels0_4.etl_service import process_uploaded_docs
-from app.services.levels0_4.segments_service import (
+from app.services.levels_0_4.etl_service import process_uploaded_docs
+from app.services.levels_0_4.segment_service import (
     build_l1_segments,
     build_l2_segments,
     build_l3_segments,

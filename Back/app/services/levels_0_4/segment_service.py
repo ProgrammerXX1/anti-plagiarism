@@ -20,7 +20,7 @@ from app.models.segment import Segment
 from app.models.segment_doc import SegmentDoc
 from app.repositories.index_errors import log_index_error
 from app.services.helpers.file_extract import extract_text_from_file_bytes
-from app.services.levels0_4.etl_service import utcnow
+from app.services.levels_0_4.etl_service import utcnow
 
 
 # -------------------------
