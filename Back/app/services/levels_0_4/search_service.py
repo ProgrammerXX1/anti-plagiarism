@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,10 +9,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import INDEX_DIR, UPLOAD_DIR
 from app.models.segment import Segment
 from app.models.document import Document
-from app.services.levels_0_4.native_segments import seg_search_many
+from app.services.levels_0_4.native_segments import seg_search_many, seg_excerpt_for_span
 from app.services.helpers.file_extract import extract_text_from_file_bytes
 
 K_SHINGLE = 9
+MIN_SPAN_SHINGLES = 6
+MAX_SPANS_PER_HIT = 3
 
 
 def _build_match_spans(q_pos: List[int], d_pos: List[int]) -> List[Dict[str, int]]:
@@ -20,10 +22,10 @@ def _build_match_spans(q_pos: List[int], d_pos: List[int]) -> List[Dict[str, int
         return []
 
     spans: List[Dict[str, int]] = []
-    q_start = q_pos[0]
-    d_start = d_pos[0]
-    q_prev = q_pos[0]
-    d_prev = d_pos[0]
+    q_start = int(q_pos[0])
+    d_start = int(d_pos[0])
+    q_prev = int(q_pos[0])
+    d_prev = int(d_pos[0])
 
     for i in range(1, len(q_pos)):
         q = int(q_pos[i])
@@ -60,43 +62,7 @@ def _build_match_spans(q_pos: List[int], d_pos: List[int]) -> List[Dict[str, int
     return spans
 
 
-def _normalize_for_shingles_simple_py(text: str) -> str:
-    """
-    Python-side approx of C++ normalize_for_shingles_simple.
-    IMPORTANT: for exact char offsets you'd need to share the same normalization logic.
-    For user-readable excerpts this is sufficient.
-    """
-    # минимально: lower + collapse spaces
-    t = text.lower()
-    t = " ".join(t.split())
-    return t
-
-
-def _tokenize_simple(norm_text: str) -> List[str]:
-    # простой токенайзер; если хочешь 1-в-1, лучше вынести из C++ в shared lib
-    return norm_text.split()
-
-
-def _excerpt_from_tokens(tokens: List[str], tok_from: int, tok_to: int, max_tokens: int = 80) -> str:
-    if not tokens:
-        return ""
-    tok_from = max(0, min(tok_from, len(tokens)))
-    tok_to = max(0, min(tok_to, len(tokens) - 1))
-    if tok_from > tok_to:
-        return ""
-
-    length = tok_to - tok_from + 1
-    if length > max_tokens:
-        tok_to = tok_from + max_tokens - 1
-
-    piece = tokens[tok_from : tok_to + 1]
-    return " ".join(piece)
-
-
 async def _load_doc_text(db: AsyncSession, doc_id: int) -> Optional[str]:
-    """
-    Берёт Document.external_id -> UPLOAD_DIR -> extract_text_from_file_bytes.
-    """
     doc = await db.get(Document, doc_id)
     if not doc or not doc.external_id:
         return None
@@ -121,11 +87,10 @@ async def search_levels_1_4(
     include_matches: bool = True,
     max_matches_per_doc: Optional[int] = None,
     include_spans: bool = True,
-    include_user_view: bool = True,     # <- главное: читабельные фрагменты
-    keep_raw_matches: bool = False,     # <- по умолчанию скрываем мусор для UI
-    excerpt_max_tokens: int = 80,       # сколько токенов показывать
+    include_user_view: bool = True,
+    keep_raw_matches: bool = False,
+    excerpt_max_chars: int = 800,
 ) -> Dict[str, Any]:
-    # 1) сегменты
     res = await db.execute(
         select(Segment)
         .where(
@@ -147,7 +112,6 @@ async def search_levels_1_4(
         index_dirs.append(d)
         by_dir[d] = {"segment_id": s.id, "segment_level": s.level, "segment_path": s.path}
 
-    # 2) нативный поиск
     data = seg_search_many(
         query=query,
         top_k=top_k,
@@ -158,7 +122,7 @@ async def search_levels_1_4(
 
     hits = data.get("hits") or []
 
-    # 3) enrich segment meta + spans
+    # enrich + spans
     for h in hits:
         d = h.get("index_dir")
         meta = by_dir.get(d)
@@ -176,13 +140,17 @@ async def search_levels_1_4(
             if isinstance(m, dict):
                 q_pos = m.get("q_pos") or []
                 d_pos = m.get("d_pos") or []
-                h["match_spans"] = _build_match_spans(q_pos, d_pos)
+                spans = _build_match_spans(q_pos, d_pos)
+
+                # filter + keep biggest spans only (for UX)
+                spans = [sp for sp in spans if int(sp.get("length", 0)) >= MIN_SPAN_SHINGLES]
+                spans.sort(key=lambda x: int(x.get("length", 0)), reverse=True)
+                h["match_spans"] = spans[:MAX_SPANS_PER_HIT]
             else:
                 h["match_spans"] = []
 
-    # 4) user_view: excerpts (дорого, но читаемо)
+    # user_view via C++ excerpt (single normalization)
     if include_user_view and include_matches:
-        # Чтобы не читать/извлекать один и тот же doc много раз
         doc_text_cache: Dict[int, Optional[str]] = {}
 
         for h in hits:
@@ -205,42 +173,44 @@ async def search_levels_1_4(
                 h["user_view"] = {"summary": "Текст документа недоступен", "spans": []}
                 continue
 
-            norm = _normalize_for_shingles_simple_py(raw_text)
-            tokens = _tokenize_simple(norm)
-
             uv_spans = []
+            total_sh = 0
+
             for sp in spans:
                 d_from = int(sp["d_from"])
                 d_to = int(sp["d_to"])
+                length = int(sp.get("length", 0))
+                total_sh += length
 
-                # перевод шингл-оффсетов в токен-оффсеты
-                tok_from = d_from
-                tok_to = d_to + (K_SHINGLE - 1)
-
-                excerpt = _excerpt_from_tokens(tokens, tok_from, tok_to, max_tokens=excerpt_max_tokens)
+                ex = seg_excerpt_for_span(
+                    text=raw_text,
+                    d_from=d_from,
+                    d_to=d_to,
+                    k_shingle=K_SHINGLE,
+                    max_chars=excerpt_max_chars,
+                )
 
                 uv_spans.append(
                     {
-                        "doc_token_from": tok_from,
-                        "doc_token_to": tok_to,
                         "doc_shingle_from": d_from,
                         "doc_shingle_to": d_to,
-                        "shingles": int(sp["length"]),
-                        "excerpt": excerpt,
+                        "shingles": length,
+                        "excerpt": ex.get("excerpt", ""),
+                        "doc_char_from": ex.get("char_from", 0),
+                        "doc_char_to": ex.get("char_to", 0),
+                        "tok_from": ex.get("tok_from", None),
+                        "tok_to": ex.get("tok_to", None),
+                        "ok": bool(ex.get("ok", False)),
                     }
                 )
 
-            # короткое описание
-            total_sh = sum(int(sp.get("length", 0)) for sp in spans)
             h["user_view"] = {
                 "summary": f"Найдено {len(spans)} фрагм., совпало {total_sh} шинглов",
                 "spans": uv_spans,
             }
 
-    # 5) скрыть сырой мусор, если надо
     if include_matches and not keep_raw_matches:
         for h in hits:
             h.pop("matches", None)
-            # match_spans можно оставить (это уже норм)
 
     return data
