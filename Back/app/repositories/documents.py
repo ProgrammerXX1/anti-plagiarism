@@ -10,26 +10,32 @@ from sqlalchemy import select, update
 from app.models.document import Document
 from app.core.settings_index import calc_shard_id_from_meta
 
+
 async def list_unsegmented_docs_for_shard(
     db: AsyncSession,
+    *,
+    organization_id: int,
     shard_id: int,
     limit: int,
 ) -> list[Document]:
     res = await db.execute(
         select(Document)
         .where(
+            Document.organization_id == organization_id,
             Document.shard_id == shard_id,
             Document.segment_id.is_(None),
-            Document.status == "uploaded",  # или "normalized"
+            Document.status == "uploaded",
         )
         .order_by(Document.id)
         .limit(limit)
     )
     return list(res.scalars().all())
 
+
 async def create_document(
     db: AsyncSession,
     *,
+    organization_id: int,
     title: Optional[str],
     student_name: Optional[str],
     university: Optional[str],
@@ -45,6 +51,7 @@ async def create_document(
     )
 
     doc = Document(
+        organization_id=organization_id,
         external_id=external_id,
         shard_id=shard_id,
         status="uploaded",
@@ -57,7 +64,7 @@ async def create_document(
         group_name=group_name,
     )
     db.add(doc)
-    await db.flush()  # чтобы появился doc.id
+    await db.flush()
     return doc
 
 
@@ -71,7 +78,6 @@ async def set_document_status(
     simhash_lo: Optional[int] = None,
 ) -> None:
     now = datetime.now(timezone.utc)
-
     stmt = (
         update(Document)
         .where(Document.id == doc_id)
@@ -87,7 +93,5 @@ async def set_document_status(
 
 
 async def get_document(db: AsyncSession, doc_id: int) -> Optional[Document]:
-    res = await db.execute(
-        select(Document).where(Document.id == doc_id)
-    )
+    res = await db.execute(select(Document).where(Document.id == doc_id))
     return res.scalar_one_or_none()

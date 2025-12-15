@@ -1,4 +1,3 @@
-# app/models/segment_doc.py
 from sqlalchemy import BigInteger, Integer, ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -10,20 +9,24 @@ class SegmentDoc(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
 
+    # NEW
+    organization_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+
     segment_id: Mapped[int] = mapped_column(
         BigInteger,
         ForeignKey("segments.id", ondelete="CASCADE"),
         nullable=False,
+        index=True,
     )
 
     document_id: Mapped[int] = mapped_column(
         BigInteger,
         ForeignKey("documents.id", ondelete="CASCADE"),
         nullable=False,
+        index=True,
     )
 
-    shard_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    shard_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
 
-    # связи (на будущее, можно не использовать прямо сейчас)
     segment: Mapped["Segment"] = relationship("Segment", back_populates="segment_docs")
     document: Mapped["Document"] = relationship("Document", back_populates="segment_docs")

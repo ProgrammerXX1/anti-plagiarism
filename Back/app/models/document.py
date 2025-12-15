@@ -1,4 +1,3 @@
-# app/models/document.py
 from datetime import datetime
 from typing import Optional, List
 
@@ -20,29 +19,27 @@ class Document(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
 
+    # NEW
+    organization_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+
     external_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    shard_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    shard_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
 
     segment_id: Mapped[Optional[int]] = mapped_column(
         BigInteger,
         ForeignKey("segments.id", ondelete="SET NULL"),
         nullable=True,
+        index=True,
     )
 
-    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
 
     simhash_hi: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     simhash_lo: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
 
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
-    )
-    last_checked_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     title: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     student_name: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -50,9 +47,8 @@ class Document(Base):
     faculty: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     group_name: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    segment: Mapped[Optional["Segment"]] = relationship("Segment", backref="documents")
+    segment: Mapped[Optional["Segment"]] = relationship("Segment", back_populates="documents")
 
-    # связь с SegmentDoc
     segment_docs: Mapped[List["SegmentDoc"]] = relationship(
         "SegmentDoc",
         back_populates="document",

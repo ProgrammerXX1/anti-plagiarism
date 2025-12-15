@@ -1,3 +1,4 @@
+# app/services/levels_0_4/search_service.py
 from __future__ import annotations
 
 from pathlib import Path
@@ -81,23 +82,35 @@ async def _load_doc_text(db: AsyncSession, doc_id: int) -> Optional[str]:
 async def search_levels_1_4(
     db: AsyncSession,
     *,
-    shard_id: int,
+    organization_id: int,
+    shard_id: Optional[int],
     query: str,
     top_k: int = 10,
+    global_search: bool = False,
     include_matches: bool = True,
     max_matches_per_doc: Optional[int] = None,
-    include_spans: bool = True,
     include_user_view: bool = True,
     keep_raw_matches: bool = False,
     excerpt_max_chars: int = 800,
 ) -> Dict[str, Any]:
+    """
+    - global_search=False: ищем внутри org + shard
+    - global_search=True:  ищем по всем shard внутри org
+    """
+    conds = [
+        Segment.organization_id == organization_id,
+        Segment.status == "ready",
+        Segment.level.in_([1, 2, 3, 4]),
+    ]
+    if not global_search:
+        if shard_id is None:
+            # strict: shard must be provided unless global_search
+            return {"count": 0, "hits": []}
+        conds.append(Segment.shard_id == shard_id)
+
     res = await db.execute(
         select(Segment)
-        .where(
-            Segment.shard_id == shard_id,
-            Segment.status == "ready",
-            Segment.level.in_([1, 2, 3, 4]),
-        )
+        .where(*conds)
         .order_by(Segment.level.desc(), Segment.id.desc())
     )
     segs: List[Segment] = list(res.scalars())
@@ -135,21 +148,20 @@ async def search_levels_1_4(
         if meta:
             h.update(meta)
 
-        if include_spans and include_matches:
+        if include_matches:
             m = h.get("matches")
             if isinstance(m, dict):
                 q_pos = m.get("q_pos") or []
                 d_pos = m.get("d_pos") or []
                 spans = _build_match_spans(q_pos, d_pos)
 
-                # filter + keep biggest spans only (for UX)
                 spans = [sp for sp in spans if int(sp.get("length", 0)) >= MIN_SPAN_SHINGLES]
                 spans.sort(key=lambda x: int(x.get("length", 0)), reverse=True)
                 h["match_spans"] = spans[:MAX_SPANS_PER_HIT]
             else:
                 h["match_spans"] = []
 
-    # user_view via C++ excerpt (single normalization)
+    # user_view via C++ excerpt
     if include_user_view and include_matches:
         doc_text_cache: Dict[int, Optional[str]] = {}
 

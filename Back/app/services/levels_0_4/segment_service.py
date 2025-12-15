@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import List, Set
+from typing import List, Set, Tuple, Optional
 
 from sqlalchemy import select, delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -61,16 +61,18 @@ async def _run_etl_index_builder(corpus: Path, out_dir: Path) -> bool:
 async def _select_docs_for_l1_locked(
     session: AsyncSession,
     shard_id: int,
+    organization_id: int,
     limit: int,
 ) -> List[Document]:
     """
-    Берем пачку etl_ok документов для конкретного shard_id с блокировкой,
-    чтобы несколько воркеров не строили один и тот же сегмент.
+    Берем пачку etl_ok документов для (shard_id, organization_id) с блокировкой,
+    чтобы несколько воркеров не строили один и тот же сегмент и не мешали друг другу.
     """
     res = await session.execute(
         select(Document)
         .where(
             Document.shard_id == shard_id,
+            Document.organization_id == organization_id,
             Document.status == "etl_ok",
             Document.segment_id.is_(None),
         )
@@ -81,11 +83,21 @@ async def _select_docs_for_l1_locked(
     return list(res.scalars())
 
 
-def _segment_dir(shard_id: int, segment_id: int) -> Path:
-    rel = f"shard_{shard_id}/segment_{segment_id}"
+def _segment_dir(org_id: int, shard_id: int, segment_id: int) -> Path:
+    rel = f"org_{org_id}/shard_{shard_id}/segment_{segment_id}"
     d = INDEX_DIR / rel
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _ensure_single_org(docs: List[Document]) -> Optional[int]:
+    if not docs:
+        return None
+    org0 = docs[0].organization_id
+    for d in docs[1:]:
+        if d.organization_id != org0:
+            return None
+    return org0
 
 
 # -------------------------
@@ -97,32 +109,54 @@ async def build_l1_segments() -> int:
     L1: индексируем документы (создаём L1-сегменты).
     КЛЮЧЕВО:
       - берём документы пачками с FOR UPDATE SKIP LOCKED
+      - берём строго в рамках (shard_id, organization_id), иначе ломается инвариант org_id в segment_docs
       - помечаем indexed только те, кто реально попал в corpus.jsonl
     """
     async with AsyncSessionLocal() as session:
-        shard_rows = await session.execute(
-            select(Document.shard_id)
+        pair_rows = await session.execute(
+            select(Document.shard_id, Document.organization_id)
             .where(
                 Document.status == "etl_ok",
                 Document.segment_id.is_(None),
             )
             .distinct()
         )
-        shard_ids = [row[0] for row in shard_rows.fetchall()]
+        pairs: List[Tuple[int, int]] = [(r[0], r[1]) for r in pair_rows.fetchall()]
 
-        if not shard_ids:
+        if not pairs:
             print("[SEGMENT-L1] Нет документов etl_ok без segment_id — L1-сегменты не нужны")
             return 0
 
     total_docs_processed = 0
 
-    # shard loop — отдельными транзакциями, чтобы не держать long tx
-    for shard_id in shard_ids:
+    # (shard_id, org_id) loop — отдельными транзакциями, чтобы не держать long tx
+    for shard_id, org_id in pairs:
         while True:
             async with AsyncSessionLocal() as session:
-                docs = await _select_docs_for_l1_locked(session, shard_id, DOCS_PER_L1_SEGMENT)
+                docs = await _select_docs_for_l1_locked(
+                    session=session,
+                    shard_id=shard_id,
+                    organization_id=org_id,
+                    limit=DOCS_PER_L1_SEGMENT,
+                )
                 if not docs:
                     break
+
+                # safety: если вдруг попали смешанные org (не должны) — не продолжаем
+                org_checked = _ensure_single_org(docs)
+                if org_checked is None:
+                    await log_index_error(
+                        session,
+                        stage="build_l1",
+                        message="mixed organization_id in locked docs batch; abort batch",
+                        payload={
+                            "shard_id": shard_id,
+                            "org_ids": sorted({d.organization_id for d in docs}),
+                            "doc_ids": [d.id for d in docs],
+                        },
+                    )
+                    await session.commit()
+                    continue
 
                 now = utcnow()
 
@@ -141,11 +175,11 @@ async def build_l1_segments() -> int:
                 session.add(segment)
                 await session.flush()
 
-                seg_dir = _segment_dir(shard_id, segment.id)
-                segment.path = f"shard_{shard_id}/segment_{segment.id}"
+                seg_dir = _segment_dir(org_id, shard_id, segment.id)
+                segment.path = f"org_{org_id}/shard_{shard_id}/segment_{segment.id}"
 
                 print(
-                    f"[SEGMENT-L1] shard={shard_id}: строю L1-segment id={segment.id}, "
+                    f"[SEGMENT-L1] shard={shard_id}, org={org_id}: строю L1-segment id={segment.id}, "
                     f"docs(batch)={len(docs)}, dir={seg_dir}"
                 )
 
@@ -165,7 +199,6 @@ async def build_l1_segments() -> int:
                             raw_bytes = file_path.read_bytes()
                             raw_text = extract_text_from_file_bytes(raw_bytes, filename=str(file_path))
                         except Exception as e:
-                            # логируем и пропускаем
                             await log_index_error(
                                 session,
                                 stage="build_l1",
@@ -187,7 +220,7 @@ async def build_l1_segments() -> int:
                         stage="build_l1",
                         message="segment_corpus.jsonl is empty (no indexable docs)",
                         segment_id=segment.id,
-                        payload={"shard_id": shard_id},
+                        payload={"shard_id": shard_id, "organization_id": org_id},
                     )
                     await session.commit()
                     continue
@@ -245,30 +278,51 @@ async def build_l1_segments() -> int:
                 )
                 real_docs_list: List[Document] = list(real_docs.scalars())
 
-                for doc in real_docs_list:
-                    doc.segment_id = seg.id
-                    doc.status = "indexed"
-                    doc.updated_at = utcnow()
-                    session.add(
-                        SegmentDoc(
+                # safety: ensure org invariant for segment_docs
+                for d in real_docs_list:
+                    if d.organization_id != org_id:
+                        seg.status = "error"
+                        await log_index_error(
+                            session,
+                            stage="build_l1",
+                            message="org invariant violated in finalization; abort",
                             segment_id=seg.id,
-                            document_id=doc.id,
-                            shard_id=doc.shard_id,
+                            doc_id=d.id,
+                            payload={
+                                "expected_org_id": org_id,
+                                "doc_org_id": d.organization_id,
+                                "shard_id": shard_id,
+                            },
                         )
+                        await session.commit()
+                        break
+                else:
+                    for doc in real_docs_list:
+                        doc.segment_id = seg.id
+                        doc.status = "indexed"
+                        doc.updated_at = utcnow()
+
+                        session.add(
+                            SegmentDoc(
+                                segment_id=seg.id,
+                                document_id=doc.id,
+                                shard_id=doc.shard_id,
+                                organization_id=doc.organization_id,  # FIX
+                            )
+                        )
+
+                    seg.size_bytes = size_bytes
+                    seg.doc_count = len(real_docs_list)
+                    seg.status = "ready"
+
+                    await session.commit()
+
+                    print(
+                        f"[SEGMENT-L1] Готов L1-segment id={seg.id}, shard={shard_id}, org={org_id}, "
+                        f"docs(indexed)={len(real_docs_list)}, bytes={size_bytes}"
                     )
 
-                seg.size_bytes = size_bytes
-                seg.doc_count = len(real_docs_list)
-                seg.status = "ready"
-
-                await session.commit()
-
-                print(
-                    f"[SEGMENT-L1] Готов L1-segment id={seg.id}, shard={shard_id}, "
-                    f"docs(indexed)={len(real_docs_list)}, bytes={size_bytes}"
-                )
-
-                total_docs_processed += len(real_docs_list)
+                    total_docs_processed += len(real_docs_list)
 
     return total_docs_processed
 
@@ -282,6 +336,9 @@ async def compact_segments_level(from_level: int) -> int:
     Компакция сегментов: Lx -> L(x+1)
     Строгий режим: если не смогли извлечь текст хотя бы для одного документа —
     НЕ мерджим исходные сегменты (иначе тихая потеря данных).
+
+    ВАЖНО: компакция должна сохранять инвариант organization_id.
+    Здесь мы проверяем, что все docs в батче одной организации; иначе abort.
     """
     to_level = from_level + 1
     per_compact = cfg_segments_per_compact(from_level)
@@ -342,6 +399,20 @@ async def compact_segments_level(from_level: int) -> int:
                     await session.commit()
                     continue
 
+                # org invariant: все docs должны быть одной организации
+                org_id = _ensure_single_org(docs)
+                if org_id is None:
+                    new_orgs = sorted({d.organization_id for d in docs})
+                    await log_index_error(
+                        session,
+                        stage="compact",
+                        message="mixed organization_id in compaction batch; abort",
+                        payload={"from_segments": seg_ids, "org_ids": new_orgs, "shard_id": shard_id},
+                    )
+                    # не трогаем исходные сегменты
+                    await session.commit()
+                    continue
+
                 now = utcnow()
 
                 new_segment = Segment(
@@ -359,8 +430,8 @@ async def compact_segments_level(from_level: int) -> int:
                 session.add(new_segment)
                 await session.flush()
 
-                seg_dir = _segment_dir(shard_id, new_segment.id)
-                new_segment.path = f"shard_{shard_id}/segment_{new_segment.id}"
+                seg_dir = _segment_dir(org_id, shard_id, new_segment.id)
+                new_segment.path = f"org_{org_id}/shard_{shard_id}/segment_{new_segment.id}"
 
                 seg_corpus_path = seg_dir / "segment_corpus.jsonl"
 
@@ -419,7 +490,11 @@ async def compact_segments_level(from_level: int) -> int:
                         stage="compact",
                         message="strict mode: not all docs were indexable; compaction aborted",
                         segment_id=new_segment.id,
-                        payload={"from_segments": seg_ids, "docs_total": len(docs), "docs_written": len(indexed_doc_ids)},
+                        payload={
+                            "from_segments": seg_ids,
+                            "docs_total": len(docs),
+                            "docs_written": len(indexed_doc_ids),
+                        },
                     )
                     await session.commit()
                     continue
@@ -474,6 +549,20 @@ async def compact_segments_level(from_level: int) -> int:
                 res_docs = await session.execute(select(Document).where(Document.id.in_(indexed_doc_ids)))
                 docs2: List[Document] = list(res_docs.scalars())
 
+                # org invariant re-check
+                org2 = _ensure_single_org(docs2)
+                if org2 is None or org2 != org_id:
+                    seg.status = "error"
+                    await log_index_error(
+                        session,
+                        stage="compact",
+                        message="org invariant violated in finalization; abort",
+                        segment_id=seg.id,
+                        payload={"expected_org_id": org_id, "got_orgs": sorted({d.organization_id for d in docs2})},
+                    )
+                    await session.commit()
+                    continue
+
                 for doc in docs2:
                     doc.segment_id = seg.id
                     doc.status = "indexed"
@@ -483,7 +572,14 @@ async def compact_segments_level(from_level: int) -> int:
                 await session.execute(delete(SegmentDoc).where(SegmentDoc.segment_id.in_(seg_ids)))
 
                 for doc in docs2:
-                    session.add(SegmentDoc(segment_id=seg.id, document_id=doc.id, shard_id=doc.shard_id))
+                    session.add(
+                        SegmentDoc(
+                            segment_id=seg.id,
+                            document_id=doc.id,
+                            shard_id=doc.shard_id,
+                            organization_id=doc.organization_id,  # FIX
+                        )
+                    )
 
                 # помечаем старые сегменты merged
                 res_old = await session.execute(select(Segment).where(Segment.id.in_(seg_ids)))
@@ -499,7 +595,7 @@ async def compact_segments_level(from_level: int) -> int:
                 await session.commit()
 
                 print(
-                    f"[COMPACT L{from_level}->L{to_level}] shard={shard_id}: "
+                    f"[COMPACT L{from_level}->L{to_level}] shard={shard_id}, org={org_id}: "
                     f"готов segment id={seg.id}, docs={len(docs2)}, bytes={size_bytes}, merged_segments={seg_ids}"
                 )
                 total_docs_promoted += len(docs2)
