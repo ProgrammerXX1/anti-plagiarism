@@ -1,4 +1,4 @@
-// cpp/etl_index_builder.cpp
+// cpp/etl_index_builder.cpp  (VERSION 2: postings with positions)
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -18,12 +18,12 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr int K = 9;  // длина шингла k=9
+constexpr int K = 9;
 
-// лимиты для контроля монстров-документов
-constexpr std::uint32_t MAX_TOKENS_PER_DOC   = 100000;   // 0 = без лимита
-constexpr std::uint32_t MAX_SHINGLES_PER_DOC = 50000;    // 0 = без лимита
-constexpr int           SHINGLE_STRIDE       = 1;        // 1 = каждый шингл
+// limits
+constexpr std::uint32_t MAX_TOKENS_PER_DOC   = 100000;
+constexpr std::uint32_t MAX_SHINGLES_PER_DOC = 50000;
+constexpr int           SHINGLE_STRIDE       = 1;
 
 struct DocMeta {
     std::uint32_t tok_len;
@@ -31,11 +31,16 @@ struct DocMeta {
     std::uint64_t simhash_lo;
 };
 
+struct Posting9 {
+    std::uint64_t h;
+    std::uint32_t did;  // local doc id
+    std::uint32_t pos;  // shingle index in doc
+};
+
 struct ThreadResult {
     std::vector<DocMeta> docs;
     std::vector<std::string> doc_ids;
-    // postings9: (hash, local_doc_idx)
-    std::vector<std::pair<std::uint64_t, std::uint32_t>> postings9;
+    std::vector<Posting9> postings9;
 };
 
 void process_range(
@@ -58,83 +63,54 @@ void process_range(
 
     for (std::size_t i = start; i < end; ++i) {
         const std::string& line = lines[i];
-        if (line.empty()) {
-            continue;
-        }
+        if (line.empty()) continue;
 
         simdjson::dom::element doc;
-        auto err = parser.parse(line).get(doc);
-        if (err) {
-            // можно залогировать при желании
-            continue;
-        }
+        if (parser.parse(line).get(doc)) continue;
 
-        // doc_id как строка (совпадает с Python: str(doc.id))
         std::string_view did_sv;
-        err = doc["doc_id"].get(did_sv);
-        if (err || did_sv.empty()) {
-            continue;
-        }
+        if (doc["doc_id"].get(did_sv) || did_sv.empty()) continue;
 
         std::string_view text_sv;
-        err = doc["text"].get(text_sv);
-        if (err || text_sv.empty()) {
-            continue;
-        }
+        if (doc["text"].get(text_sv) || text_sv.empty()) continue;
 
         std::string did{did_sv};
         std::string text{text_sv};
 
-        // нормализация под шинглы
         std::string norm = normalize_for_shingles_simple(text);
 
         spans.clear();
         tokenize_spans(norm, spans);
-        if (spans.empty()) {
-            continue;
-        }
+        if (spans.empty()) continue;
 
-        // лимитируем длину документа по токенам
-        if (MAX_TOKENS_PER_DOC > 0 &&
-            spans.size() > static_cast<std::size_t>(MAX_TOKENS_PER_DOC)) {
+        if (MAX_TOKENS_PER_DOC > 0 && spans.size() > (std::size_t)MAX_TOKENS_PER_DOC) {
             spans.resize(MAX_TOKENS_PER_DOC);
         }
+        if (spans.size() < (std::size_t)K) continue;
 
-        if (spans.size() < static_cast<std::size_t>(K)) {
-            continue;
-        }
-
-        const int n   = static_cast<int>(spans.size());
+        const int n   = (int)spans.size();
         const int cnt = n - K + 1;
-        if (cnt <= 0) {
-            continue;
-        }
+        if (cnt <= 0) continue;
 
-        // simhash по укороченному списку токенов
         auto [hi, lo] = simhash128_spans(norm, spans);
 
         DocMeta dm{};
-        dm.tok_len    = static_cast<std::uint32_t>(spans.size());
+        dm.tok_len    = (std::uint32_t)spans.size();
         dm.simhash_hi = hi;
         dm.simhash_lo = lo;
 
-        std::uint32_t local_doc_id =
-            static_cast<std::uint32_t>(out.docs.size());
-
+        std::uint32_t local_doc_id = (std::uint32_t)out.docs.size();
         out.docs.push_back(dm);
         out.doc_ids.push_back(std::move(did));
 
-        // шинглы прямо в postings9, без промежуточного вектора
         const int step = (SHINGLE_STRIDE > 0 ? SHINGLE_STRIDE : 1);
         std::uint32_t produced = 0;
         const std::uint32_t max_sh =
-            (MAX_SHINGLES_PER_DOC > 0)
-                ? MAX_SHINGLES_PER_DOC
-                : static_cast<std::uint32_t>(cnt);
+            (MAX_SHINGLES_PER_DOC > 0) ? MAX_SHINGLES_PER_DOC : (std::uint32_t)cnt;
 
         for (int pos = 0; pos < cnt && produced < max_sh; pos += step) {
             std::uint64_t h = hash_shingle_tokens_spans(norm, spans, pos, K);
-            out.postings9.emplace_back(h, local_doc_id);
+            out.postings9.push_back(Posting9{h, local_doc_id, (std::uint32_t)pos});
             ++produced;
         }
     }
@@ -160,34 +136,28 @@ int main(int argc, char** argv) {
     std::ios::sync_with_stdio(false);
     std::cin.tie(nullptr);
 
-    // 1) читаем segment_corpus.jsonl в память
+    // 1) read file into memory (ok for small segments)
     std::vector<std::string> lines;
     {
         std::string line;
         while (std::getline(in, line)) {
-            if (!line.empty()) {
-                lines.push_back(line);
-            }
+            if (!line.empty()) lines.push_back(line);
         }
     }
-
     if (lines.empty()) {
-        std::cerr << "[etl_index_builder] corpus is empty: no lines\n";
+        std::cerr << "[etl_index_builder] corpus is empty\n";
         return 1;
     }
 
     const std::size_t total_lines = lines.size();
 
-    // 2) выбираем количество потоков (до 16)
+    // 2) threads up to 16
     unsigned hw = std::thread::hardware_concurrency();
     if (hw == 0) hw = 4;
     unsigned num_threads = std::min<unsigned>(hw, 16u);
-    if (num_threads > total_lines) {
-        num_threads = static_cast<unsigned>(total_lines);
-    }
+    if (num_threads > total_lines) num_threads = (unsigned)total_lines;
     if (num_threads == 0) num_threads = 1;
 
-    // 3) делим по чанкам
     std::vector<ThreadResult> results(num_threads);
     std::vector<std::thread>  workers;
     workers.reserve(num_threads);
@@ -199,31 +169,24 @@ int main(int argc, char** argv) {
         std::size_t start = cur_start;
         std::size_t end   = std::min<std::size_t>(start + chunk_size, total_lines);
         cur_start = end;
-
         if (start >= end) break;
 
-        workers.emplace_back(
-            [&, start, end, t]() {
-                process_range(lines, start, end, results[t]);
-            }
-        );
+        workers.emplace_back([&, start, end, t]() {
+            process_range(lines, start, end, results[t]);
+        });
     }
 
-    const unsigned used_threads = static_cast<unsigned>(workers.size());
-    for (auto& th : workers) {
-        if (th.joinable()) th.join();
-    }
+    const unsigned used_threads = (unsigned)workers.size();
+    for (auto& th : workers) th.join();
 
-    // 4) собираем результаты
-    std::uint64_t total_docs   = 0;
-    std::uint64_t total_posts9 = 0;
+    // 3) merge results
+    std::uint64_t total_docs = 0, total_posts9 = 0;
     for (unsigned t = 0; t < used_threads; ++t) {
-        total_docs   += results[t].docs.size();
+        total_docs += results[t].docs.size();
         total_posts9 += results[t].postings9.size();
     }
-
     if (total_docs == 0) {
-        std::cerr << "[etl_index_builder] no valid docs in corpus (N_docs=0)\n";
+        std::cerr << "[etl_index_builder] no valid docs\n";
         return 1;
     }
 
@@ -232,17 +195,17 @@ int main(int argc, char** argv) {
         std::uint32_t acc = 0;
         for (unsigned t = 0; t < used_threads; ++t) {
             doc_id_offsets[t] = acc;
-            acc += static_cast<std::uint32_t>(results[t].docs.size());
+            acc += (std::uint32_t)results[t].docs.size();
         }
     }
 
     std::vector<DocMeta> docs;
     std::vector<std::string> doc_ids;
-    std::vector<std::pair<std::uint64_t, std::uint32_t>> postings9;
+    std::vector<Posting9> postings9;
 
-    docs.reserve(static_cast<std::size_t>(total_docs));
-    doc_ids.reserve(static_cast<std::size_t>(total_docs));
-    postings9.reserve(static_cast<std::size_t>(total_posts9));
+    docs.reserve((std::size_t)total_docs);
+    doc_ids.reserve((std::size_t)total_docs);
+    postings9.reserve((std::size_t)total_posts9);
 
     for (unsigned t = 0; t < used_threads; ++t) {
         auto& r = results[t];
@@ -255,110 +218,78 @@ int main(int argc, char** argv) {
     for (unsigned t = 0; t < used_threads; ++t) {
         const std::uint32_t base = doc_id_offsets[t];
         auto& r = results[t];
-
         for (const auto& p : r.postings9) {
-            std::uint64_t h      = p.first;
-            std::uint32_t local  = p.second;
-            std::uint32_t global = base + local;
-            postings9.emplace_back(h, global);
+            postings9.push_back(Posting9{p.h, base + p.did, p.pos});
         }
     }
 
-    const std::uint32_t N_docs   = static_cast<std::uint32_t>(docs.size());
-    const std::uint64_t N_post9  = static_cast<std::uint64_t>(postings9.size());
+    // Sort postings so load() doesn't need heavy sort (but loader still sorts safely)
+    std::sort(postings9.begin(), postings9.end(), [](const Posting9& a, const Posting9& b) {
+        if (a.h != b.h) return a.h < b.h;
+        if (a.did != b.did) return a.did < b.did;
+        return a.pos < b.pos;
+    });
+
+    const std::uint32_t N_docs   = (std::uint32_t)docs.size();
+    const std::uint64_t N_post9  = (std::uint64_t)postings9.size();
     const std::uint64_t N_post13 = 0;
 
-    // 5) бинарный индекс (тот же формат, что у старого index_builder)
+    // 4) write bin v2
     const std::string bin_path = out_dir + "/index_native.bin";
     std::ofstream bout(bin_path, std::ios::binary);
     if (!bout) {
-        std::cerr << "[etl_index_builder] cannot open " << bin_path << " for write\n";
+        std::cerr << "[etl_index_builder] cannot open " << bin_path << "\n";
         return 1;
     }
 
-    const char magic[4] = { 'P', 'L', 'A', 'G' };
+    const char magic[4] = {'P','L','A','G'};
     bout.write(magic, 4);
-    std::uint32_t version = 1;
-    bout.write(reinterpret_cast<const char*>(&version), sizeof(version));
-    bout.write(reinterpret_cast<const char*>(&N_docs),  sizeof(N_docs));
-    bout.write(reinterpret_cast<const char*>(&N_post9), sizeof(N_post9));
-    bout.write(reinterpret_cast<const char*>(&N_post13),sizeof(N_post13));
+    std::uint32_t version = 2;
+    bout.write((char*)&version, sizeof(version));
+    bout.write((char*)&N_docs, sizeof(N_docs));
+    bout.write((char*)&N_post9, sizeof(N_post9));
+    bout.write((char*)&N_post13, sizeof(N_post13));
 
     for (const auto& dm : docs) {
-        bout.write(reinterpret_cast<const char*>(&dm.tok_len),    sizeof(dm.tok_len));
-        bout.write(reinterpret_cast<const char*>(&dm.simhash_hi), sizeof(dm.simhash_hi));
-        bout.write(reinterpret_cast<const char*>(&dm.simhash_lo), sizeof(dm.simhash_lo));
+        bout.write((char*)&dm.tok_len, sizeof(dm.tok_len));
+        bout.write((char*)&dm.simhash_hi, sizeof(dm.simhash_hi));
+        bout.write((char*)&dm.simhash_lo, sizeof(dm.simhash_lo));
     }
 
     for (const auto& p : postings9) {
-        const std::uint64_t h   = p.first;
-        const std::uint32_t did = p.second;
-        bout.write(reinterpret_cast<const char*>(&h),   sizeof(h));
-        bout.write(reinterpret_cast<const char*>(&did), sizeof(did));
+        bout.write((char*)&p.h, sizeof(p.h));
+        bout.write((char*)&p.did, sizeof(p.did));
+        bout.write((char*)&p.pos, sizeof(p.pos));
     }
-
     bout.close();
 
-    // 6) docids
+    // 5) docids json
     const std::string docids_path = out_dir + "/index_native_docids.json";
     {
         std::ofstream dout(docids_path);
         if (!dout) {
-            std::cerr << "[etl_index_builder] cannot open " << docids_path << " for write\n";
+            std::cerr << "[etl_index_builder] cannot open " << docids_path << "\n";
             return 1;
         }
-        json docids_json(doc_ids);
-        // без отступов для компактности
-        dout << docids_json.dump();
+        dout << json(doc_ids).dump();
     }
 
-    // 7) meta (совместимо со старым индексом)
-    json j_docs_meta = json::object();
-    for (std::size_t i = 0; i < doc_ids.size(); ++i) {
-        const auto& did = doc_ids[i];
-        const auto& dm  = docs[i];
-
-        json mobj;
-        mobj["tok_len"]    = dm.tok_len;
-        mobj["simhash_hi"] = dm.simhash_hi;
-        mobj["simhash_lo"] = dm.simhash_lo;
-
-        j_docs_meta[did] = std::move(mobj);
-    }
-
+    // 6) meta json (keep small)
     json j_meta;
-    j_meta["docs_meta"] = std::move(j_docs_meta);
-
-    json j_cfg;
-    json j_thr;
-    j_thr["plag_thr"]    = 0.7;
-    j_thr["partial_thr"] = 0.3;
-    j_cfg["thresholds"]  = std::move(j_thr);
-    j_meta["config"]     = std::move(j_cfg);
-
-    json j_stats;
-    j_stats["docs"] = N_docs;
-    j_stats["k9"]   = N_post9;
-    j_stats["k13"]  = 0;
-    j_meta["stats"] = std::move(j_stats);
-
+    j_meta["stats"] = {{"docs", N_docs}, {"k9", N_post9}, {"k13", 0}};
+    j_meta["config"] = {{"max_matches_per_doc", 256}};
     const std::string meta_path = out_dir + "/index_native_meta.json";
     {
         std::ofstream mout(meta_path);
         if (!mout) {
-            std::cerr << "[etl_index_builder] cannot open " << meta_path << " for write\n";
+            std::cerr << "[etl_index_builder] cannot open " << meta_path << "\n";
             return 1;
         }
-        // без отступов
         mout << j_meta.dump();
     }
 
-    std::cout << "[etl_index_builder] built index_native.bin docs=" << N_docs
+    std::cout << "[etl_index_builder] built v2 index docs=" << N_docs
               << " post9=" << N_post9
-              << " (k9-only, spans, parallel=" << used_threads
-              << ", max_tokens=" << MAX_TOKENS_PER_DOC
-              << ", max_shingles=" << MAX_SHINGLES_PER_DOC
-              << ")\n";
-
+              << " threads=" << used_threads << "\n";
     return 0;
 }

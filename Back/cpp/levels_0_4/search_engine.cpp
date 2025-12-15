@@ -8,6 +8,7 @@
 #include <iostream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -42,6 +43,43 @@ static bool read_u64(std::ifstream& in, std::uint64_t& v) {
     return (bool)in;
 }
 
+struct QSh {
+    std::uint64_t h;
+    std::uint32_t qpos; // shingle index in query
+};
+
+static bool build_query_shingles(
+    const std::string& text_utf8,
+    std::string& norm_out,
+    std::vector<TokenSpan>& spans_out,
+    std::vector<QSh>& qsh_out
+) {
+    norm_out = normalize_for_shingles_simple(text_utf8);
+
+    spans_out.clear();
+    tokenize_spans(norm_out, spans_out);
+    if ((int)spans_out.size() < K) return false;
+
+    const int q_tok = (int)spans_out.size();
+    const int q_sh  = q_tok - K + 1;
+    if (q_sh <= 0) return false;
+
+    qsh_out.clear();
+    qsh_out.reserve((std::size_t)q_sh);
+    for (int pos = 0; pos < q_sh; ++pos) {
+        std::uint64_t h = hash_shingle_tokens_spans(norm_out, spans_out, pos, K);
+        qsh_out.push_back(QSh{h, (std::uint32_t)pos});
+    }
+
+    // sort by hash for cache locality (keep duplicates -> offsets are important)
+    std::sort(qsh_out.begin(), qsh_out.end(), [](const QSh& a, const QSh& b) {
+        if (a.h != b.h) return a.h < b.h;
+        return a.qpos < b.qpos;
+    });
+
+    return true;
+}
+
 } // namespace
 
 // ----------------- helpers -----------------
@@ -69,7 +107,7 @@ inline void SearchEngine::jc_compute(int inter, int q_size, int t_size, double& 
     C = (q_size > 0) ? (double)inter / (double)q_size : 0.0;
 }
 
-// postings9 должны быть отсортированы по h
+// postings9 must be sorted by h
 std::pair<std::size_t, std::size_t> SearchEngine::find_postings9_range(std::uint64_t h) const {
     auto lb = std::lower_bound(
         post9_.begin(), post9_.end(), h,
@@ -84,7 +122,7 @@ std::pair<std::size_t, std::size_t> SearchEngine::find_postings9_range(std::uint
 }
 
 IndexConfig SearchEngine::load_config_from_json(const std::string& index_dir) {
-    IndexConfig cfg; // дефолты из .h
+    IndexConfig cfg;
     std::string meta_txt;
     const std::string meta_path = index_dir + "/index_native_meta.json";
     if (!read_all_text(meta_path, meta_txt)) {
@@ -93,11 +131,13 @@ IndexConfig SearchEngine::load_config_from_json(const std::string& index_dir) {
 
     try {
         auto j = json::parse(meta_txt);
-
-        // если хочешь — можешь позже расширить формат config под свои веса
-        // сейчас просто читаем thresholds как факт наличия meta
-        (void)j;
-
+        // optional: read config.max_matches_per_doc etc
+        if (j.contains("config") && j["config"].is_object()) {
+            auto& c = j["config"];
+            if (c.contains("max_matches_per_doc")) {
+                cfg.max_matches_per_doc = c["max_matches_per_doc"].get<int>();
+            }
+        }
         return cfg;
     } catch (...) {
         return cfg;
@@ -154,7 +194,7 @@ bool SearchEngine::load(const std::string& index_dir) {
     }
 
     std::uint32_t version = 0;
-    if (!read_u32(in, version) || version != 1) {
+    if (!read_u32(in, version) || (version != 1 && version != 2)) {
         std::cerr << "[SearchEngine] bad version in " << bin_path << ": " << version << "\n";
         return false;
     }
@@ -172,18 +212,14 @@ bool SearchEngine::load(const std::string& index_dir) {
     }
 
     if (doc_ids_.size() != (std::size_t)N_docs) {
-        // не фатально, но лучше держать консистентность
         std::cerr << "[SearchEngine] WARNING: docids.size != N_docs ("
                   << doc_ids_.size() << " vs " << N_docs << ")\n";
-        // если больше — обрежем, если меньше — тоже работать будет, но часть doc_id не будет резолвиться
         if (doc_ids_.size() > (std::size_t)N_docs) doc_ids_.resize((std::size_t)N_docs);
     }
 
     docs_.resize((std::size_t)N_docs);
 
-    // ВАЖНО: твой etl_index_builder пишет для DocMeta 3 поля:
-    // tok_len (u32), simhash_hi (u64), simhash_lo (u64)
-    // А наш DocMeta в search_engine.h содержит ещё bm25_len (u32) — заполним = tok_len.
+    // Builder writes: tok_len(u32), simhash_hi(u64), simhash_lo(u64)
     for (std::size_t i = 0; i < (std::size_t)N_docs; ++i) {
         std::uint32_t tok_len = 0;
         std::uint64_t hi = 0, lo = 0;
@@ -200,27 +236,43 @@ bool SearchEngine::load(const std::string& index_dir) {
     }
 
     post9_.resize((std::size_t)N_post9);
-    for (std::size_t i = 0; i < (std::size_t)N_post9; ++i) {
-        std::uint64_t h = 0;
-        std::uint32_t did = 0;
-        if (!read_u64(in, h) || !read_u32(in, did)) {
-            std::cerr << "[SearchEngine] postings9 read failed at i=" << i << "\n";
-            return false;
+    if (version == 1) {
+        // legacy: (h,u64) (did,u32) without dpos -> set pos=0
+        for (std::size_t i = 0; i < (std::size_t)N_post9; ++i) {
+            std::uint64_t h = 0;
+            std::uint32_t did = 0;
+            if (!read_u64(in, h) || !read_u32(in, did)) {
+                std::cerr << "[SearchEngine] postings9(v1) read failed at i=" << i << "\n";
+                return false;
+            }
+            post9_[i] = Posting9{h, did, 0};
         }
-        post9_[i] = Posting9{h, did};
+    } else {
+        // v2: (h,u64) (did,u32) (pos,u32)
+        for (std::size_t i = 0; i < (std::size_t)N_post9; ++i) {
+            std::uint64_t h = 0;
+            std::uint32_t did = 0;
+            std::uint32_t pos = 0;
+            if (!read_u64(in, h) || !read_u32(in, did) || !read_u32(in, pos)) {
+                std::cerr << "[SearchEngine] postings9(v2) read failed at i=" << i << "\n";
+                return false;
+            }
+            post9_[i] = Posting9{h, did, pos};
+        }
     }
 
-    // 3) сортируем postings по hash, иначе find_postings9_range бессмысленен
+    // postings must be sorted for range queries
     std::sort(post9_.begin(), post9_.end(), [](const Posting9& a, const Posting9& b) {
         if (a.h != b.h) return a.h < b.h;
-        return a.did < b.did;
+        if (a.did != b.did) return a.did < b.did;
+        return a.pos < b.pos;
     });
 
     loaded_ = true;
     return true;
 }
 
-// ----------------- search -----------------
+// ----------------- search (phase 1: top-k) -----------------
 
 int SearchEngine::search_text(
     const std::string& text_utf8,
@@ -230,56 +282,45 @@ int SearchEngine::search_text(
     out.clear();
     if (!loaded_ || top_k <= 0) return 0;
 
-    // нормализуем и токенизируем как в билдере
-    std::string norm = normalize_for_shingles_simple(text_utf8);
-
+    std::string norm;
     std::vector<TokenSpan> spans;
+    std::vector<QSh> qsh;
     spans.reserve(256);
-    tokenize_spans(norm, spans);
 
-    if ((int)spans.size() < K) return 0;
+    if (!build_query_shingles(text_utf8, norm, spans, qsh)) return 0;
 
     const int q_tok = (int)spans.size();
-    const int q_sh  = q_tok - K + 1;
-    if (q_sh <= 0) return 0;
+    const int q_sh_total = q_tok - K + 1;
+    if (q_sh_total <= 0) return 0;
 
-    // шинглы запроса (hashes)
-    std::vector<std::uint64_t> q_hashes;
-    q_hashes.reserve((std::size_t)q_sh);
-    for (int pos = 0; pos < q_sh; ++pos) {
-        std::uint64_t h = hash_shingle_tokens_spans(norm, spans, pos, K);
-        q_hashes.push_back(h);
-    }
-    std::sort(q_hashes.begin(), q_hashes.end());
-    q_hashes.erase(std::unique(q_hashes.begin(), q_hashes.end()), q_hashes.end());
+    // IMPORTANT: for scoring use unique hashes (set size), but offsets are collected later
+    std::vector<std::uint64_t> q_uniq;
+    q_uniq.reserve((std::size_t)q_sh_total);
+    for (auto& it : qsh) q_uniq.push_back(it.h);
+    std::sort(q_uniq.begin(), q_uniq.end());
+    q_uniq.erase(std::unique(q_uniq.begin(), q_uniq.end()), q_uniq.end());
 
-    const int q_size = (int)q_hashes.size();
-    if (q_size < cfg_.w_min_query) {
-        // слишком короткий запрос для устойчивой метрики
-        // но можно не резать, если хочешь:
-        // return 0;
-    }
+    const int q_size = (int)q_uniq.size();
+    if (q_size <= 0) return 0;
 
-    // кандидаты: doc_id -> hits
-    std::unordered_map<std::uint32_t, int> hits;
-    hits.reserve((std::size_t)q_size * 8);
+    // Dense hits + touched list (fast)
+    const std::size_t N = docs_.size();
+    std::vector<int> hits(N, 0);
+    std::vector<std::uint32_t> touched;
+    touched.reserve((std::size_t)q_size * 64);
 
-    for (std::uint64_t h : q_hashes) {
+    for (std::uint64_t h : q_uniq) {
         auto [L, R] = find_postings9_range(h);
-        if (L == R) continue;
-
-        // добавляем все did из диапазона
         for (std::size_t i = L; i < R; ++i) {
             const std::uint32_t did = post9_[i].did;
-            auto it = hits.find(did);
-            if (it == hits.end()) hits.emplace(did, 1);
-            else it->second += 1;
+            if (did >= N) continue;
+            if (hits[did] == 0) touched.push_back(did);
+            hits[did] += 1;
         }
     }
 
-    if (hits.empty()) return 0;
+    if (touched.empty()) return 0;
 
-    // соберём вектор кандидатов и посчитаем score
     struct Cand {
         std::uint32_t did;
         int inter;
@@ -289,18 +330,15 @@ int SearchEngine::search_text(
     };
 
     std::vector<Cand> cands;
-    cands.reserve(hits.size());
+    cands.reserve(touched.size());
 
-    for (const auto& kv : hits) {
-        const std::uint32_t did = kv.first;
-        const int inter = kv.second;
-
-        if (did >= docs_.size()) continue;
+    for (std::uint32_t did : touched) {
+        const int inter = hits[did];
+        hits[did] = 0; // reset
 
         const auto& dm = docs_[did];
         if ((int)dm.tok_len < cfg_.w_min_doc) continue;
 
-        // оценка размера множества шинглов документа
         int t_size = 0;
         if ((int)dm.tok_len >= K) t_size = (int)dm.tok_len - K + 1;
         if (t_size <= 0) continue;
@@ -308,7 +346,6 @@ int SearchEngine::search_text(
         double J = 0.0, C = 0.0;
         jc_compute(inter, q_size, t_size, J, C);
 
-        // простой скоринг: смесь Jaccard + containment
         double s = cfg_.alpha * J + (1.0 - cfg_.alpha) * C;
         s = clamp01(s);
 
@@ -317,26 +354,85 @@ int SearchEngine::search_text(
 
     if (cands.empty()) return 0;
 
+    const int keep = std::min<int>((int)cands.size(), top_k);
     std::partial_sort(
         cands.begin(),
-        cands.begin() + std::min<int>((int)cands.size(), top_k),
+        cands.begin() + keep,
         cands.end(),
         [](const Cand& a, const Cand& b) { return a.score > b.score; }
     );
 
-    const int take = std::min<int>((int)cands.size(), top_k);
-    out.reserve((std::size_t)take);
-
-    for (int i = 0; i < take; ++i) {
-        const auto& c = cands[i];
+    out.reserve((std::size_t)keep);
+    for (int i = 0; i < keep; ++i) {
         SeHitLite h{};
-        h.doc_id_int = c.did;
-        h.score = c.score;
-        h.j9 = c.J;
-        h.c9 = c.C;
-        h.cand_hits = c.inter;
+        h.doc_id_int = cands[i].did;
+        h.score = cands[i].score;
+        h.j9 = cands[i].J;
+        h.c9 = cands[i].C;
+        h.cand_hits = cands[i].inter;
         out.push_back(h);
     }
 
-    return take;
+    return keep;
+}
+
+// ----------------- offsets (phase 2: collect matches for top hits) -----------------
+
+void SearchEngine::collect_matches_for_hits(
+    const std::string& text_utf8,
+    const std::vector<SeHitLite>& hits,
+    std::vector<std::vector<MatchPair>>& out_matches
+) const {
+    out_matches.clear();
+    out_matches.resize(hits.size());
+    if (!loaded_ || hits.empty()) return;
+
+    std::string norm;
+    std::vector<TokenSpan> spans;
+    std::vector<QSh> qsh;
+    spans.reserve(256);
+
+    if (!build_query_shingles(text_utf8, norm, spans, qsh)) return;
+
+    // Build a set of target doc ids (top docs)
+    std::unordered_set<std::uint32_t> target;
+    target.reserve(hits.size() * 2);
+    for (auto& h : hits) target.insert(h.doc_id_int);
+
+    // For speed: per-doc counter for match limit
+    std::unordered_map<std::uint32_t, int> used;
+    used.reserve(hits.size() * 2);
+
+    // We will collect by scanning postings range for each query shingle.
+    for (const auto& qs : qsh) {
+        auto [L, R] = find_postings9_range(qs.h);
+        if (L == R) continue;
+
+        for (std::size_t i = L; i < R; ++i) {
+            const auto& p = post9_[i];
+            if (target.find(p.did) == target.end()) continue;
+
+            int& cnt = used[p.did];
+            if (cnt >= cfg_.max_matches_per_doc) continue;
+            cnt += 1;
+
+            // push to corresponding hit bucket (keep stable ordering by hits vector)
+            // small hits.size(), linear scan is OK; if you want faster, build did->idx map once.
+            for (std::size_t k = 0; k < hits.size(); ++k) {
+                if (hits[k].doc_id_int == p.did) {
+                    out_matches[k].push_back(MatchPair{qs.qpos, p.pos, qs.h});
+                    break;
+                }
+            }
+        }
+    }
+
+    // Optional: sort per-doc matches by qpos then dpos
+    for (auto& v : out_matches) {
+        std::sort(v.begin(), v.end(), [](const MatchPair& a, const MatchPair& b) {
+            if (a.qpos != b.qpos) return a.qpos < b.qpos;
+            if (a.dpos != b.dpos) return a.dpos < b.dpos;
+            return a.h < b.h;
+        });
+    }
 }
