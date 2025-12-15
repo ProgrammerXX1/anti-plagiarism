@@ -1,4 +1,4 @@
-// cpp/level_0_4/etl_index_builder.cpp  (VERSION 2: postings with positions)
+// cpp/levels_0_4/etl_index_builder.cpp  (VERSION 2: postings with positions + per-doc normalization flag)
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -20,7 +20,6 @@ namespace {
 
 constexpr int K = 9;
 
-// limits
 constexpr std::uint32_t MAX_TOKENS_PER_DOC   = 100000;
 constexpr std::uint32_t MAX_SHINGLES_PER_DOC = 50000;
 constexpr int           SHINGLE_STRIDE       = 1;
@@ -33,8 +32,8 @@ struct DocMeta {
 
 struct Posting9 {
     std::uint64_t h;
-    std::uint32_t did;  // local doc id
-    std::uint32_t pos;  // shingle index in doc
+    std::uint32_t did;
+    std::uint32_t pos;
 };
 
 struct ThreadResult {
@@ -42,6 +41,14 @@ struct ThreadResult {
     std::vector<std::string> doc_ids;
     std::vector<Posting9> postings9;
 };
+
+static bool get_bool_safe(const simdjson::dom::element& e, const char* key, bool defv) {
+    simdjson::dom::element v;
+    if (e.at_key(key).get(v)) return defv;
+    bool b = defv;
+    if (!v.get(b)) return b;
+    return defv;
+}
 
 void process_range(
     const std::vector<std::string>& lines,
@@ -74,10 +81,13 @@ void process_range(
         std::string_view text_sv;
         if (doc["text"].get(text_sv) || text_sv.empty()) continue;
 
+        const bool already_norm = get_bool_safe(doc, "normalized", false);
+
         std::string did{did_sv};
         std::string text{text_sv};
 
-        std::string norm = normalize_for_shingles_simple(text);
+        // KEY: optional normalization
+        std::string norm = already_norm ? text : normalize_for_shingles_simple(text);
 
         spans.clear();
         tokenize_spans(norm, spans);
@@ -136,7 +146,6 @@ int main(int argc, char** argv) {
     std::ios::sync_with_stdio(false);
     std::cin.tie(nullptr);
 
-    // 1) read file into memory (ok for small segments)
     std::vector<std::string> lines;
     {
         std::string line;
@@ -151,7 +160,6 @@ int main(int argc, char** argv) {
 
     const std::size_t total_lines = lines.size();
 
-    // 2) threads up to 16
     unsigned hw = std::thread::hardware_concurrency();
     if (hw == 0) hw = 4;
     unsigned num_threads = std::min<unsigned>(hw, 16u);
@@ -159,7 +167,7 @@ int main(int argc, char** argv) {
     if (num_threads == 0) num_threads = 1;
 
     std::vector<ThreadResult> results(num_threads);
-    std::vector<std::thread>  workers;
+    std::vector<std::thread> workers;
     workers.reserve(num_threads);
 
     std::size_t chunk_size = (total_lines + num_threads - 1) / num_threads;
@@ -179,7 +187,6 @@ int main(int argc, char** argv) {
     const unsigned used_threads = (unsigned)workers.size();
     for (auto& th : workers) th.join();
 
-    // 3) merge results
     std::uint64_t total_docs = 0, total_posts9 = 0;
     for (unsigned t = 0; t < used_threads; ++t) {
         total_docs += results[t].docs.size();
@@ -223,7 +230,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Sort postings so load() doesn't need heavy sort (but loader still sorts safely)
     std::sort(postings9.begin(), postings9.end(), [](const Posting9& a, const Posting9& b) {
         if (a.h != b.h) return a.h < b.h;
         if (a.did != b.did) return a.did < b.did;
@@ -234,7 +240,6 @@ int main(int argc, char** argv) {
     const std::uint64_t N_post9  = (std::uint64_t)postings9.size();
     const std::uint64_t N_post13 = 0;
 
-    // 4) write bin v2
     const std::string bin_path = out_dir + "/index_native.bin";
     std::ofstream bout(bin_path, std::ios::binary);
     if (!bout) {
@@ -263,7 +268,6 @@ int main(int argc, char** argv) {
     }
     bout.close();
 
-    // 5) docids json
     const std::string docids_path = out_dir + "/index_native_docids.json";
     {
         std::ofstream dout(docids_path);
@@ -274,7 +278,6 @@ int main(int argc, char** argv) {
         dout << json(doc_ids).dump();
     }
 
-    // 6) meta json (keep small)
     json j_meta;
     j_meta["stats"] = {{"docs", N_docs}, {"k9", N_post9}, {"k13", 0}};
     j_meta["config"] = {{"max_matches_per_doc", 256}};

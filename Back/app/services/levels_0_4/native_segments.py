@@ -14,24 +14,26 @@ if not os.path.exists(SO_PATH):
 
 _lib = ctypes.CDLL(SO_PATH)
 
-# char* seg_search_many_json(const char* query_utf8, int top_k, const char** index_dirs_utf8, int n_dirs)
-_lib.seg_search_many_json.argtypes = [
+# v2 search
+_lib.seg_search_many_json_v2.argtypes = [
     ctypes.c_char_p,
     ctypes.c_int,
     ctypes.POINTER(ctypes.c_char_p),
     ctypes.c_int,
+    ctypes.c_int,  # normalize_query
 ]
-_lib.seg_search_many_json.restype = ctypes.c_void_p  # malloc ptr
+_lib.seg_search_many_json_v2.restype = ctypes.c_void_p
 
-# char* seg_excerpt_for_span_json(const char* text_utf8, int d_from, int d_to, int k_shingle, int max_chars)
-_lib.seg_excerpt_for_span_json.argtypes = [
+# v2 excerpt
+_lib.seg_excerpt_for_span_json_v2.argtypes = [
     ctypes.c_char_p,
     ctypes.c_int,
     ctypes.c_int,
     ctypes.c_int,
     ctypes.c_int,
+    ctypes.c_int,  # normalize_text
 ]
-_lib.seg_excerpt_for_span_json.restype = ctypes.c_void_p  # malloc ptr
+_lib.seg_excerpt_for_span_json_v2.restype = ctypes.c_void_p
 
 _lib.seg_free.argtypes = [ctypes.c_void_p]
 _lib.seg_free.restype = None
@@ -41,7 +43,7 @@ def _safe_json_loads(b: bytes) -> Dict[str, Any]:
     try:
         return json.loads(b.decode("utf-8", errors="ignore"))
     except Exception:
-        return {"ok": False}
+        return {"count": 0, "hits": []}
 
 
 def seg_search_many(
@@ -50,7 +52,8 @@ def seg_search_many(
     top_k: int,
     index_dirs: List[str],
     include_matches: bool = True,
-    max_matches_per_doc: Optional[int] = None,  # python-side trim
+    max_matches_per_doc: Optional[int] = None,
+    normalize_query: bool = True,
 ) -> Dict[str, Any]:
     if not query or top_k <= 0 or not index_dirs:
         return {"count": 0, "hits": []}
@@ -65,7 +68,13 @@ def seg_search_many(
         return {"count": 0, "hits": []}
 
     arr = (ctypes.c_char_p * len(dirs))(*dirs)
-    ptr = _lib.seg_search_many_json(query.encode("utf-8"), int(top_k), arr, int(len(dirs)))
+    ptr = _lib.seg_search_many_json_v2(
+        query.encode("utf-8"),
+        int(top_k),
+        arr,
+        int(len(dirs)),
+        1 if normalize_query else 0,
+    )
     if not ptr:
         return {"count": 0, "hits": []}
 
@@ -107,21 +116,18 @@ def seg_excerpt_for_span(
     d_to: int,
     k_shingle: int = 9,
     max_chars: int = 800,
+    normalize_text: bool = True,
 ) -> Dict[str, Any]:
-    """
-    Uses C++ normalization/tokenization to compute excerpt and char offsets
-    for a shingle span [d_from, d_to].
-    Returns JSON dict: {ok, excerpt, char_from, char_to, tok_from, tok_to, ...}
-    """
     if not text:
         return {"ok": False, "excerpt": ""}
 
-    ptr = _lib.seg_excerpt_for_span_json(
+    ptr = _lib.seg_excerpt_for_span_json_v2(
         text.encode("utf-8", errors="ignore"),
         int(d_from),
         int(d_to),
         int(k_shingle),
         int(max_chars),
+        1 if normalize_text else 0,
     )
     if not ptr:
         return {"ok": False, "excerpt": ""}

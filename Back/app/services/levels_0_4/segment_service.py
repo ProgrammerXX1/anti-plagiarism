@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import List, Set, Tuple, Optional
+from typing import List, Set, Tuple, Optional, Any, Dict
 
 from sqlalchemy import select, delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,10 +21,6 @@ from app.repositories.index_errors import log_index_error
 from app.services.helpers.file_extract import extract_text_from_file_bytes
 from app.services.levels_0_4.etl_service import utcnow
 
-
-# -------------------------
-# helpers
-# -------------------------
 
 async def _run_etl_index_builder(corpus: Path, out_dir: Path) -> bool:
     import asyncio
@@ -96,9 +92,19 @@ def _ensure_single_org(docs: List[Document]) -> Optional[int]:
     return org0
 
 
-# -------------------------
-# L1 build
-# -------------------------
+def _load_upload_meta(external_id: str) -> Dict[str, Any]:
+    """
+    Читает UPLOAD_DIR/<external_id>.meta.json
+    Возвращает {} если нет/битый.
+    """
+    p = UPLOAD_DIR / f"{external_id}.meta.json"
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
 
 async def build_l1_segments() -> int:
     async with AsyncSessionLocal() as session:
@@ -111,7 +117,6 @@ async def build_l1_segments() -> int:
             .distinct()
         )
         pairs: List[Tuple[int, int]] = [(int(r[0]), int(r[1])) for r in pair_rows.fetchall()]
-
         if not pairs:
             print("[SEGMENT-L1] Нет документов etl_ok без segment_id — L1-сегменты не нужны")
             return 0
@@ -130,8 +135,7 @@ async def build_l1_segments() -> int:
                 if not docs:
                     break
 
-                org_checked = _ensure_single_org(docs)
-                if org_checked is None:
+                if _ensure_single_org(docs) is None:
                     await log_index_error(
                         session,
                         stage="build_l1",
@@ -147,7 +151,6 @@ async def build_l1_segments() -> int:
 
                 now = utcnow()
 
-                # FIX #1: write organization_id into segments table
                 segment = Segment(
                     organization_id=org_id,
                     shard_id=shard_id,
@@ -168,7 +171,7 @@ async def build_l1_segments() -> int:
                 segment.path = f"org_{org_id}/shard_{shard_id}/segment_{segment.id}"
 
                 print(
-                    f"[SEGMENT-L1] shard={shard_id}, org={org_id}: строю L1-segment id={segment.id}, "
+                    f"[SEGMENT-L1] shard={shard_id}, org={org_id}: строю L1 id={segment.id}, "
                     f"docs(batch)={len(docs)}, dir={seg_dir}"
                 )
 
@@ -183,9 +186,11 @@ async def build_l1_segments() -> int:
                         if not file_path.exists():
                             continue
 
+                        meta = _load_upload_meta(doc.external_id)
+                        already_norm = bool(meta.get("text_is_normalized", False))
+
                         try:
                             raw_bytes = file_path.read_bytes()
-                            # fast path for txt
                             if file_path.suffix.lower() == ".txt":
                                 raw_text = raw_bytes.decode("utf-8", errors="ignore")
                             else:
@@ -200,7 +205,12 @@ async def build_l1_segments() -> int:
                             )
                             continue
 
-                        rec = {"doc_id": str(doc.id), "text": raw_text}
+                        # IMPORTANT: передаём флаг в C++ билдер
+                        rec = {
+                            "doc_id": str(doc.id),
+                            "text": raw_text,
+                            "normalized": already_norm,
+                        }
                         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                         indexed_doc_ids.add(doc.id)
 
@@ -266,7 +276,6 @@ async def build_l1_segments() -> int:
                 )
                 real_docs_list: List[Document] = list(real_docs.scalars())
 
-                # org invariant
                 for d in real_docs_list:
                     if d.organization_id != org_id:
                         seg.status = "error"
@@ -276,11 +285,7 @@ async def build_l1_segments() -> int:
                             message="org invariant violated in finalization; abort",
                             segment_id=seg.id,
                             doc_id=d.id,
-                            payload={
-                                "expected_org_id": org_id,
-                                "doc_org_id": d.organization_id,
-                                "shard_id": shard_id,
-                            },
+                            payload={"expected_org_id": org_id, "doc_org_id": d.organization_id, "shard_id": shard_id},
                         )
                         await session.commit()
                         break
@@ -289,7 +294,6 @@ async def build_l1_segments() -> int:
                         doc.segment_id = seg.id
                         doc.status = "indexed"
                         doc.updated_at = utcnow()
-
                         session.add(
                             SegmentDoc(
                                 segment_id=seg.id,
@@ -302,21 +306,16 @@ async def build_l1_segments() -> int:
                     seg.size_bytes = size_bytes
                     seg.doc_count = len(real_docs_list)
                     seg.status = "ready"
-
                     await session.commit()
 
                     print(
-                        f"[SEGMENT-L1] Готов L1-segment id={seg.id}, shard={shard_id}, org={org_id}, "
-                        f"docs(indexed)={len(real_docs_list)}, bytes={size_bytes}"
+                        f"[SEGMENT-L1] Готов L1 id={seg.id}, shard={shard_id}, org={org_id}, "
+                        f"docs={len(real_docs_list)}, bytes={size_bytes}"
                     )
                     total_docs_processed += len(real_docs_list)
 
     return total_docs_processed
 
-
-# -------------------------
-# Compaction Lx -> L(x+1)
-# -------------------------
 
 async def compact_segments_level(from_level: int) -> int:
     to_level = from_level + 1
@@ -324,7 +323,6 @@ async def compact_segments_level(from_level: int) -> int:
 
     total_docs_promoted = 0
 
-    # FIX #2: compaction candidates by (org, shard)
     async with AsyncSessionLocal() as session:
         pair_rows = await session.execute(
             select(Segment.organization_id, Segment.shard_id)
@@ -370,7 +368,6 @@ async def compact_segments_level(from_level: int) -> int:
                     .with_for_update(skip_locked=True)
                 )
                 docs: List[Document] = list(doc_rows.scalars())
-
                 if not docs:
                     for s in batch_segments:
                         s.status = "merged"
@@ -380,7 +377,6 @@ async def compact_segments_level(from_level: int) -> int:
 
                 now = utcnow()
 
-                # FIX #1 again: write org_id into new segment
                 new_segment = Segment(
                     organization_id=org_id,
                     shard_id=shard_id,
@@ -401,7 +397,6 @@ async def compact_segments_level(from_level: int) -> int:
                 new_segment.path = f"org_{org_id}/shard_{shard_id}/segment_{new_segment.id}"
 
                 seg_corpus_path = seg_dir / "segment_corpus.jsonl"
-
                 indexed_doc_ids: List[int] = []
                 failed = False
 
@@ -409,27 +404,19 @@ async def compact_segments_level(from_level: int) -> int:
                     for doc in docs:
                         if not doc.external_id:
                             failed = True
-                            await log_index_error(
-                                session,
-                                stage="compact",
-                                message="doc has no external_id",
-                                doc_id=doc.id,
-                                segment_id=new_segment.id,
-                            )
+                            await log_index_error(session, stage="compact", message="doc has no external_id",
+                                                 doc_id=doc.id, segment_id=new_segment.id)
                             break
 
                         file_path = UPLOAD_DIR / doc.external_id
                         if not file_path.exists():
                             failed = True
-                            await log_index_error(
-                                session,
-                                stage="compact",
-                                message="file missing",
-                                doc_id=doc.id,
-                                segment_id=new_segment.id,
-                                payload={"file": str(file_path)},
-                            )
+                            await log_index_error(session, stage="compact", message="file missing",
+                                                 doc_id=doc.id, segment_id=new_segment.id, payload={"file": str(file_path)})
                             break
+
+                        meta = _load_upload_meta(doc.external_id)
+                        already_norm = bool(meta.get("text_is_normalized", False))
 
                         try:
                             raw_bytes = file_path.read_bytes()
@@ -439,17 +426,11 @@ async def compact_segments_level(from_level: int) -> int:
                                 raw_text = extract_text_from_file_bytes(raw_bytes, filename=str(file_path))
                         except Exception as e:
                             failed = True
-                            await log_index_error(
-                                session,
-                                stage="compact",
-                                message=f"extract/read failed: {e}",
-                                doc_id=doc.id,
-                                segment_id=new_segment.id,
-                                payload={"file": str(file_path)},
-                            )
+                            await log_index_error(session, stage="compact", message=f"extract/read failed: {e}",
+                                                 doc_id=doc.id, segment_id=new_segment.id, payload={"file": str(file_path)})
                             break
 
-                        f.write(json.dumps({"doc_id": str(doc.id), "text": raw_text}, ensure_ascii=False) + "\n")
+                        f.write(json.dumps({"doc_id": str(doc.id), "text": raw_text, "normalized": already_norm}, ensure_ascii=False) + "\n")
                         indexed_doc_ids.append(doc.id)
 
                 if failed or len(indexed_doc_ids) != len(docs):
@@ -459,13 +440,8 @@ async def compact_segments_level(from_level: int) -> int:
                         stage="compact",
                         message="strict mode: not all docs were indexable; compaction aborted",
                         segment_id=new_segment.id,
-                        payload={
-                            "org_id": org_id,
-                            "shard_id": shard_id,
-                            "from_segments": seg_ids,
-                            "docs_total": len(docs),
-                            "docs_written": len(indexed_doc_ids),
-                        },
+                        payload={"org_id": org_id, "shard_id": shard_id, "from_segments": seg_ids,
+                                 "docs_total": len(docs), "docs_written": len(indexed_doc_ids)},
                     )
                     await session.commit()
                     continue
@@ -478,13 +454,8 @@ async def compact_segments_level(from_level: int) -> int:
                     seg = await session.get(Segment, new_segment.id)
                     if seg:
                         seg.status = "error"
-                        await log_index_error(
-                            session,
-                            stage="compact",
-                            message="etl_index_builder failed",
-                            segment_id=new_segment.id,
-                            payload={"dir": str(seg_dir)},
-                        )
+                        await log_index_error(session, stage="compact", message="etl_index_builder failed",
+                                             segment_id=new_segment.id, payload={"dir": str(seg_dir)})
                         await session.commit()
                 continue
 
@@ -499,13 +470,8 @@ async def compact_segments_level(from_level: int) -> int:
 
                 if (not bin_path.exists()) or (not docids_path.exists()):
                     seg.status = "error"
-                    await log_index_error(
-                        session,
-                        stage="compact",
-                        message="index_native.* was not created",
-                        segment_id=new_segment.id,
-                        payload={"dir": str(seg_dir)},
-                    )
+                    await log_index_error(session, stage="compact", message="index_native.* was not created",
+                                         segment_id=new_segment.id, payload={"dir": str(seg_dir)})
                     await session.commit()
                     continue
 
@@ -530,14 +496,8 @@ async def compact_segments_level(from_level: int) -> int:
                 )
 
                 for doc in docs2:
-                    session.add(
-                        SegmentDoc(
-                            segment_id=seg.id,
-                            document_id=doc.id,
-                            shard_id=doc.shard_id,
-                            organization_id=doc.organization_id,
-                        )
-                    )
+                    session.add(SegmentDoc(segment_id=seg.id, document_id=doc.id,
+                                           shard_id=doc.shard_id, organization_id=doc.organization_id))
 
                 res_old = await session.execute(select(Segment).where(Segment.id.in_(seg_ids)))
                 old_segs: List[Segment] = list(res_old.scalars())

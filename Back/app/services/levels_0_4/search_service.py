@@ -1,4 +1,3 @@
-# app/services/levels_0_4/search_service.py
 from __future__ import annotations
 
 from pathlib import Path
@@ -38,27 +37,12 @@ def _build_match_spans(q_pos: List[int], d_pos: List[int]) -> List[Dict[str, int
             continue
 
         spans.append(
-            {
-                "q_from": q_start,
-                "q_to": q_prev,
-                "d_from": d_start,
-                "d_to": d_prev,
-                "length": (q_prev - q_start + 1),
-            }
+            {"q_from": q_start, "q_to": q_prev, "d_from": d_start, "d_to": d_prev, "length": (q_prev - q_start + 1)}
         )
-        q_start = q
-        d_start = d
-        q_prev = q
-        d_prev = d
+        q_start, d_start, q_prev, d_prev = q, d, q, d
 
     spans.append(
-        {
-            "q_from": q_start,
-            "q_to": q_prev,
-            "d_from": d_start,
-            "d_to": d_prev,
-            "length": (q_prev - q_start + 1),
-        }
+        {"q_from": q_start, "q_to": q_prev, "d_from": d_start, "d_to": d_prev, "length": (q_prev - q_start + 1)}
     )
     return spans
 
@@ -74,6 +58,8 @@ async def _load_doc_text(db: AsyncSession, doc_id: int) -> Optional[str]:
 
     try:
         raw = file_path.read_bytes()
+        if file_path.suffix.lower() == ".txt":
+            return raw.decode("utf-8", errors="ignore")
         return extract_text_from_file_bytes(raw, filename=str(file_path))
     except Exception:
         return None
@@ -83,34 +69,26 @@ async def search_levels_1_4(
     db: AsyncSession,
     *,
     organization_id: int,
-    shard_id: Optional[int],
+    shard_id: int,
     query: str,
     top_k: int = 10,
-    global_search: bool = False,
     include_matches: bool = True,
     max_matches_per_doc: Optional[int] = None,
     include_user_view: bool = True,
     keep_raw_matches: bool = False,
     excerpt_max_chars: int = 800,
+    # NEW
+    normalize_query: bool = True,
 ) -> Dict[str, Any]:
-    """
-    - global_search=False: ищем внутри org + shard
-    - global_search=True:  ищем по всем shard внутри org
-    """
-    conds = [
-        Segment.organization_id == organization_id,
-        Segment.status == "ready",
-        Segment.level.in_([1, 2, 3, 4]),
-    ]
-    if not global_search:
-        if shard_id is None:
-            # strict: shard must be provided unless global_search
-            return {"count": 0, "hits": []}
-        conds.append(Segment.shard_id == shard_id)
-
+    # сегменты только этой организации и шарда
     res = await db.execute(
         select(Segment)
-        .where(*conds)
+        .where(
+            Segment.organization_id == organization_id,
+            Segment.shard_id == shard_id,
+            Segment.status == "ready",
+            Segment.level.in_([1, 2, 3, 4]),
+        )
         .order_by(Segment.level.desc(), Segment.id.desc())
     )
     segs: List[Segment] = list(res.scalars())
@@ -123,7 +101,12 @@ async def search_levels_1_4(
             continue
         d = str(INDEX_DIR / s.path)
         index_dirs.append(d)
-        by_dir[d] = {"segment_id": s.id, "segment_level": s.level, "segment_path": s.path}
+        by_dir[d] = {
+            "segment_id": int(s.id),
+            "segment_level": int(s.level),
+            "segment_path": s.path,
+            "organization_id": int(s.organization_id or 0),
+        }
 
     data = seg_search_many(
         query=query,
@@ -131,6 +114,7 @@ async def search_levels_1_4(
         index_dirs=index_dirs,
         include_matches=include_matches,
         max_matches_per_doc=max_matches_per_doc,
+        normalize_query=normalize_query,  # NEW: прокид
     )
 
     hits = data.get("hits") or []
@@ -161,7 +145,7 @@ async def search_levels_1_4(
             else:
                 h["match_spans"] = []
 
-    # user_view via C++ excerpt
+    # user_view excerpt through C++ normalization (usually normalize_text=True because docs are raw)
     if include_user_view and include_matches:
         doc_text_cache: Dict[int, Optional[str]] = {}
 
@@ -200,6 +184,7 @@ async def search_levels_1_4(
                     d_to=d_to,
                     k_shingle=K_SHINGLE,
                     max_chars=excerpt_max_chars,
+                    normalize_text=True,
                 )
 
                 uv_spans.append(

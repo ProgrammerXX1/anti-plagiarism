@@ -12,7 +12,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include "text_common.h"  // normalize_for_shingles_simple, tokenize_spans, TokenSpan
+#include "text_common.h"
 
 using json = nlohmann::json;
 
@@ -25,7 +25,6 @@ struct CachedIndex {
 static std::mutex g_cache_mx;
 static std::unordered_map<std::string, CachedIndex> g_cache;
 
-// Load outside lock, then insert
 static std::shared_ptr<const SearchEngine> get_or_load(const std::string& dir) {
     {
         std::lock_guard<std::mutex> lk(g_cache_mx);
@@ -64,11 +63,12 @@ struct OutHit {
 
 } // namespace
 
-extern "C" char* seg_search_many_json(
+extern "C" char* seg_search_many_json_v2(
     const char* query_utf8,
     int top_k,
     const char** index_dirs_utf8,
-    int n_dirs
+    int n_dirs,
+    int normalize_query
 ) {
     auto mk_empty = []() -> char* {
         std::string s = "{\"hits\":[],\"count\":0}";
@@ -82,6 +82,7 @@ extern "C" char* seg_search_many_json(
         return mk_empty();
     }
 
+    const bool do_norm = (normalize_query != 0);
     std::string q(query_utf8);
 
     std::vector<OutHit> all;
@@ -98,11 +99,11 @@ extern "C" char* seg_search_many_json(
         std::vector<SeHitLite> tmp;
         tmp.reserve((std::size_t)top_k);
 
-        int got = eng->search_text(q, top_k, tmp);
+        int got = eng->search_text(q, top_k, tmp, do_norm);
         if (got <= 0) continue;
 
         std::vector<std::vector<MatchPair>> tmp_matches;
-        eng->collect_matches_for_hits(q, tmp, tmp_matches);
+        eng->collect_matches_for_hits(q, tmp, tmp_matches, do_norm);
 
         const auto& docids = eng->doc_ids();
         for (int k = 0; k < got; ++k) {
@@ -120,7 +121,6 @@ extern "C" char* seg_search_many_json(
             if ((std::size_t)k < tmp_matches.size()) {
                 oh.matches = std::move(tmp_matches[(std::size_t)k]);
             }
-
             all.push_back(std::move(oh));
         }
     }
@@ -163,12 +163,23 @@ extern "C" char* seg_search_many_json(
     return malloc_json(j);
 }
 
-extern "C" char* seg_excerpt_for_span_json(
+// backward compatible old API: normalize=true
+extern "C" char* seg_search_many_json(
+    const char* query_utf8,
+    int top_k,
+    const char** index_dirs_utf8,
+    int n_dirs
+) {
+    return seg_search_many_json_v2(query_utf8, top_k, index_dirs_utf8, n_dirs, 1);
+}
+
+extern "C" char* seg_excerpt_for_span_json_v2(
     const char* text_utf8,
     int d_from,
     int d_to,
     int k_shingle,
-    int max_chars
+    int max_chars,
+    int normalize_text
 ) {
     json j;
     j["ok"] = false;
@@ -183,7 +194,10 @@ extern "C" char* seg_excerpt_for_span_json(
     if (!text_utf8 || k_shingle <= 0) return malloc_json(j);
     if (d_from < 0 || d_to < d_from) return malloc_json(j);
 
-    std::string norm = normalize_for_shingles_simple(std::string(text_utf8));
+    std::string norm;
+    if (normalize_text != 0) norm = normalize_for_shingles_simple(std::string(text_utf8));
+    else norm = std::string(text_utf8);
+
     j["norm_len"] = (int)norm.size();
 
     std::vector<TokenSpan> spans;
@@ -200,7 +214,7 @@ extern "C" char* seg_excerpt_for_span_json(
 
     const int tok_to = std::min(tok_to_raw, (int)spans.size() - 1);
 
-    // TokenSpan = { off, len } over `norm`
+    // TokenSpan = { off, len }
     int char_from = (int)spans[(std::size_t)tok_from].off;
     int char_to   = (int)(spans[(std::size_t)tok_to].off + spans[(std::size_t)tok_to].len);
 
@@ -208,7 +222,6 @@ extern "C" char* seg_excerpt_for_span_json(
     if (char_to < char_from) char_to = char_from;
     if (char_to > (int)norm.size()) char_to = (int)norm.size();
 
-    // safety cap by chars
     if (max_chars > 0) {
         int want = char_to - char_from;
         if (want > max_chars) {
@@ -228,6 +241,17 @@ extern "C" char* seg_excerpt_for_span_json(
     j["k"] = k_shingle;
 
     return malloc_json(j);
+}
+
+// backward compatible old API: normalize=true
+extern "C" char* seg_excerpt_for_span_json(
+    const char* text_utf8,
+    int d_from,
+    int d_to,
+    int k_shingle,
+    int max_chars
+) {
+    return seg_excerpt_for_span_json_v2(text_utf8, d_from, d_to, k_shingle, max_chars, 1);
 }
 
 extern "C" void seg_free(void* p) {

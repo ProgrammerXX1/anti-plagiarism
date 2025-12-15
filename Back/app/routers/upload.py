@@ -1,11 +1,10 @@
-# app/api/routes/upload.py
 import os
 import uuid
+import json
 from datetime import datetime, timezone
-from typing import Optional
-from fastapi import Body, Query
-from fastapi import APIRouter, Form, Depends, HTTPException
-from pydantic import BaseModel, Field
+
+from fastapi import APIRouter, Depends, HTTPException, Body, Query
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import UPLOAD_DIR, N_SHARDS
@@ -32,8 +31,6 @@ def _safe_ext(filename: str) -> str:
 
 
 def compute_shard_id_for_text(organization_id: int, n_shards: int) -> int:
-    # текстовый upload без метаданных -> shard 0
-    # если хочешь: можно шардинг по user/session/key
     return 0
 
 
@@ -44,6 +41,7 @@ class TextUploadResponse(BaseModel):
     external_id: str
     organization_id: int
     title: str
+    text_is_normalized: bool
 
 
 @router.post("/upload-text", response_model=TextUploadResponse)
@@ -52,6 +50,10 @@ async def upload_text(
     organization_id: int = Query(...),
     title: str = Query("text_upload"),
     for_level5: bool = Query(False),
+
+    # NEW: если true — считаем что текст уже нормализован (не менять ни при индексации, ни при excerpt)
+    text_is_normalized: bool = Query(False),
+
     db: AsyncSession = Depends(get_db),
 ):
     _validate_org_id(organization_id)
@@ -61,18 +63,35 @@ async def upload_text(
 
     now = utcnow()
     status = "l5_uploaded" if for_level5 else "uploaded"
-
     shard_id = compute_shard_id_for_text(organization_id, N_SHARDS)
 
-    # store as UTF-8 txt file in uploads
-    ext = _safe_ext(title)  # if user passed "a.txt" keep ext, else ".txt"
-    external_id = f"org_{organization_id}_text_{int(now.timestamp())}_{uuid.uuid4().hex}{ext}"
+    ext = _safe_ext(title)
+    norm_tag = "norm1" if text_is_normalized else "norm0"
+    external_id = f"org_{organization_id}_text_{norm_tag}_{int(now.timestamp())}_{uuid.uuid4().hex}{ext}"
     upload_path = UPLOAD_DIR / external_id
 
     try:
         upload_path.write_text(text, encoding="utf-8")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Cannot save text: {e}")
+
+    # sidecar meta: воркер будет читать и решать нормализовать ли при индексации
+    meta_path = UPLOAD_DIR / f"{external_id}.meta.json"
+    try:
+        meta_path.write_text(
+            json.dumps(
+                {
+                    "organization_id": int(organization_id),
+                    "text_is_normalized": bool(text_is_normalized),
+                    "title": title,
+                    "created_at": now.isoformat(),
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
 
     doc = Document(
         organization_id=organization_id,
@@ -103,4 +122,5 @@ async def upload_text(
         external_id=doc.external_id,
         organization_id=doc.organization_id,
         title=doc.title or title,
+        text_is_normalized=bool(text_is_normalized),
     )
