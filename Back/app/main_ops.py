@@ -40,6 +40,6 @@ logger.info("=== main_ops started ===")
 # тяжёлые штуки: OCR, загрузка, билд индекса, corpus list/text
 app.include_router(upload.router)
 app.include_router(status.router)
-app.include_router(level5.router)
+# app.include_router(level5.router)
 app.include_router(admin_levels.router)
 app.include_router(levels0_4_search.router)

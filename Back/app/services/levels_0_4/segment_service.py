@@ -1,4 +1,3 @@
-# app/services/levels0_4/segments_service.py
 from __future__ import annotations
 
 import json
@@ -60,14 +59,11 @@ async def _run_etl_index_builder(corpus: Path, out_dir: Path) -> bool:
 
 async def _select_docs_for_l1_locked(
     session: AsyncSession,
+    *,
     shard_id: int,
     organization_id: int,
     limit: int,
 ) -> List[Document]:
-    """
-    Берем пачку etl_ok документов для (shard_id, organization_id) с блокировкой,
-    чтобы несколько воркеров не строили один и тот же сегмент и не мешали друг другу.
-    """
     res = await session.execute(
         select(Document)
         .where(
@@ -105,13 +101,6 @@ def _ensure_single_org(docs: List[Document]) -> Optional[int]:
 # -------------------------
 
 async def build_l1_segments() -> int:
-    """
-    L1: индексируем документы (создаём L1-сегменты).
-    КЛЮЧЕВО:
-      - берём документы пачками с FOR UPDATE SKIP LOCKED
-      - берём строго в рамках (shard_id, organization_id), иначе ломается инвариант org_id в segment_docs
-      - помечаем indexed только те, кто реально попал в corpus.jsonl
-    """
     async with AsyncSessionLocal() as session:
         pair_rows = await session.execute(
             select(Document.shard_id, Document.organization_id)
@@ -121,7 +110,7 @@ async def build_l1_segments() -> int:
             )
             .distinct()
         )
-        pairs: List[Tuple[int, int]] = [(r[0], r[1]) for r in pair_rows.fetchall()]
+        pairs: List[Tuple[int, int]] = [(int(r[0]), int(r[1])) for r in pair_rows.fetchall()]
 
         if not pairs:
             print("[SEGMENT-L1] Нет документов etl_ok без segment_id — L1-сегменты не нужны")
@@ -129,7 +118,6 @@ async def build_l1_segments() -> int:
 
     total_docs_processed = 0
 
-    # (shard_id, org_id) loop — отдельными транзакциями, чтобы не держать long tx
     for shard_id, org_id in pairs:
         while True:
             async with AsyncSessionLocal() as session:
@@ -142,7 +130,6 @@ async def build_l1_segments() -> int:
                 if not docs:
                     break
 
-                # safety: если вдруг попали смешанные org (не должны) — не продолжаем
                 org_checked = _ensure_single_org(docs)
                 if org_checked is None:
                     await log_index_error(
@@ -160,12 +147,14 @@ async def build_l1_segments() -> int:
 
                 now = utcnow()
 
+                # FIX #1: write organization_id into segments table
                 segment = Segment(
+                    organization_id=org_id,
                     shard_id=shard_id,
                     level=1,
                     status="building",
                     path="",
-                    doc_count=len(docs),      # позже обновим фактическим числом
+                    doc_count=len(docs),
                     shingle_count=0,
                     size_bytes=0,
                     created_at=now,
@@ -184,7 +173,6 @@ async def build_l1_segments() -> int:
                 )
 
                 seg_corpus_path = seg_dir / "segment_corpus.jsonl"
-
                 indexed_doc_ids: Set[int] = set()
 
                 with seg_corpus_path.open("w", encoding="utf-8") as f:
@@ -197,7 +185,11 @@ async def build_l1_segments() -> int:
 
                         try:
                             raw_bytes = file_path.read_bytes()
-                            raw_text = extract_text_from_file_bytes(raw_bytes, filename=str(file_path))
+                            # fast path for txt
+                            if file_path.suffix.lower() == ".txt":
+                                raw_text = raw_bytes.decode("utf-8", errors="ignore")
+                            else:
+                                raw_text = extract_text_from_file_bytes(raw_bytes, filename=str(file_path))
                         except Exception as e:
                             await log_index_error(
                                 session,
@@ -225,10 +217,8 @@ async def build_l1_segments() -> int:
                     await session.commit()
                     continue
 
-                # ВАЖНО: выходим из транзакции, чтобы не держать lock пока C++ работает
                 await session.commit()
 
-            # запуск C++ — вне tx
             ok = await _run_etl_index_builder(seg_corpus_path, seg_dir)
             if not ok:
                 async with AsyncSessionLocal() as session:
@@ -245,7 +235,6 @@ async def build_l1_segments() -> int:
                         await session.commit()
                 continue
 
-            # финализация — отдельная транзакция
             async with AsyncSessionLocal() as session:
                 seg = await session.get(Segment, segment.id)
                 if not seg:
@@ -272,13 +261,12 @@ async def build_l1_segments() -> int:
                     if p.exists():
                         size_bytes += p.stat().st_size
 
-                # обновляем только реально индексированные документы
                 real_docs = await session.execute(
                     select(Document).where(Document.id.in_(list(indexed_doc_ids)))
                 )
                 real_docs_list: List[Document] = list(real_docs.scalars())
 
-                # safety: ensure org invariant for segment_docs
+                # org invariant
                 for d in real_docs_list:
                     if d.organization_id != org_id:
                         seg.status = "error"
@@ -307,7 +295,7 @@ async def build_l1_segments() -> int:
                                 segment_id=seg.id,
                                 document_id=doc.id,
                                 shard_id=doc.shard_id,
-                                organization_id=doc.organization_id,  # FIX
+                                organization_id=doc.organization_id,
                             )
                         )
 
@@ -321,7 +309,6 @@ async def build_l1_segments() -> int:
                         f"[SEGMENT-L1] Готов L1-segment id={seg.id}, shard={shard_id}, org={org_id}, "
                         f"docs(indexed)={len(real_docs_list)}, bytes={size_bytes}"
                     )
-
                     total_docs_processed += len(real_docs_list)
 
     return total_docs_processed
@@ -332,42 +319,32 @@ async def build_l1_segments() -> int:
 # -------------------------
 
 async def compact_segments_level(from_level: int) -> int:
-    """
-    Компакция сегментов: Lx -> L(x+1)
-    Строгий режим: если не смогли извлечь текст хотя бы для одного документа —
-    НЕ мерджим исходные сегменты (иначе тихая потеря данных).
-
-    ВАЖНО: компакция должна сохранять инвариант organization_id.
-    Здесь мы проверяем, что все docs в батче одной организации; иначе abort.
-    """
     to_level = from_level + 1
     per_compact = cfg_segments_per_compact(from_level)
 
     total_docs_promoted = 0
 
+    # FIX #2: compaction candidates by (org, shard)
     async with AsyncSessionLocal() as session:
-        shard_rows = await session.execute(
-            select(Segment.shard_id)
+        pair_rows = await session.execute(
+            select(Segment.organization_id, Segment.shard_id)
             .where(Segment.level == from_level, Segment.status == "ready")
-            .group_by(Segment.shard_id)
+            .group_by(Segment.organization_id, Segment.shard_id)
             .having(func.count(Segment.id) >= per_compact)
         )
-        shard_ids = [row[0] for row in shard_rows.fetchall()]
+        pairs: List[Tuple[int, int]] = [(int(r[0]), int(r[1])) for r in pair_rows.fetchall() if r[0] is not None]
 
-    if not shard_ids:
-        print(
-            f"[COMPACT L{from_level}->L{to_level}] "
-            f"нет шардов с достаточным числом сегментов (>= {per_compact})"
-        )
+    if not pairs:
+        print(f"[COMPACT L{from_level}->L{to_level}] нет пар (org, shard) с >= {per_compact} сегментов")
         return 0
 
-    for shard_id in shard_ids:
+    for org_id, shard_id in pairs:
         while True:
-            # 1) берём сегменты под lock
             async with AsyncSessionLocal() as session:
                 seg_rows = await session.execute(
                     select(Segment)
                     .where(
+                        Segment.organization_id == org_id,
                         Segment.level == from_level,
                         Segment.status == "ready",
                         Segment.shard_id == shard_id,
@@ -382,11 +359,13 @@ async def compact_segments_level(from_level: int) -> int:
 
                 seg_ids = [s.id for s in batch_segments]
 
-                # docs для этих сегментов
                 doc_rows = await session.execute(
                     select(Document)
                     .join(SegmentDoc, SegmentDoc.document_id == Document.id)
-                    .where(SegmentDoc.segment_id.in_(seg_ids))
+                    .where(
+                        SegmentDoc.segment_id.in_(seg_ids),
+                        SegmentDoc.organization_id == org_id,
+                    )
                     .order_by(Document.id)
                     .with_for_update(skip_locked=True)
                 )
@@ -399,23 +378,11 @@ async def compact_segments_level(from_level: int) -> int:
                     await session.commit()
                     continue
 
-                # org invariant: все docs должны быть одной организации
-                org_id = _ensure_single_org(docs)
-                if org_id is None:
-                    new_orgs = sorted({d.organization_id for d in docs})
-                    await log_index_error(
-                        session,
-                        stage="compact",
-                        message="mixed organization_id in compaction batch; abort",
-                        payload={"from_segments": seg_ids, "org_ids": new_orgs, "shard_id": shard_id},
-                    )
-                    # не трогаем исходные сегменты
-                    await session.commit()
-                    continue
-
                 now = utcnow()
 
+                # FIX #1 again: write org_id into new segment
                 new_segment = Segment(
+                    organization_id=org_id,
                     shard_id=shard_id,
                     level=to_level,
                     status="building",
@@ -466,7 +433,10 @@ async def compact_segments_level(from_level: int) -> int:
 
                         try:
                             raw_bytes = file_path.read_bytes()
-                            raw_text = extract_text_from_file_bytes(raw_bytes, filename=str(file_path))
+                            if file_path.suffix.lower() == ".txt":
+                                raw_text = raw_bytes.decode("utf-8", errors="ignore")
+                            else:
+                                raw_text = extract_text_from_file_bytes(raw_bytes, filename=str(file_path))
                         except Exception as e:
                             failed = True
                             await log_index_error(
@@ -483,7 +453,6 @@ async def compact_segments_level(from_level: int) -> int:
                         indexed_doc_ids.append(doc.id)
 
                 if failed or len(indexed_doc_ids) != len(docs):
-                    # строгий режим: компакцию не делаем, исходники не трогаем
                     new_segment.status = "error"
                     await log_index_error(
                         session,
@@ -491,6 +460,8 @@ async def compact_segments_level(from_level: int) -> int:
                         message="strict mode: not all docs were indexable; compaction aborted",
                         segment_id=new_segment.id,
                         payload={
+                            "org_id": org_id,
+                            "shard_id": shard_id,
                             "from_segments": seg_ids,
                             "docs_total": len(docs),
                             "docs_written": len(indexed_doc_ids),
@@ -501,7 +472,6 @@ async def compact_segments_level(from_level: int) -> int:
 
                 await session.commit()
 
-            # 2) запускаем C++ вне tx
             ok = await _run_etl_index_builder(seg_corpus_path, seg_dir)
             if not ok:
                 async with AsyncSessionLocal() as session:
@@ -518,7 +488,6 @@ async def compact_segments_level(from_level: int) -> int:
                         await session.commit()
                 continue
 
-            # 3) финализация: обновить docs/segment_docs, пометить старые merged
             async with AsyncSessionLocal() as session:
                 seg = await session.get(Segment, new_segment.id)
                 if not seg:
@@ -545,31 +514,20 @@ async def compact_segments_level(from_level: int) -> int:
                     if p.exists():
                         size_bytes += p.stat().st_size
 
-                # переназначаем документы на новый сегмент
                 res_docs = await session.execute(select(Document).where(Document.id.in_(indexed_doc_ids)))
                 docs2: List[Document] = list(res_docs.scalars())
-
-                # org invariant re-check
-                org2 = _ensure_single_org(docs2)
-                if org2 is None or org2 != org_id:
-                    seg.status = "error"
-                    await log_index_error(
-                        session,
-                        stage="compact",
-                        message="org invariant violated in finalization; abort",
-                        segment_id=seg.id,
-                        payload={"expected_org_id": org_id, "got_orgs": sorted({d.organization_id for d in docs2})},
-                    )
-                    await session.commit()
-                    continue
 
                 for doc in docs2:
                     doc.segment_id = seg.id
                     doc.status = "indexed"
                     doc.updated_at = utcnow()
 
-                # пересобираем SegmentDoc:
-                await session.execute(delete(SegmentDoc).where(SegmentDoc.segment_id.in_(seg_ids)))
+                await session.execute(
+                    delete(SegmentDoc).where(
+                        SegmentDoc.segment_id.in_(seg_ids),
+                        SegmentDoc.organization_id == org_id,
+                    )
+                )
 
                 for doc in docs2:
                     session.add(
@@ -577,11 +535,10 @@ async def compact_segments_level(from_level: int) -> int:
                             segment_id=seg.id,
                             document_id=doc.id,
                             shard_id=doc.shard_id,
-                            organization_id=doc.organization_id,  # FIX
+                            organization_id=doc.organization_id,
                         )
                     )
 
-                # помечаем старые сегменты merged
                 res_old = await session.execute(select(Segment).where(Segment.id.in_(seg_ids)))
                 old_segs: List[Segment] = list(res_old.scalars())
                 for s in old_segs:
@@ -595,7 +552,7 @@ async def compact_segments_level(from_level: int) -> int:
                 await session.commit()
 
                 print(
-                    f"[COMPACT L{from_level}->L{to_level}] shard={shard_id}, org={org_id}: "
+                    f"[COMPACT L{from_level}->L{to_level}] org={org_id} shard={shard_id}: "
                     f"готов segment id={seg.id}, docs={len(docs2)}, bytes={size_bytes}, merged_segments={seg_ids}"
                 )
                 total_docs_promoted += len(docs2)

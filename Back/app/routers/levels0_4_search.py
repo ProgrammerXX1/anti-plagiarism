@@ -26,3 +26,4 @@ async def search(
         include_matches=include_matches,
         max_matches_per_doc=max_matches_per_doc,
     )
+

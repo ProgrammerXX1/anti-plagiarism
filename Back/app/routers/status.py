@@ -1,8 +1,8 @@
-from typing import List
+from typing import List, Dict, Optional
 import json
 from pathlib import Path
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_db
 from app.models.document import Document
 from app.models.segment import Segment
+from app.models.segment_doc import SegmentDoc
 
 from app.core.config import (
     ETL_BATCH_SIZE,
@@ -25,16 +26,16 @@ from app.schemas.level5 import Level5BaseInfo
 router = APIRouter(tags=["Admin-levels"])
 
 
-# ───────────────────────── schemas ───────────────────────── #
-
 class LevelSegmentItem(BaseModel):
     segment_id: int
+    organization_id: int
     shard_id: int
     level: int
     status: str
     doc_count: int
     size_bytes: int
     path: str
+    document_ids: List[int]
 
 
 class LevelsConfigResponse(BaseModel):
@@ -47,33 +48,19 @@ class LevelsConfigResponse(BaseModel):
 
 
 class LevelsStatusResponse(BaseModel):
-    # уровни 0–4
     level0_docs: int
     level1_segments: List[LevelSegmentItem]
     level2_segments: List[LevelSegmentItem]
     level3_segments: List[LevelSegmentItem]
     level4_segments: List[LevelSegmentItem]
 
-    # уровень 5 (подробно)
-    level5_waiting_docs: int   # l5_uploaded, которых нет ни в одной базе
-    level5_indexed_docs: int   # уникальные doc_id, присутствующие в L5-базах
-    level5_bases: List[Level5BaseInfo]  # список баз L5 (каждая индексация отдельно)
+    level5_waiting_docs: int
+    level5_indexed_docs: int
+    level5_bases: List[Level5BaseInfo]
 
-
-class LevelsFullResponse(BaseModel):
-    config: LevelsConfigResponse
-    status: LevelsStatusResponse
-
-
-# ───────────────────────── helpers ───────────────────────── #
 
 def _iter_l5_doc_ids() -> set[int]:
-    """
-    Собираем уникальные doc_id из всех index_native_docids.json всех баз L5.
-    Предполагаем, что doc_id там лежат как строки ID документов.
-    """
     ids: set[int] = set()
-
     if not L5_SHARDS_DIR.exists():
         return ids
 
@@ -103,19 +90,7 @@ def _iter_l5_doc_ids() -> set[int]:
 
 
 def _iter_l5_bases() -> List[Level5BaseInfo]:
-    """
-    Возвращает список баз уровня 5 по всем shard_*.
-
-    Каталог базы:
-      L5_SHARDS_DIR / shard_<id> / current
-
-    Метрики:
-      - has_index: наличие index_native.bin + index_native_docids.json
-      - docs: количество doc_id в index_native_docids.json
-      - size_bytes: суммарный размер bin/docids/meta
-    """
     bases: List[Level5BaseInfo] = []
-
     if not L5_SHARDS_DIR.exists():
         return bases
 
@@ -165,13 +140,8 @@ def _iter_l5_bases() -> List[Level5BaseInfo]:
     return bases
 
 
-# ───────────────────────── endpoints ───────────────────────── #
-
 @router.get("/levels/config", response_model=LevelsConfigResponse)
 async def get_levels_config() -> LevelsConfigResponse:
-    """
-    Показывает ТЕКУЩИЕ конфиги, которые реально используются воркером (env).
-    """
     return LevelsConfigResponse(
         etl_batch_size=ETL_BATCH_SIZE,
         docs_per_l1_segment=DOCS_PER_L1_SEGMENT,
@@ -185,27 +155,31 @@ async def get_levels_config() -> LevelsConfigResponse:
 @router.get("/levels/status", response_model=LevelsStatusResponse)
 async def get_levels_status(
     db: AsyncSession = Depends(get_db),
+    organization_id: Optional[int] = Query(
+        None,
+        description="If provided: filter L0-L4 by organization_id. If omitted: show all orgs.",
+    ),
 ) -> LevelsStatusResponse:
-    """
-    Текущий статус уровней в БД + детализированное состояние уровня 5.
-    """
-
-    # 0 уровень — ещё не индексированы (обычный пайплайн)
-    level0_stmt = select(func.count(Document.id)).where(
+    # L0
+    level0_conds = [
         Document.status.in_(["uploaded", "etl_ok"]),
         Document.segment_id.is_(None),
-    )
+    ]
+    if organization_id is not None:
+        level0_conds.append(Document.organization_id == organization_id)
+
+    level0_stmt = select(func.count(Document.id)).where(*level0_conds)
     level0_count = (await db.execute(level0_stmt)).scalar_one()
 
-    async def load_level(level: int):
-        stmt = (
-            select(Segment)
-            .where(
-                Segment.level == level,
-                Segment.status == "ready",
-            )
-            .order_by(Segment.id)
-        )
+    async def load_level(level: int) -> List[Segment]:
+        seg_conds = [
+            Segment.level == level,
+            Segment.status == "ready",
+        ]
+        if organization_id is not None:
+            seg_conds.append(Segment.organization_id == organization_id)
+
+        stmt = select(Segment).where(*seg_conds).order_by(Segment.id)
         return list((await db.execute(stmt)).scalars())
 
     l1_segments = await load_level(1)
@@ -213,44 +187,60 @@ async def get_levels_status(
     l3_segments = await load_level(3)
     l4_segments = await load_level(4)
 
+    all_segs = l1_segments + l2_segments + l3_segments + l4_segments
+    seg_ids = [int(s.id) for s in all_segs]
+
+    docs_by_seg: Dict[int, List[int]] = {}
+    if seg_ids:
+        sd_conds = [SegmentDoc.segment_id.in_(seg_ids)]
+        # фильтровать по org в segment_docs имеет смысл только если org задан
+        if organization_id is not None:
+            sd_conds.append(SegmentDoc.organization_id == organization_id)
+
+        sd_stmt = (
+            select(SegmentDoc.segment_id, SegmentDoc.document_id)
+            .where(*sd_conds)
+            .order_by(SegmentDoc.segment_id, SegmentDoc.document_id)
+        )
+        rows = (await db.execute(sd_stmt)).all()
+        for sid, did in rows:
+            docs_by_seg.setdefault(int(sid), []).append(int(did))
+
     def to_item(s: Segment) -> LevelSegmentItem:
+        org = int(s.organization_id or 0)  # FIX: old rows may have NULL
         return LevelSegmentItem(
-            segment_id=s.id,
-            shard_id=s.shard_id,
-            level=s.level,
-            status=s.status,
-            doc_count=s.doc_count,
-            size_bytes=s.size_bytes or 0,
+            segment_id=int(s.id),
+            organization_id=org,
+            shard_id=int(s.shard_id or 0),
+            level=int(s.level or 0),
+            status=s.status or "",
+            doc_count=int(s.doc_count or 0),
+            size_bytes=int(s.size_bytes or 0),
             path=s.path or "",
+            document_ids=docs_by_seg.get(int(s.id), []),
         )
 
-    # ── L5: базы (каждая индексация отдельно) ──────────────────────
+    # L5
     level5_bases = _iter_l5_bases()
-
-    # ── L5: глобальный список индексированных doc_id ──────────────
     indexed_ids = _iter_l5_doc_ids()
     level5_indexed = len(indexed_ids)
 
-    # ── L5: документы, которые ждут индексации ────────────────────
     if indexed_ids:
         l5_wait_stmt = select(func.count(Document.id)).where(
             Document.status == "l5_uploaded",
             ~Document.id.in_(indexed_ids),
         )
     else:
-        l5_wait_stmt = select(func.count(Document.id)).where(
-            Document.status == "l5_uploaded",
-        )
-
+        l5_wait_stmt = select(func.count(Document.id)).where(Document.status == "l5_uploaded")
     level5_waiting = (await db.execute(l5_wait_stmt)).scalar_one()
 
     return LevelsStatusResponse(
-        level0_docs=level0_count,
+        level0_docs=int(level0_count),
         level1_segments=[to_item(s) for s in l1_segments],
         level2_segments=[to_item(s) for s in l2_segments],
         level3_segments=[to_item(s) for s in l3_segments],
         level4_segments=[to_item(s) for s in l4_segments],
-        level5_waiting_docs=level5_waiting,
-        level5_indexed_docs=level5_indexed,
+        level5_waiting_docs=int(level5_waiting),
+        level5_indexed_docs=int(level5_indexed),
         level5_bases=level5_bases,
     )
