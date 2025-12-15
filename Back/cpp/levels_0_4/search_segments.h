@@ -41,6 +41,8 @@ char* seg_excerpt_for_span_json_v2(
     int normalize_text
 );
 
+char* seg_normalize_json_v1(const char* text_utf8);
+
 void seg_free(void* p);
 
 #ifdef __cplusplus

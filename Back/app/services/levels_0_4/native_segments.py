@@ -114,6 +114,19 @@ def seg_search_many(
     finally:
         _lib.seg_free(ptr)
 
+_lib.seg_normalize_json_v1.argtypes = [ctypes.c_char_p]
+_lib.seg_normalize_json_v1.restype = ctypes.c_void_p
+
+def seg_normalize_text(text: str) -> dict:
+    ptr = _lib.seg_normalize_json_v1(text.encode("utf-8", errors="ignore"))
+    if not ptr:
+        return {"ok": False, "text": ""}
+    try:
+        raw = ctypes.cast(ptr, ctypes.c_char_p).value or b""
+        return _safe_json_loads(raw)
+    finally:
+        _lib.seg_free(ptr)
+
 
 def seg_excerpt_for_span(
     *,

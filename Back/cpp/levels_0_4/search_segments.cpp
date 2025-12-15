@@ -257,3 +257,17 @@ extern "C" char* seg_excerpt_for_span_json(
 extern "C" void seg_free(void* p) {
     std::free(p);
 }
+
+// debugger
+extern "C" char* seg_normalize_json_v1(const char* text_utf8) {
+    json j;
+    j["ok"] = false;
+    j["text"] = "";
+
+    if (!text_utf8) return malloc_json(j);
+
+    std::string norm = normalize_for_shingles_simple(std::string(text_utf8));
+    j["ok"] = true;
+    j["text"] = norm;
+    return malloc_json(j);
+}

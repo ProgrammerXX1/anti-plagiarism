@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from app.services.levels_0_4.native_segments import seg_normalize_text
 from fastapi import APIRouter, Depends, Body, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -35,3 +36,8 @@ async def search(
         max_matches_per_doc=max_matches_per_doc,
         normalize_query=normalize_query,
     )
+
+@router.post("/normalize")
+async def normalize_text(text: str = Body(..., media_type="text/plain")):
+    return seg_normalize_text(text)
+
