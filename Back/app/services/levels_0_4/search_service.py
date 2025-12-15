@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,7 +18,25 @@ MIN_SPAN_SHINGLES = 6
 MAX_SPANS_PER_HIT = 3
 
 
+def _load_upload_meta(external_id: str) -> Dict[str, Any]:
+    """
+    Читает UPLOAD_DIR/<external_id>.meta.json
+    Возвращает {} если нет/битый.
+    """
+    p = UPLOAD_DIR / f"{external_id}.meta.json"
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
 def _build_match_spans(q_pos: List[int], d_pos: List[int]) -> List[Dict[str, int]]:
+    """
+    Превращает параллельные массивы q_pos/d_pos в интервалы.
+    Важно: q_pos/d_pos — это позиции ТOKENS (по нормализованной строке C++).
+    """
     if not q_pos or not d_pos or len(q_pos) != len(d_pos):
         return []
 
@@ -37,32 +56,51 @@ def _build_match_spans(q_pos: List[int], d_pos: List[int]) -> List[Dict[str, int
             continue
 
         spans.append(
-            {"q_from": q_start, "q_to": q_prev, "d_from": d_start, "d_to": d_prev, "length": (q_prev - q_start + 1)}
+            {
+                "q_from": q_start,
+                "q_to": q_prev,
+                "d_from": d_start,
+                "d_to": d_prev,
+                "length": (q_prev - q_start + 1),
+            }
         )
         q_start, d_start, q_prev, d_prev = q, d, q, d
 
     spans.append(
-        {"q_from": q_start, "q_to": q_prev, "d_from": d_start, "d_to": d_prev, "length": (q_prev - q_start + 1)}
+        {
+            "q_from": q_start,
+            "q_to": q_prev,
+            "d_from": d_start,
+            "d_to": d_prev,
+            "length": (q_prev - q_start + 1),
+        }
     )
     return spans
 
 
-async def _load_doc_text(db: AsyncSession, doc_id: int) -> Optional[str]:
+async def _load_doc_text_and_norm(db: AsyncSession, doc_id: int) -> Tuple[Optional[str], bool]:
+    """
+    Возвращает (raw_text, text_is_normalized).
+    Python НЕ нормализует текст. Флаг берём из sidecar meta.
+    """
     doc = await db.get(Document, doc_id)
     if not doc or not doc.external_id:
-        return None
+        return None, False
 
     file_path = UPLOAD_DIR / doc.external_id
     if not file_path.exists():
-        return None
+        return None, False
+
+    meta = _load_upload_meta(doc.external_id)
+    already_norm = bool(meta.get("text_is_normalized", False))
 
     try:
         raw = file_path.read_bytes()
         if file_path.suffix.lower() == ".txt":
-            return raw.decode("utf-8", errors="ignore")
-        return extract_text_from_file_bytes(raw, filename=str(file_path))
+            return raw.decode("utf-8", errors="ignore"), already_norm
+        return extract_text_from_file_bytes(raw, filename=str(file_path)), already_norm
     except Exception:
-        return None
+        return None, already_norm
 
 
 async def search_levels_1_4(
@@ -77,7 +115,6 @@ async def search_levels_1_4(
     include_user_view: bool = True,
     keep_raw_matches: bool = False,
     excerpt_max_chars: int = 800,
-    # NEW
     normalize_query: bool = True,
 ) -> Dict[str, Any]:
     # сегменты только этой организации и шарда
@@ -114,7 +151,7 @@ async def search_levels_1_4(
         index_dirs=index_dirs,
         include_matches=include_matches,
         max_matches_per_doc=max_matches_per_doc,
-        normalize_query=normalize_query,  # NEW: прокид
+        normalize_query=normalize_query,  # Python не меняет query
     )
 
     hits = data.get("hits") or []
@@ -124,6 +161,7 @@ async def search_levels_1_4(
         d = h.get("index_dir")
         meta = by_dir.get(d)
         if not meta:
+            # подстраховка, но лучше фиксить контрактом C++
             try:
                 dd = str(Path(d))
                 meta = by_dir.get(dd)
@@ -145,9 +183,9 @@ async def search_levels_1_4(
             else:
                 h["match_spans"] = []
 
-    # user_view excerpt through C++ normalization (usually normalize_text=True because docs are raw)
+    # user_view excerpt: normalize_text зависит от того, как хранился текст
     if include_user_view and include_matches:
-        doc_text_cache: Dict[int, Optional[str]] = {}
+        doc_cache: Dict[int, Tuple[Optional[str], bool]] = {}
 
         for h in hits:
             doc_id_str = h.get("doc_id")
@@ -161,16 +199,21 @@ async def search_levels_1_4(
                 h["user_view"] = {"summary": "", "spans": []}
                 continue
 
-            if doc_id_int not in doc_text_cache:
-                doc_text_cache[doc_id_int] = await _load_doc_text(db, doc_id_int)
+            if doc_id_int not in doc_cache:
+                doc_cache[doc_id_int] = await _load_doc_text_and_norm(db, doc_id_int)
 
-            raw_text = doc_text_cache[doc_id_int]
+            raw_text, text_is_normalized = doc_cache[doc_id_int]
             if not raw_text:
                 h["user_view"] = {"summary": "Текст документа недоступен", "spans": []}
                 continue
 
             uv_spans = []
             total_sh = 0
+
+            # IMPORTANT:
+            # - если текст уже нормализован -> normalize_text=False
+            # - если текст сырой -> normalize_text=True
+            normalize_text = (not bool(text_is_normalized))
 
             for sp in spans:
                 d_from = int(sp["d_from"])
@@ -184,7 +227,7 @@ async def search_levels_1_4(
                     d_to=d_to,
                     k_shingle=K_SHINGLE,
                     max_chars=excerpt_max_chars,
-                    normalize_text=True,
+                    normalize_text=normalize_text,
                 )
 
                 uv_spans.append(
@@ -198,6 +241,8 @@ async def search_levels_1_4(
                         "tok_from": ex.get("tok_from", None),
                         "tok_to": ex.get("tok_to", None),
                         "ok": bool(ex.get("ok", False)),
+                        "text_is_normalized": bool(text_is_normalized),
+                        "normalize_text_applied": bool(normalize_text),
                     }
                 )
 

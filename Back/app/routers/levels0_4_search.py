@@ -20,7 +20,7 @@ async def search(
     include_matches: bool = Query(True),
     max_matches_per_doc: int | None = Query(None, ge=0, le=5000),
 
-    # NEW: если false — запрос уже нормализован, C++ не должен его менять
+    # если false — запрос уже нормализован C++-совместимо, C++ не должен его менять
     normalize_query: bool = Query(True),
 
     db: AsyncSession = Depends(get_db),

@@ -1,8 +1,9 @@
+# app/services/levels0_4/segments_service.py
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import List, Set, Tuple, Optional, Any, Dict
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sqlalchemy import select, delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,6 +22,10 @@ from app.repositories.index_errors import log_index_error
 from app.services.helpers.file_extract import extract_text_from_file_bytes
 from app.services.levels_0_4.etl_service import utcnow
 
+
+# -------------------------
+# helpers
+# -------------------------
 
 async def _run_etl_index_builder(corpus: Path, out_dir: Path) -> bool:
     import asyncio
@@ -94,8 +99,11 @@ def _ensure_single_org(docs: List[Document]) -> Optional[int]:
 
 def _load_upload_meta(external_id: str) -> Dict[str, Any]:
     """
-    Читает UPLOAD_DIR/<external_id>.meta.json
-    Возвращает {} если нет/битый.
+    Reads UPLOAD_DIR/<external_id>.meta.json
+
+    Expected keys (after your change):
+      - text_is_normalized: bool        (how file is stored)
+      - index_normalize: bool           (how to build index; default True)
     """
     p = UPLOAD_DIR / f"{external_id}.meta.json"
     if not p.exists():
@@ -105,6 +113,32 @@ def _load_upload_meta(external_id: str) -> Dict[str, Any]:
     except Exception:
         return {}
 
+
+def _index_normalize_from_meta(meta: Dict[str, Any]) -> bool:
+    """
+    Controls *index-time* normalization.
+    Default: True (normalize during indexing) to preserve old behavior.
+    """
+    v = meta.get("index_normalize", True)
+    return bool(v)
+
+
+def _builder_normalized_flag(index_normalize: bool) -> bool:
+    """
+    C++ builder expects field name "normalized" meaning:
+      normalized=True  => text is already normalized; builder will NOT normalize
+      normalized=False => builder WILL normalize via normalize_for_shingles_simple
+
+    So:
+      index_normalize=True  => normalized=False
+      index_normalize=False => normalized=True
+    """
+    return (not bool(index_normalize))
+
+
+# -------------------------
+# build L1
+# -------------------------
 
 async def build_l1_segments() -> int:
     async with AsyncSessionLocal() as session:
@@ -182,12 +216,21 @@ async def build_l1_segments() -> int:
                     for doc in docs:
                         if not doc.external_id:
                             continue
+
                         file_path = UPLOAD_DIR / doc.external_id
                         if not file_path.exists():
+                            await log_index_error(
+                                session,
+                                stage="build_l1",
+                                message="file missing",
+                                doc_id=doc.id,
+                                payload={"file": str(file_path)},
+                            )
                             continue
 
                         meta = _load_upload_meta(doc.external_id)
-                        already_norm = bool(meta.get("text_is_normalized", False))
+                        index_normalize = _index_normalize_from_meta(meta)
+                        normalized_for_builder = _builder_normalized_flag(index_normalize)
 
                         try:
                             raw_bytes = file_path.read_bytes()
@@ -205,11 +248,12 @@ async def build_l1_segments() -> int:
                             )
                             continue
 
-                        # IMPORTANT: передаём флаг в C++ билдер
+                        # IMPORTANT:
+                        #   "normalized" here means "already normalized" for C++ builder.
                         rec = {
                             "doc_id": str(doc.id),
                             "text": raw_text,
-                            "normalized": already_norm,
+                            "normalized": bool(normalized_for_builder),
                         }
                         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                         indexed_doc_ids.add(doc.id)
@@ -317,6 +361,10 @@ async def build_l1_segments() -> int:
     return total_docs_processed
 
 
+# -------------------------
+# compact (L1->L2->L3->L4)
+# -------------------------
+
 async def compact_segments_level(from_level: int) -> int:
     to_level = from_level + 1
     per_compact = cfg_segments_per_compact(from_level)
@@ -404,19 +452,31 @@ async def compact_segments_level(from_level: int) -> int:
                     for doc in docs:
                         if not doc.external_id:
                             failed = True
-                            await log_index_error(session, stage="compact", message="doc has no external_id",
-                                                 doc_id=doc.id, segment_id=new_segment.id)
+                            await log_index_error(
+                                session,
+                                stage="compact",
+                                message="doc has no external_id",
+                                doc_id=doc.id,
+                                segment_id=new_segment.id,
+                            )
                             break
 
                         file_path = UPLOAD_DIR / doc.external_id
                         if not file_path.exists():
                             failed = True
-                            await log_index_error(session, stage="compact", message="file missing",
-                                                 doc_id=doc.id, segment_id=new_segment.id, payload={"file": str(file_path)})
+                            await log_index_error(
+                                session,
+                                stage="compact",
+                                message="file missing",
+                                doc_id=doc.id,
+                                segment_id=new_segment.id,
+                                payload={"file": str(file_path)},
+                            )
                             break
 
                         meta = _load_upload_meta(doc.external_id)
-                        already_norm = bool(meta.get("text_is_normalized", False))
+                        index_normalize = _index_normalize_from_meta(meta)
+                        normalized_for_builder = _builder_normalized_flag(index_normalize)
 
                         try:
                             raw_bytes = file_path.read_bytes()
@@ -426,11 +486,27 @@ async def compact_segments_level(from_level: int) -> int:
                                 raw_text = extract_text_from_file_bytes(raw_bytes, filename=str(file_path))
                         except Exception as e:
                             failed = True
-                            await log_index_error(session, stage="compact", message=f"extract/read failed: {e}",
-                                                 doc_id=doc.id, segment_id=new_segment.id, payload={"file": str(file_path)})
+                            await log_index_error(
+                                session,
+                                stage="compact",
+                                message=f"extract/read failed: {e}",
+                                doc_id=doc.id,
+                                segment_id=new_segment.id,
+                                payload={"file": str(file_path)},
+                            )
                             break
 
-                        f.write(json.dumps({"doc_id": str(doc.id), "text": raw_text, "normalized": already_norm}, ensure_ascii=False) + "\n")
+                        f.write(
+                            json.dumps(
+                                {
+                                    "doc_id": str(doc.id),
+                                    "text": raw_text,
+                                    "normalized": bool(normalized_for_builder),
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
                         indexed_doc_ids.append(doc.id)
 
                 if failed or len(indexed_doc_ids) != len(docs):
@@ -440,8 +516,13 @@ async def compact_segments_level(from_level: int) -> int:
                         stage="compact",
                         message="strict mode: not all docs were indexable; compaction aborted",
                         segment_id=new_segment.id,
-                        payload={"org_id": org_id, "shard_id": shard_id, "from_segments": seg_ids,
-                                 "docs_total": len(docs), "docs_written": len(indexed_doc_ids)},
+                        payload={
+                            "org_id": org_id,
+                            "shard_id": shard_id,
+                            "from_segments": seg_ids,
+                            "docs_total": len(docs),
+                            "docs_written": len(indexed_doc_ids),
+                        },
                     )
                     await session.commit()
                     continue
@@ -454,8 +535,13 @@ async def compact_segments_level(from_level: int) -> int:
                     seg = await session.get(Segment, new_segment.id)
                     if seg:
                         seg.status = "error"
-                        await log_index_error(session, stage="compact", message="etl_index_builder failed",
-                                             segment_id=new_segment.id, payload={"dir": str(seg_dir)})
+                        await log_index_error(
+                            session,
+                            stage="compact",
+                            message="etl_index_builder failed",
+                            segment_id=new_segment.id,
+                            payload={"dir": str(seg_dir)},
+                        )
                         await session.commit()
                 continue
 
@@ -470,8 +556,13 @@ async def compact_segments_level(from_level: int) -> int:
 
                 if (not bin_path.exists()) or (not docids_path.exists()):
                     seg.status = "error"
-                    await log_index_error(session, stage="compact", message="index_native.* was not created",
-                                         segment_id=new_segment.id, payload={"dir": str(seg_dir)})
+                    await log_index_error(
+                        session,
+                        stage="compact",
+                        message="index_native.* was not created",
+                        segment_id=new_segment.id,
+                        payload={"dir": str(seg_dir)},
+                    )
                     await session.commit()
                     continue
 
@@ -496,8 +587,14 @@ async def compact_segments_level(from_level: int) -> int:
                 )
 
                 for doc in docs2:
-                    session.add(SegmentDoc(segment_id=seg.id, document_id=doc.id,
-                                           shard_id=doc.shard_id, organization_id=doc.organization_id))
+                    session.add(
+                        SegmentDoc(
+                            segment_id=seg.id,
+                            document_id=doc.id,
+                            shard_id=doc.shard_id,
+                            organization_id=doc.organization_id,
+                        )
+                    )
 
                 res_old = await session.execute(select(Segment).where(Segment.id.in_(seg_ids)))
                 old_segs: List[Segment] = list(res_old.scalars())

@@ -1,3 +1,4 @@
+# app/api/upload_text.py
 import os
 import uuid
 import json
@@ -31,6 +32,7 @@ def _safe_ext(filename: str) -> str:
 
 
 def compute_shard_id_for_text(organization_id: int, n_shards: int) -> int:
+    # TODO: нормальный shard hash
     return 0
 
 
@@ -41,7 +43,7 @@ class TextUploadResponse(BaseModel):
     external_id: str
     organization_id: int
     title: str
-    text_is_normalized: bool
+    index_normalize: bool
 
 
 @router.post("/upload-text", response_model=TextUploadResponse)
@@ -51,14 +53,17 @@ async def upload_text(
     title: str = Query("text_upload"),
     for_level5: bool = Query(False),
 
-    # NEW: если true — считаем что текст уже нормализован (не менять ни при индексации, ни при excerpt)
-    text_is_normalized: bool = Query(False),
+    # 🔥 ЕДИНСТВЕННЫЙ ФЛАГ
+    index_normalize: bool = Query(
+        True,
+        description="Включить или выключить нормализацию при индексации"
+    ),
 
     db: AsyncSession = Depends(get_db),
 ):
     _validate_org_id(organization_id)
 
-    if text is None or not text.strip():
+    if not text or not text.strip():
         raise HTTPException(status_code=400, detail="Empty text")
 
     now = utcnow()
@@ -66,8 +71,13 @@ async def upload_text(
     shard_id = compute_shard_id_for_text(organization_id, N_SHARDS)
 
     ext = _safe_ext(title)
-    norm_tag = "norm1" if text_is_normalized else "norm0"
-    external_id = f"org_{organization_id}_text_{norm_tag}_{int(now.timestamp())}_{uuid.uuid4().hex}{ext}"
+
+    external_id = (
+        f"org_{organization_id}_"
+        f"text_normindex{int(index_normalize)}_"
+        f"{int(now.timestamp())}_{uuid.uuid4().hex}{ext}"
+    )
+
     upload_path = UPLOAD_DIR / external_id
 
     try:
@@ -75,21 +85,19 @@ async def upload_text(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Cannot save text: {e}")
 
-    # sidecar meta: воркер будет читать и решать нормализовать ли при индексации
+    # sidecar meta — источник правды для индексации
     meta_path = UPLOAD_DIR / f"{external_id}.meta.json"
+    meta = {
+        "organization_id": int(organization_id),
+        "title": title,
+        "created_at": now.isoformat(),
+
+        # 🔥 ТОЛЬКО ЭТО
+        "index_normalize": bool(index_normalize),
+    }
+
     try:
-        meta_path.write_text(
-            json.dumps(
-                {
-                    "organization_id": int(organization_id),
-                    "text_is_normalized": bool(text_is_normalized),
-                    "title": title,
-                    "created_at": now.isoformat(),
-                },
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
     except Exception:
         pass
 
@@ -122,5 +130,5 @@ async def upload_text(
         external_id=doc.external_id,
         organization_id=doc.organization_id,
         title=doc.title or title,
-        text_is_normalized=bool(text_is_normalized),
+        index_normalize=index_normalize,
     )
