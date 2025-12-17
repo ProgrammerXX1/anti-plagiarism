@@ -8,7 +8,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 
 from app.models.document import Document
+from app.core.config import N_SHARDS
 from app.core.settings_index import calc_shard_id_from_meta
+
+
+def calc_shard_id_from_org(organization_id: int) -> int:
+    """
+    Единое распределение для случаев, когда нет meta (university/faculty/group_name).
+    """
+    try:
+        n = int(N_SHARDS or 0)
+    except Exception:
+        n = 0
+    if n <= 1:
+        return 0
+    return int(organization_id) % n
 
 
 async def list_unsegmented_docs_for_shard(
@@ -42,18 +56,25 @@ async def create_document(
     faculty: Optional[str],
     group_name: Optional[str],
     external_id: Optional[str] = None,
+    shard_id: Optional[int] = None,
 ) -> Document:
     now = datetime.now(timezone.utc)
-    shard_id = calc_shard_id_from_meta(
-        university=university,
-        faculty=faculty,
-        group_name=group_name,
-    )
+
+    if shard_id is None:
+        # старое поведение — если есть meta
+        if any([university, faculty, group_name]):
+            shard_id = calc_shard_id_from_meta(
+                university=university,
+                faculty=faculty,
+                group_name=group_name,
+            )
+        else:
+            shard_id = calc_shard_id_from_org(organization_id)
 
     doc = Document(
         organization_id=organization_id,
         external_id=external_id,
-        shard_id=shard_id,
+        shard_id=int(shard_id),
         status="uploaded",
         created_at=now,
         updated_at=now,

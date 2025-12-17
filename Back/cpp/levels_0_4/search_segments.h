@@ -5,7 +5,6 @@
 extern "C" {
 #endif
 
-// old API (kept)
 char* seg_search_many_json(
     const char* query_utf8,
     int top_k,
@@ -13,7 +12,7 @@ char* seg_search_many_json(
     int n_dirs
 );
 
-// new API: normalize_query (1/0)
+// v2: kept for backward compatibility (always include legacy matches)
 char* seg_search_many_json_v2(
     const char* query_utf8,
     int top_k,
@@ -22,7 +21,16 @@ char* seg_search_many_json_v2(
     int normalize_query
 );
 
-// old API (kept)
+// v3: NEW - allow disabling legacy matches computation/serialization
+char* seg_search_many_json_v3(
+    const char* query_utf8,
+    int top_k,
+    const char** index_dirs_utf8,
+    int n_dirs,
+    int normalize_query,
+    int include_matches
+);
+
 char* seg_excerpt_for_span_json(
     const char* text_utf8,
     int d_from,
@@ -31,7 +39,6 @@ char* seg_excerpt_for_span_json(
     int max_chars
 );
 
-// new API: normalize_text (1/0)
 char* seg_excerpt_for_span_json_v2(
     const char* text_utf8,
     int d_from,

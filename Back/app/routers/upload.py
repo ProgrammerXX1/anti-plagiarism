@@ -1,5 +1,4 @@
 # app/api/upload_text.py
-import os
 import uuid
 import json
 from datetime import datetime, timezone
@@ -24,16 +23,10 @@ def _validate_org_id(organization_id: int) -> None:
         raise HTTPException(status_code=422, detail="organization_id must be a positive integer")
 
 
-def _safe_ext(filename: str) -> str:
-    _, ext = os.path.splitext(filename or "")
-    if not ext or len(ext) > 16:
-        return ".txt"
-    return ext
-
-
 def compute_shard_id_for_text(organization_id: int, n_shards: int) -> int:
-    # TODO: нормальный shard hash
-    return 0
+    if not n_shards or int(n_shards) <= 1:
+        return 0
+    return int(organization_id) % int(n_shards)
 
 
 class TextUploadResponse(BaseModel):
@@ -53,11 +46,8 @@ async def upload_text(
     title: str = Query("text_upload"),
     for_level5: bool = Query(False),
 
-    # 🔥 ЕДИНСТВЕННЫЙ ФЛАГ
-    index_normalize: bool = Query(
-        True,
-        description="Включить или выключить нормализацию при индексации"
-    ),
+    # единый флаг
+    index_normalize: bool = Query(True),
 
     db: AsyncSession = Depends(get_db),
 ):
@@ -70,8 +60,8 @@ async def upload_text(
     status = "l5_uploaded" if for_level5 else "uploaded"
     shard_id = compute_shard_id_for_text(organization_id, N_SHARDS)
 
-    ext = _safe_ext(title)
-
+    # КЛЮЧЕВО: текст -> всегда .txt
+    ext = ".txt"
     external_id = (
         f"org_{organization_id}_"
         f"text_normindex{int(index_normalize)}_"
@@ -79,23 +69,21 @@ async def upload_text(
     )
 
     upload_path = UPLOAD_DIR / external_id
-
     try:
         upload_path.write_text(text, encoding="utf-8")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Cannot save text: {e}")
 
-    # sidecar meta — источник правды для индексации
+    # sidecar meta
     meta_path = UPLOAD_DIR / f"{external_id}.meta.json"
     meta = {
         "organization_id": int(organization_id),
         "title": title,
         "created_at": now.isoformat(),
-
-        # 🔥 ТОЛЬКО ЭТО
         "index_normalize": bool(index_normalize),
+        "text_is_normalized": False,
+        "file_name": "upload-text.txt",
     }
-
     try:
         meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
     except Exception:

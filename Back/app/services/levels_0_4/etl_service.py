@@ -18,40 +18,41 @@ def utcnow() -> datetime:
 async def process_uploaded_docs() -> int:
     """
     L0: uploaded -> etl_ok.
-    В L0 лежат только неиндексированные документы.
-    Тут нет "тяжелого ETL" — просто переводим статус, проверяя файл.
+
+    Важно:
+    - SELECT ... FOR UPDATE SKIP LOCKED должен выполняться внутри транзакции.
+    - Здесь нет тяжелого ETL — только проверка наличия файла и перевод статуса.
     """
     async with AsyncSessionLocal() as session:
-        result = await session.execute(
-            select(Document)
-            .where(Document.status == "uploaded")
-            .order_by(Document.id)
-            .limit(ETL_BATCH_SIZE)
-            .with_for_update(skip_locked=True)
-        )
-        docs: List[Document] = list(result.scalars())
+        async with session.begin():
+            result = await session.execute(
+                select(Document)
+                .where(Document.status == "uploaded")
+                .order_by(Document.id)
+                .limit(ETL_BATCH_SIZE)
+                .with_for_update(skip_locked=True)
+            )
+            docs: List[Document] = list(result.scalars())
 
-        if not docs:
-            print("[ETL] Нет документов со статусом 'uploaded'")
-            return 0
+            if not docs:
+                # без лишнего спама
+                return 0
 
-        now = utcnow()
-        processed = 0
+            now = utcnow()
+            processed = 0
 
-        for doc in docs:
-            if not doc.external_id:
-                print(f"[ETL] WARNING: doc id={doc.id} без external_id, пропускаю")
-                continue
+            for doc in docs:
+                if not doc.external_id:
+                    # doc без файла — лучше оставлять uploaded и логировать отдельно
+                    continue
 
-            file_path = UPLOAD_DIR / doc.external_id
-            if not file_path.exists():
-                print(f"[ETL] WARNING: файл не найден: {file_path}, пропускаю doc id={doc.id}")
-                continue
+                file_path = UPLOAD_DIR / doc.external_id
+                if not file_path.exists():
+                    # файл не найден — оставляем uploaded (может приехать позже)
+                    continue
 
-            doc.status = "etl_ok"
-            doc.updated_at = now
-            processed += 1
+                doc.status = "etl_ok"
+                doc.updated_at = now
+                processed += 1
 
-        await session.commit()
-        print(f"[ETL] Переведено в etl_ok: {processed}")
-        return processed
+            return processed

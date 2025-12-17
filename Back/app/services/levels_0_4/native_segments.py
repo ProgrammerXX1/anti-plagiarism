@@ -14,13 +14,24 @@ if not os.path.exists(SO_PATH):
 
 _lib = ctypes.CDLL(SO_PATH)
 
-# v2 search
-_lib.seg_search_many_json_v2.argtypes = [
+# v3 search (preferred)
+_lib.seg_search_many_json_v3.argtypes = [
     ctypes.c_char_p,                 # query_utf8
     ctypes.c_int,                    # top_k
     ctypes.POINTER(ctypes.c_char_p), # index_dirs
     ctypes.c_int,                    # n_dirs
     ctypes.c_int,                    # normalize_query (0/1)
+    ctypes.c_int,                    # include_matches (0/1)
+]
+_lib.seg_search_many_json_v3.restype = ctypes.c_void_p
+
+# fallback v2 (optional, but keep defined if you want)
+_lib.seg_search_many_json_v2.argtypes = [
+    ctypes.c_char_p,
+    ctypes.c_int,
+    ctypes.POINTER(ctypes.c_char_p),
+    ctypes.c_int,
+    ctypes.c_int,
 ]
 _lib.seg_search_many_json_v2.restype = ctypes.c_void_p
 
@@ -35,6 +46,9 @@ _lib.seg_excerpt_for_span_json_v2.argtypes = [
 ]
 _lib.seg_excerpt_for_span_json_v2.restype = ctypes.c_void_p
 
+_lib.seg_normalize_json_v1.argtypes = [ctypes.c_char_p]
+_lib.seg_normalize_json_v1.restype = ctypes.c_void_p
+
 _lib.seg_free.argtypes = [ctypes.c_void_p]
 _lib.seg_free.restype = None
 
@@ -43,7 +57,6 @@ def _safe_json_loads(b: bytes) -> Dict[str, Any]:
     try:
         return json.loads(b.decode("utf-8", errors="ignore"))
     except Exception:
-        # не скрываем полностью — хотя бы структура
         return {"count": 0, "hits": [], "error": "bad_json"}
 
 
@@ -52,14 +65,10 @@ def seg_search_many(
     query: str,
     top_k: int,
     index_dirs: List[str],
-    include_matches: bool = True,
-    max_matches_per_doc: Optional[int] = None,
+    include_matches: bool = False,
+    max_matches_per_doc: Optional[int] = None,  # kept for compatibility; used only if include_matches=True
     normalize_query: bool = True,
 ) -> Dict[str, Any]:
-    """
-    Python НЕ нормализует текст.
-    normalize_query просто прокидывается в C++.
-    """
     if not query or top_k <= 0 or not index_dirs:
         return {"count": 0, "hits": []}
 
@@ -73,12 +82,14 @@ def seg_search_many(
         return {"count": 0, "hits": []}
 
     arr = (ctypes.c_char_p * len(dirs))(*dirs)
-    ptr = _lib.seg_search_many_json_v2(
+
+    ptr = _lib.seg_search_many_json_v3(
         query.encode("utf-8", errors="ignore"),
         int(top_k),
         arr,
         int(len(dirs)),
         1 if normalize_query else 0,
+        1 if include_matches else 0,
     )
     if not ptr:
         return {"count": 0, "hits": []}
@@ -92,11 +103,12 @@ def seg_search_many(
         hits = data.get("hits") or []
 
         if not include_matches:
+            # v3 already doesn't include "matches", but keep safe:
             for h in hits:
                 h.pop("matches", None)
             return data
 
-        # жёсткий лимит matches на Python-стороне (если нужно)
+        # If matches requested, optionally hard-limit arrays on Python side
         if max_matches_per_doc is not None and max_matches_per_doc >= 0:
             for h in hits:
                 m = h.get("matches")
@@ -114,8 +126,6 @@ def seg_search_many(
     finally:
         _lib.seg_free(ptr)
 
-_lib.seg_normalize_json_v1.argtypes = [ctypes.c_char_p]
-_lib.seg_normalize_json_v1.restype = ctypes.c_void_p
 
 def seg_normalize_text(text: str) -> dict:
     ptr = _lib.seg_normalize_json_v1(text.encode("utf-8", errors="ignore"))
@@ -137,10 +147,6 @@ def seg_excerpt_for_span(
     max_chars: int = 800,
     normalize_text: bool = True,
 ) -> Dict[str, Any]:
-    """
-    Python НЕ нормализует.
-    normalize_text прокидывается в C++.
-    """
     if not text:
         return {"ok": False, "excerpt": ""}
 

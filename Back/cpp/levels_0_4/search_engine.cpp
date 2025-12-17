@@ -5,9 +5,9 @@
 #include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -57,8 +57,7 @@ static bool build_query_shingles(
     if (normalize_input) {
         norm_out = normalize_for_shingles_simple(text_utf8);
     } else {
-        // assume already normalized exactly like C++ normalize_for_shingles_simple would produce
-        norm_out = text_utf8;
+        norm_out = text_utf8; // assume already normalized identically
     }
 
     spans_out.clear();
@@ -83,6 +82,8 @@ static bool build_query_shingles(
 
     return true;
 }
+
+struct Pt { std::uint32_t q; std::uint32_t d; };
 
 } // namespace
 
@@ -132,9 +133,10 @@ IndexConfig SearchEngine::load_config_from_json(const std::string& index_dir) {
         auto j = json::parse(meta_txt);
         if (j.contains("config") && j["config"].is_object()) {
             auto& c = j["config"];
-            if (c.contains("max_matches_per_doc")) {
-                cfg.max_matches_per_doc = c["max_matches_per_doc"].get<int>();
-            }
+            if (c.contains("max_matches_per_doc")) cfg.max_matches_per_doc = c["max_matches_per_doc"].get<int>();
+            if (c.contains("span_min_len")) cfg.span_min_len = c["span_min_len"].get<int>();
+            if (c.contains("span_gap")) cfg.span_gap = c["span_gap"].get<int>();
+            if (c.contains("max_spans_per_doc")) cfg.max_spans_per_doc = c["max_spans_per_doc"].get<int>();
         }
         return cfg;
     } catch (...) {
@@ -258,11 +260,20 @@ int SearchEngine::search_text(
     std::vector<std::uint32_t> touched;
     touched.reserve((std::size_t)q_size * 64);
 
+    // FIX: count intersection as "unique query shingles that appear in doc"
+    // (NOT "number of postings"). postings are sorted by (h, did, pos),
+    // so within [L,R) the same did groups consecutively.
     for (std::uint64_t h : q_uniq) {
         auto [L, R] = find_postings9_range(h);
+
+        std::uint32_t prev_did = std::numeric_limits<std::uint32_t>::max();
         for (std::size_t i = L; i < R; ++i) {
             const std::uint32_t did = post9_[i].did;
             if (did >= N) continue;
+
+            if (did == prev_did) continue; // dedup did for this h
+            prev_did = did;
+
             if (hits[did] == 0) touched.push_back(did);
             hits[did] += 1;
         }
@@ -271,7 +282,7 @@ int SearchEngine::search_text(
 
     struct Cand {
         std::uint32_t did;
-        int inter;
+        int inter;        // unique intersecting shingles count
         double score;
         double J;
         double C;
@@ -358,7 +369,7 @@ void SearchEngine::collect_matches_for_hits(
             if (it == did2idx.end()) continue;
 
             int& cnt = used[p.did];
-            if (cnt >= cfg_.max_matches_per_doc) continue;
+            if (cfg_.max_matches_per_doc > 0 && cnt >= cfg_.max_matches_per_doc) continue;
             cnt += 1;
 
             out_matches[it->second].push_back(MatchPair{qs.qpos, p.pos, qs.h});
@@ -371,5 +382,130 @@ void SearchEngine::collect_matches_for_hits(
             if (a.dpos != b.dpos) return a.dpos < b.dpos;
             return a.h < b.h;
         });
+    }
+}
+
+void SearchEngine::collect_spans_for_hits(
+    const std::string& text_utf8,
+    const std::vector<SeHitLite>& hits,
+    std::vector<std::vector<MatchSpan>>& out_spans,
+    bool normalize_input
+) const {
+    out_spans.clear();
+    out_spans.resize(hits.size());
+    if (!loaded_ || hits.empty()) return;
+
+    std::string norm;
+    std::vector<TokenSpan> spans;
+    std::vector<QSh> qsh;
+    spans.reserve(256);
+
+    if (!build_query_shingles(text_utf8, norm, spans, qsh, normalize_input)) return;
+
+    std::unordered_map<std::uint32_t, std::size_t> did2idx;
+    did2idx.reserve(hits.size() * 2);
+    for (std::size_t i = 0; i < hits.size(); ++i) did2idx[hits[i].doc_id_int] = i;
+
+    std::unordered_map<std::uint32_t, int> used;
+    used.reserve(hits.size() * 2);
+
+    std::vector<std::unordered_map<int, std::vector<Pt>>> by_delta(hits.size());
+    for (auto& m : by_delta) m.reserve(64);
+
+    const int max_pts = (cfg_.max_matches_per_doc > 0 ? cfg_.max_matches_per_doc : 0);
+
+    for (const auto& qs : qsh) {
+        auto [L, R] = find_postings9_range(qs.h);
+        if (L == R) continue;
+
+        for (std::size_t i = L; i < R; ++i) {
+            const auto& p = post9_[i];
+            auto it = did2idx.find(p.did);
+            if (it == did2idx.end()) continue;
+
+            int& cnt = used[p.did];
+            if (max_pts > 0 && cnt >= max_pts) continue;
+            cnt += 1;
+
+            std::size_t hit_idx = it->second;
+            int delta = int(qs.qpos) - int(p.pos);
+            by_delta[hit_idx][delta].push_back(Pt{qs.qpos, p.pos});
+        }
+    }
+
+    const int min_len = (cfg_.span_min_len > 0 ? cfg_.span_min_len : 1);
+    const int gap = (cfg_.span_gap >= 0 ? cfg_.span_gap : 0);
+    const int max_spans = (cfg_.max_spans_per_doc > 0 ? cfg_.max_spans_per_doc : 0);
+
+    for (std::size_t hi = 0; hi < hits.size(); ++hi) {
+        std::vector<MatchSpan> all_sp;
+
+        for (auto& kv : by_delta[hi]) {
+            int delta = kv.first;
+            auto& pts = kv.second;
+            if (pts.empty()) continue;
+
+            std::sort(pts.begin(), pts.end(), [](const Pt& a, const Pt& b) {
+                if (a.q != b.q) return a.q < b.q;
+                return a.d < b.d;
+            });
+
+            pts.erase(std::unique(pts.begin(), pts.end(), [](const Pt& a, const Pt& b) {
+                return a.q == b.q && a.d == b.d;
+            }), pts.end());
+
+            std::uint32_t q0 = pts[0].q, d0 = pts[0].d;
+            std::uint32_t q1 = pts[0].q, d1 = pts[0].d;
+
+            for (std::size_t i = 1; i < pts.size(); ++i) {
+                const auto& cur = pts[i];
+
+                bool cont =
+                    (cur.q > q1) && (cur.d > d1) &&
+                    (cur.q <= q1 + 1u + (unsigned)gap) &&
+                    (cur.d <= d1 + 1u + (unsigned)gap);
+
+                if (cont) {
+                    q1 = cur.q;
+                    d1 = cur.d;
+                    continue;
+                }
+
+                std::uint32_t len = (q1 >= q0) ? (q1 - q0 + 1) : 1;
+                if ((int)len >= min_len) {
+                    all_sp.push_back(MatchSpan{q0, q1, d0, d1, len, delta});
+                }
+
+                q0 = q1 = cur.q;
+                d0 = d1 = cur.d;
+            }
+
+            std::uint32_t len = (q1 >= q0) ? (q1 - q0 + 1) : 1;
+            if ((int)len >= min_len) {
+                all_sp.push_back(MatchSpan{q0, q1, d0, d1, len, delta});
+            }
+        }
+
+        if (all_sp.empty()) {
+            out_spans[hi] = {};
+            continue;
+        }
+
+        std::sort(all_sp.begin(), all_sp.end(), [](const MatchSpan& a, const MatchSpan& b) {
+            if (a.length != b.length) return a.length > b.length;
+            if (a.d_from != b.d_from) return a.d_from < b.d_from;
+            return a.q_from < b.q_from;
+        });
+
+        if (max_spans > 0 && (int)all_sp.size() > max_spans) {
+            all_sp.resize((std::size_t)max_spans);
+        }
+
+        std::sort(all_sp.begin(), all_sp.end(), [](const MatchSpan& a, const MatchSpan& b) {
+            if (a.d_from != b.d_from) return a.d_from < b.d_from;
+            return a.d_to < b.d_to;
+        });
+
+        out_spans[hi] = std::move(all_sp);
     }
 }

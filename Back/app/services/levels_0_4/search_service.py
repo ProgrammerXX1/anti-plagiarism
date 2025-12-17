@@ -19,10 +19,6 @@ MAX_SPANS_PER_HIT = 3
 
 
 def _load_upload_meta(external_id: str) -> Dict[str, Any]:
-    """
-    Читает UPLOAD_DIR/<external_id>.meta.json
-    Возвращает {} если нет/битый.
-    """
     p = UPLOAD_DIR / f"{external_id}.meta.json"
     if not p.exists():
         return {}
@@ -32,75 +28,61 @@ def _load_upload_meta(external_id: str) -> Dict[str, Any]:
         return {}
 
 
-def _build_match_spans(q_pos: List[int], d_pos: List[int]) -> List[Dict[str, int]]:
+def _spans_to_match_spans(spans: Any) -> List[Dict[str, int]]:
     """
-    Превращает параллельные массивы q_pos/d_pos в интервалы.
-    Важно: q_pos/d_pos — это позиции ТOKENS (по нормализованной строке C++).
+    C++ returns spans: [{q_from,q_to,d_from,d_to,length,(delta)}, ...]
+    External API should NOT expose delta.
     """
-    if not q_pos or not d_pos or len(q_pos) != len(d_pos):
+    if not isinstance(spans, list):
         return []
 
-    spans: List[Dict[str, int]] = []
-    q_start = int(q_pos[0])
-    d_start = int(d_pos[0])
-    q_prev = int(q_pos[0])
-    d_prev = int(d_pos[0])
-
-    for i in range(1, len(q_pos)):
-        q = int(q_pos[i])
-        d = int(d_pos[i])
-
-        if q == q_prev + 1 and d == d_prev + 1:
-            q_prev = q
-            d_prev = d
+    out: List[Dict[str, int]] = []
+    for s in spans:
+        if not isinstance(s, dict):
+            continue
+        try:
+            length = int(s.get("length", 0))
+            if length < MIN_SPAN_SHINGLES:
+                continue
+            out.append(
+                {
+                    "q_from": int(s["q_from"]),
+                    "q_to": int(s["q_to"]),
+                    "d_from": int(s["d_from"]),
+                    "d_to": int(s["d_to"]),
+                    "length": length,
+                }
+            )
+        except Exception:
             continue
 
-        spans.append(
-            {
-                "q_from": q_start,
-                "q_to": q_prev,
-                "d_from": d_start,
-                "d_to": d_prev,
-                "length": (q_prev - q_start + 1),
-            }
-        )
-        q_start, d_start, q_prev, d_prev = q, d, q, d
-
-    spans.append(
-        {
-            "q_from": q_start,
-            "q_to": q_prev,
-            "d_from": d_start,
-            "d_to": d_prev,
-            "length": (q_prev - q_start + 1),
-        }
-    )
-    return spans
+    out.sort(key=lambda x: int(x.get("length", 0)), reverse=True)
+    return out[:MAX_SPANS_PER_HIT]
 
 
-async def _load_doc_text_and_norm(db: AsyncSession, doc_id: int) -> Tuple[Optional[str], bool]:
+async def _load_doc_text_and_index_norm(db: AsyncSession, doc_id: int) -> Tuple[Optional[str], bool]:
     """
-    Возвращает (raw_text, text_is_normalized).
-    Python НЕ нормализует текст. Флаг берём из sidecar meta.
+    Returns (raw_text, index_normalize).
+    index_normalize controls excerpt normalization (must match index-time behavior).
     """
     doc = await db.get(Document, doc_id)
     if not doc or not doc.external_id:
-        return None, False
+        return None, True
 
     file_path = UPLOAD_DIR / doc.external_id
     if not file_path.exists():
-        return None, False
+        return None, True
 
     meta = _load_upload_meta(doc.external_id)
-    already_norm = bool(meta.get("text_is_normalized", False))
+    index_normalize = bool(meta.get("index_normalize", True))
 
     try:
         raw = file_path.read_bytes()
         if file_path.suffix.lower() == ".txt":
-            return raw.decode("utf-8", errors="ignore"), already_norm
-        return extract_text_from_file_bytes(raw, filename=str(file_path)), already_norm
+            return raw.decode("utf-8", errors="ignore"), index_normalize
+        return extract_text_from_file_bytes(raw, filename=str(file_path)), index_normalize
     except Exception:
-        return None, already_norm
+        return None, index_normalize
 
 
 async def search_levels_1_4(
@@ -110,14 +92,10 @@ async def search_levels_1_4(
     shard_id: int,
     query: str,
     top_k: int = 10,
-    include_matches: bool = True,
-    max_matches_per_doc: Optional[int] = None,
     include_user_view: bool = True,
-    keep_raw_matches: bool = False,
     excerpt_max_chars: int = 800,
     normalize_query: bool = True,
 ) -> Dict[str, Any]:
-    # сегменты только этой организации и шарда
     res = await db.execute(
         select(Segment)
         .where(
@@ -149,19 +127,17 @@ async def search_levels_1_4(
         query=query,
         top_k=top_k,
         index_dirs=index_dirs,
-        include_matches=include_matches,
-        max_matches_per_doc=max_matches_per_doc,
-        normalize_query=normalize_query,  # Python не меняет query
+        include_matches=False,
+        max_matches_per_doc=None,
+        normalize_query=normalize_query,
     )
 
     hits = data.get("hits") or []
 
-    # enrich + spans
     for h in hits:
         d = h.get("index_dir")
         meta = by_dir.get(d)
         if not meta:
-            # подстраховка, но лучше фиксить контрактом C++
             try:
                 dd = str(Path(d))
                 meta = by_dir.get(dd)
@@ -170,21 +146,10 @@ async def search_levels_1_4(
         if meta:
             h.update(meta)
 
-        if include_matches:
-            m = h.get("matches")
-            if isinstance(m, dict):
-                q_pos = m.get("q_pos") or []
-                d_pos = m.get("d_pos") or []
-                spans = _build_match_spans(q_pos, d_pos)
+        # spans -> match_spans without delta
+        h["match_spans"] = _spans_to_match_spans(h.get("spans"))
 
-                spans = [sp for sp in spans if int(sp.get("length", 0)) >= MIN_SPAN_SHINGLES]
-                spans.sort(key=lambda x: int(x.get("length", 0)), reverse=True)
-                h["match_spans"] = spans[:MAX_SPANS_PER_HIT]
-            else:
-                h["match_spans"] = []
-
-    # user_view excerpt: normalize_text зависит от того, как хранился текст
-    if include_user_view and include_matches:
+    if include_user_view:
         doc_cache: Dict[int, Tuple[Optional[str], bool]] = {}
 
         for h in hits:
@@ -200,20 +165,17 @@ async def search_levels_1_4(
                 continue
 
             if doc_id_int not in doc_cache:
-                doc_cache[doc_id_int] = await _load_doc_text_and_norm(db, doc_id_int)
+                doc_cache[doc_id_int] = await _load_doc_text_and_index_norm(db, doc_id_int)
 
-            raw_text, text_is_normalized = doc_cache[doc_id_int]
+            raw_text, index_normalize = doc_cache[doc_id_int]
             if not raw_text:
                 h["user_view"] = {"summary": "Текст документа недоступен", "spans": []}
                 continue
 
+            normalize_text = bool(index_normalize)
+
             uv_spans = []
             total_sh = 0
-
-            # IMPORTANT:
-            # - если текст уже нормализован -> normalize_text=False
-            # - если текст сырой -> normalize_text=True
-            normalize_text = (not bool(text_is_normalized))
 
             for sp in spans:
                 d_from = int(sp["d_from"])
@@ -241,7 +203,6 @@ async def search_levels_1_4(
                         "tok_from": ex.get("tok_from", None),
                         "tok_to": ex.get("tok_to", None),
                         "ok": bool(ex.get("ok", False)),
-                        "text_is_normalized": bool(text_is_normalized),
                         "normalize_text_applied": bool(normalize_text),
                     }
                 )
@@ -250,9 +211,5 @@ async def search_levels_1_4(
                 "summary": f"Найдено {len(spans)} фрагм., совпало {total_sh} шинглов",
                 "spans": uv_spans,
             }
-
-    if include_matches and not keep_raw_matches:
-        for h in hits:
-            h.pop("matches", None)
 
     return data

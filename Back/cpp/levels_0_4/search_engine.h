@@ -21,12 +21,26 @@ struct IndexConfig {
     int    max_cands_doc = 1000;
 
     int    max_matches_per_doc = 256;
+
+    // NEW: diagonal runs -> spans
+    int    span_min_len = 6;        // минимальная длина span в шинглах
+    int    span_gap = 0;            // допустимый разрыв (0 = строго подряд)
+    int    max_spans_per_doc = 10;  // максимум spans на документ
 };
 
 struct MatchPair {
     std::uint32_t qpos;
     std::uint32_t dpos;
     std::uint64_t h;
+};
+
+struct MatchSpan {
+    std::uint32_t q_from;
+    std::uint32_t q_to;
+    std::uint32_t d_from;
+    std::uint32_t d_to;
+    std::uint32_t length; // in shingles
+    int           delta;  // qpos - dpos
 };
 
 class SearchEngine {
@@ -37,7 +51,6 @@ public:
     int  docs_count() const { return (int)doc_ids_.size(); }
     const std::vector<std::string>& doc_ids() const { return doc_ids_; }
 
-    // NEW: normalize_input flag (true = old behavior, false = input already normalized)
     int search_text(
         const std::string& text_utf8,
         int top_k,
@@ -45,11 +58,18 @@ public:
         bool normalize_input = true
     ) const;
 
-    // NEW: normalize_input flag
     void collect_matches_for_hits(
         const std::string& text_utf8,
         const std::vector<SeHitLite>& hits,
         std::vector<std::vector<MatchPair>>& out_matches,
+        bool normalize_input = true
+    ) const;
+
+    // NEW
+    void collect_spans_for_hits(
+        const std::string& text_utf8,
+        const std::vector<SeHitLite>& hits,
+        std::vector<std::vector<MatchSpan>>& out_spans,
         bool normalize_input = true
     ) const;
 
