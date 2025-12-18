@@ -1,3 +1,4 @@
+# app/services/levels_0_4/search_service.py
 from __future__ import annotations
 
 import json
@@ -63,18 +64,22 @@ def _spans_to_match_spans(spans: Any) -> List[Dict[str, int]]:
 async def _load_doc_text_and_index_norm(db: AsyncSession, doc_id: int) -> Tuple[Optional[str], bool]:
     """
     Returns (raw_text, index_normalize).
-    index_normalize controls excerpt normalization (must match index-time behavior).
+
+    PROD CONTRACT:
+      - router stores text already normalized
+      - index_normalize MUST be False
+    We still read meta for backward compatibility, but default is False.
     """
     doc = await db.get(Document, doc_id)
     if not doc or not doc.external_id:
-        return None, True
+        return None, False
 
     file_path = UPLOAD_DIR / doc.external_id
     if not file_path.exists():
-        return None, True
+        return None, False
 
     meta = _load_upload_meta(doc.external_id)
-    index_normalize = bool(meta.get("index_normalize", True))
+    index_normalize = bool(meta.get("index_normalize", False))
 
     try:
         raw = file_path.read_bytes()
@@ -94,8 +99,18 @@ async def search_levels_1_4(
     top_k: int = 10,
     include_user_view: bool = True,
     excerpt_max_chars: int = 800,
-    normalize_query: bool = True,
+    normalize_query: bool = False,  # PROD: never normalize; keep arg for compatibility
 ) -> Dict[str, Any]:
+    """
+    Search in ready segments level 1..4.
+
+    PROD CONTRACT:
+      - query is already normalized -> normalize_query must be False
+      - excerpt normalization must match index-time -> index_normalize is expected False
+    """
+    # Hard safety: prod forbids query normalization (prevents position drift)
+    normalize_query = False
+
     res = await db.execute(
         select(Segment)
         .where(
@@ -129,7 +144,7 @@ async def search_levels_1_4(
         index_dirs=index_dirs,
         include_matches=False,
         max_matches_per_doc=None,
-        normalize_query=normalize_query,
+        normalize_query=normalize_query,  # always False
     )
 
     hits = data.get("hits") or []
@@ -146,10 +161,10 @@ async def search_levels_1_4(
         if meta:
             h.update(meta)
 
-        # spans -> match_spans without delta
         h["match_spans"] = _spans_to_match_spans(h.get("spans"))
 
     if include_user_view:
+        # cache doc_id -> (text, index_normalize)
         doc_cache: Dict[int, Tuple[Optional[str], bool]] = {}
 
         for h in hits:
@@ -172,6 +187,7 @@ async def search_levels_1_4(
                 h["user_view"] = {"summary": "Текст документа недоступен", "spans": []}
                 continue
 
+            # PROD: if index_normalize is False (expected), excerpt also must be raw-space.
             normalize_text = bool(index_normalize)
 
             uv_spans = []

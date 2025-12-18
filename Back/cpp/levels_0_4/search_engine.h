@@ -1,8 +1,10 @@
 #pragma once
-#include <string>
-#include <vector>
+
+#include <cstddef>
 #include <cstdint>
+#include <string>
 #include <utility>
+#include <vector>
 
 struct SeHitLite {
     std::uint32_t doc_id_int;
@@ -13,19 +15,20 @@ struct SeHitLite {
 };
 
 struct IndexConfig {
-    int  w_min_doc   = 8;
-    int  w_min_query = 9;
+    int    w_min_doc   = 8;
+    int    w_min_query = 9;
+
     double alpha = 0.60;
     double w9    = 0.90;
+
     int    fetch_per_k   = 64;
     int    max_cands_doc = 1000;
 
     int    max_matches_per_doc = 256;
 
-    // NEW: diagonal runs -> spans
-    int    span_min_len = 6;        // минимальная длина span в шинглах
-    int    span_gap = 0;            // допустимый разрыв (0 = строго подряд)
-    int    max_spans_per_doc = 10;  // максимум spans на документ
+    int    span_min_len = 6;
+    int    span_gap = 0;
+    int    max_spans_per_doc = 10;
 };
 
 struct MatchPair {
@@ -39,8 +42,8 @@ struct MatchSpan {
     std::uint32_t q_to;
     std::uint32_t d_from;
     std::uint32_t d_to;
-    std::uint32_t length; // in shingles
-    int           delta;  // qpos - dpos
+    std::uint32_t length;
+    int           delta;
 };
 
 class SearchEngine {
@@ -65,7 +68,6 @@ public:
         bool normalize_input = true
     ) const;
 
-    // NEW
     void collect_spans_for_hits(
         const std::string& text_utf8,
         const std::vector<SeHitLite>& hits,

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Optional
 
+import anyio
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import UPLOAD_DIR, N_SHARDS
@@ -17,6 +20,10 @@ from app.services.levels_0_4.search_service import search_levels_1_4
 
 router = APIRouter(prefix="/app", tags=["Worker-Prod"])
 
+
+# ─────────────────────────────────────────────
+# helpers
+# ─────────────────────────────────────────────
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -60,17 +67,31 @@ def _cleanup_search_result(search: Dict[str, Any]) -> Dict[str, Any]:
     return {"count": int(len(cleaned)), "hits": cleaned}
 
 
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _write_json_atomic(path: Path, obj: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 # ─────────────────────────────────────────────
 # API models
 # ─────────────────────────────────────────────
 
 class ProdV1IngestRequest(BaseModel):
-    document_id: str
-    title: str
+    document_id: str = Field(..., min_length=1)
+    title: str = Field(..., min_length=1)
     author: Optional[str] = None
     created_at: Optional[str] = None
 
-    text: str
+    text: str = Field(..., min_length=1)
     file_name: str = "document.txt"
     enable_ocr: bool = False
 
@@ -86,6 +107,7 @@ class ProdV1IngestResponse(BaseModel):
     processed_at: str
 
     organization_id: int
+    shard_id: int
 
     indexed: bool
     search: Optional[Dict[str, Any]] = None
@@ -117,12 +139,13 @@ async def prod_v1_ingest(
             db,
             organization_id=req.organization_id,
             shard_id=shard_id,
-            query=req.text,   # уже нормализован
+            query=req.text,           # уже нормализован
+            normalize_query=False,    # ВАЖНО: никогда не нормализуем
         )
         search_result = _cleanup_search_result(raw)
 
         logger.info(
-            "[prod_v1] search-only doc=%s org=%s shard=%s",
+            "[prod_v1] search-only ext_doc=%s org=%s shard=%s",
             req.document_id,
             req.organization_id,
             shard_id,
@@ -133,6 +156,7 @@ async def prod_v1_ingest(
             status="checked",
             processed_at=now.isoformat(),
             organization_id=req.organization_id,
+            shard_id=shard_id,
             indexed=False,
             search=search_result,
         )
@@ -146,22 +170,37 @@ async def prod_v1_ingest(
         f"{int(now.timestamp())}_{uuid.uuid4().hex}.txt"
     )
 
-    (UPLOAD_DIR / external_id).write_text(req.text, encoding="utf-8")
+    file_path = UPLOAD_DIR / external_id
+    meta_path = UPLOAD_DIR / f"{external_id}.meta.json"
 
-    meta = {
-        "organization_id": req.organization_id,
-        "document_id": req.document_id,
+    # IMPORTANT CONTRACT:
+    # - text IS ALREADY normalized
+    # - internal normalizer is NEVER applied
+    meta: Dict[str, Any] = {
+        "organization_id": int(req.organization_id),
+        "document_id": str(req.document_id),
         "title": req.title,
         "author": req.author,
         "source_created_at": req.created_at,
         "file_name": req.file_name,
-        "enable_ocr": req.enable_ocr,
+        "enable_ocr": bool(req.enable_ocr),
         "saved_at": now.isoformat(),
+        "text_is_normalized": True,
+        "index_normalize": False,
     }
-    (UPLOAD_DIR / f"{external_id}.meta.json").write_text(
-        json.dumps(meta, ensure_ascii=False),
-        encoding="utf-8",
-    )
+
+    try:
+        await anyio.to_thread.run_sync(_write_text_atomic, file_path, req.text)
+        await anyio.to_thread.run_sync(_write_json_atomic, meta_path, meta)
+    except Exception as e:
+        # best-effort cleanup
+        for p in (file_path, meta_path):
+            try:
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+        raise HTTPException(status_code=500, detail=f"Failed to persist upload: {e}")
 
     doc = Document(
         external_id=external_id,
@@ -173,9 +212,19 @@ async def prod_v1_ingest(
         title=req.title,
         student_name=req.author,
     )
+
     db.add(doc)
-    await db.commit()
-    await db.refresh(doc)
+    try:
+        await db.commit()
+        await db.refresh(doc)
+    except Exception as e:
+        for p in (file_path, meta_path):
+            try:
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+        raise HTTPException(status_code=500, detail=f"DB commit failed: {e}")
 
     search_result = None
     if req.do_search:
@@ -183,17 +232,19 @@ async def prod_v1_ingest(
             db,
             organization_id=req.organization_id,
             shard_id=shard_id,
-            query=req.text,   # уже нормализован
+            query=req.text,
+            normalize_query=False,  # строго false
         )
         search_result = _cleanup_search_result(raw)
 
-        doc.last_checked_at = now
-        await db.commit()
+        if hasattr(doc, "last_checked_at"):
+            doc.last_checked_at = now
+            await db.commit()
 
     logger.info(
-        "[prod_v1] indexed doc=%s internal=%s org=%s shard=%s",
+        "[prod_v1] indexed ext_doc=%s internal_id=%s org=%s shard=%s",
         req.document_id,
-        doc.id,
+        getattr(doc, "id", None),
         req.organization_id,
         shard_id,
     )
@@ -203,6 +254,7 @@ async def prod_v1_ingest(
         status=("indexed_and_checked" if req.do_search else "queued_for_index"),
         processed_at=now.isoformat(),
         organization_id=req.organization_id,
+        shard_id=shard_id,
         indexed=True,
         search=search_result,
     )

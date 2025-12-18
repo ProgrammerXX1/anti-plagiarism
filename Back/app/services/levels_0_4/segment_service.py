@@ -1,19 +1,21 @@
-# app/services/levels0_4/segments_service.py
+# app/services/levels_0_4/segments_service.py
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from sqlalchemy import select, delete, func
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import (
+    DOCS_PER_L1_SEGMENT,
     INDEX_DIR,
     UPLOAD_DIR,
-    DOCS_PER_L1_SEGMENT,
     segments_per_compact as cfg_segments_per_compact,
 )
+from app.core.logger import logger
 from app.db.session import AsyncSessionLocal
 from app.models.document import Document
 from app.models.segment import Segment
@@ -23,15 +25,15 @@ from app.services.helpers.file_extract import extract_text_from_file_bytes
 from app.services.levels_0_4.etl_service import utcnow
 
 
-# -------------------------
+# ─────────────────────────────────────────────
 # helpers
-# -------------------------
+# ─────────────────────────────────────────────
 
 async def _run_etl_index_builder(corpus: Path, out_dir: Path) -> bool:
-    import asyncio
-
-    print(f"[worker] run_etl_index_builder: corpus={corpus}, out_dir={out_dir}")
-
+    """
+    Runs C++ builder:
+      etl_index_builder <segment_corpus.jsonl> <out_dir>
+    """
     proc = await asyncio.create_subprocess_exec(
         "etl_index_builder",
         str(corpus),
@@ -39,22 +41,18 @@ async def _run_etl_index_builder(corpus: Path, out_dir: Path) -> bool:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-
     stdout, stderr = await proc.communicate()
 
     if stdout:
-        print("[etl_index_builder][stdout]")
-        print(stdout.decode("utf-8", errors="ignore"))
-
+        logger.info("[etl_index_builder][stdout]\n%s", stdout.decode("utf-8", errors="ignore"))
     if stderr:
-        print("[etl_index_builder][stderr]")
-        print(stderr.decode("utf-8", errors="ignore"))
+        logger.warning("[etl_index_builder][stderr]\n%s", stderr.decode("utf-8", errors="ignore"))
 
     if proc.returncode != 0:
-        print(f"[worker] etl_index_builder FAILED, returncode={proc.returncode}")
+        logger.error("[etl_index_builder] FAILED rc=%s corpus=%s out_dir=%s", proc.returncode, corpus, out_dir)
         return False
 
-    print("[worker] etl_index_builder OK")
+    logger.info("[etl_index_builder] OK corpus=%s out_dir=%s", corpus, out_dir)
     return True
 
 
@@ -87,23 +85,13 @@ def _segment_dir(org_id: int, shard_id: int, segment_id: int) -> Path:
     return d
 
 
-def _ensure_single_org(docs: List[Document]) -> Optional[int]:
-    if not docs:
-        return None
-    org0 = docs[0].organization_id
-    for d in docs[1:]:
-        if d.organization_id != org0:
-            return None
-    return org0
-
-
 def _load_upload_meta(external_id: str) -> Dict[str, Any]:
     """
     Reads UPLOAD_DIR/<external_id>.meta.json
 
-    Expected keys (after your change):
-      - text_is_normalized: bool        (how file is stored)
-      - index_normalize: bool           (how to build index; default True)
+    We rely on two keys:
+      - text_is_normalized: bool (DEFAULT True for prod)
+      - index_normalize:    bool (DEFAULT False for prod)
     """
     p = UPLOAD_DIR / f"{external_id}.meta.json"
     if not p.exists():
@@ -114,33 +102,62 @@ def _load_upload_meta(external_id: str) -> Dict[str, Any]:
         return {}
 
 
-def _index_normalize_from_meta(meta: Dict[str, Any]) -> bool:
-    """
-    Controls *index-time* normalization.
-    Default: True (normalize during indexing) to preserve old behavior.
-    """
-    v = meta.get("index_normalize", True)
+def _text_is_normalized_from_meta(meta: Dict[str, Any]) -> bool:
+    # In prod: router guarantees normalized text -> True by default.
+    v = meta.get("text_is_normalized", True)
     return bool(v)
 
 
-def _builder_normalized_flag(index_normalize: bool) -> bool:
+def _index_normalize_from_meta(meta: Dict[str, Any]) -> bool:
+    # In prod: internal normalizer OFF -> False by default.
+    v = meta.get("index_normalize", False)
+    return bool(v)
+
+
+def _corpus_record(
+    *,
+    doc_id: int,
+    text: str,
+    text_is_normalized: bool,
+    index_normalize: bool,
+) -> Dict[str, Any]:
     """
-    C++ builder expects field name "normalized" meaning:
-      normalized=True  => text is already normalized; builder will NOT normalize
-      normalized=False => builder WILL normalize via normalize_for_shingles_simple
+    Builder contract:
 
-    So:
-      index_normalize=True  => normalized=False
-      index_normalize=False => normalized=True
+    - Primary key (new): text_is_normalized
+    - Backward compat key: normalized
+
+    Our builder in some versions reads "normalized".
+    Semantics:
+      normalized == text_is_normalized == True  -> builder must NOT normalize
+      normalized == text_is_normalized == False -> builder SHOULD normalize
     """
-    return (not bool(index_normalize))
+    already_norm = bool(text_is_normalized) and (not bool(index_normalize))
+    # If index_normalize=True, we treat the text as not normalized for builder purposes.
+    # In prod we keep index_normalize=False, so already_norm stays True.
+    rec = {
+        "doc_id": str(doc_id),
+        "text": text,
+        # new key
+        "text_is_normalized": bool(already_norm),
+        # legacy key for older builder
+        "normalized": bool(already_norm),
+    }
+    return rec
 
 
-# -------------------------
+# ─────────────────────────────────────────────
 # build L1
-# -------------------------
+# ─────────────────────────────────────────────
 
 async def build_l1_segments() -> int:
+    """
+    Builds Level-1 segments from docs with:
+      status='etl_ok' AND segment_id IS NULL
+
+    Enforces invariant: one (org_id, shard_id) per segment.
+    """
+    # discover (shard_id, org_id) pairs once
     async with AsyncSessionLocal() as session:
         pair_rows = await session.execute(
             select(Document.shard_id, Document.organization_id)
@@ -150,15 +167,19 @@ async def build_l1_segments() -> int:
             )
             .distinct()
         )
-        pairs: List[Tuple[int, int]] = [(int(r[0]), int(r[1])) for r in pair_rows.fetchall()]
-        if not pairs:
-            print("[SEGMENT-L1] Нет документов etl_ok без segment_id — L1-сегменты не нужны")
-            return 0
+        pairs: List[Tuple[int, int]] = [
+            (int(r[0]), int(r[1])) for r in pair_rows.fetchall() if r[1] is not None
+        ]
+
+    if not pairs:
+        logger.info("[SEGMENT-L1] no docs etl_ok without segment_id")
+        return 0
 
     total_docs_processed = 0
 
     for shard_id, org_id in pairs:
         while True:
+            # 1) lock a batch and create segment row
             async with AsyncSessionLocal() as session:
                 docs = await _select_docs_for_l1_locked(
                     session=session,
@@ -169,22 +190,7 @@ async def build_l1_segments() -> int:
                 if not docs:
                     break
 
-                if _ensure_single_org(docs) is None:
-                    await log_index_error(
-                        session,
-                        stage="build_l1",
-                        message="mixed organization_id in locked docs batch; abort batch",
-                        payload={
-                            "shard_id": shard_id,
-                            "org_ids": sorted({d.organization_id for d in docs}),
-                            "doc_ids": [d.id for d in docs],
-                        },
-                    )
-                    await session.commit()
-                    continue
-
                 now = utcnow()
-
                 segment = Segment(
                     organization_id=org_id,
                     shard_id=shard_id,
@@ -204,9 +210,9 @@ async def build_l1_segments() -> int:
                 seg_dir = _segment_dir(org_id, shard_id, segment.id)
                 segment.path = f"org_{org_id}/shard_{shard_id}/segment_{segment.id}"
 
-                print(
-                    f"[SEGMENT-L1] shard={shard_id}, org={org_id}: строю L1 id={segment.id}, "
-                    f"docs(batch)={len(docs)}, dir={seg_dir}"
+                logger.info(
+                    "[SEGMENT-L1] building segment_id=%s org=%s shard=%s docs=%s dir=%s",
+                    segment.id, org_id, shard_id, len(docs), seg_dir
                 )
 
                 seg_corpus_path = seg_dir / "segment_corpus.jsonl"
@@ -215,6 +221,13 @@ async def build_l1_segments() -> int:
                 with seg_corpus_path.open("w", encoding="utf-8") as f:
                     for doc in docs:
                         if not doc.external_id:
+                            await log_index_error(
+                                session,
+                                stage="build_l1",
+                                message="doc has no external_id",
+                                doc_id=doc.id,
+                                segment_id=segment.id,
+                            )
                             continue
 
                         file_path = UPLOAD_DIR / doc.external_id
@@ -224,13 +237,14 @@ async def build_l1_segments() -> int:
                                 stage="build_l1",
                                 message="file missing",
                                 doc_id=doc.id,
+                                segment_id=segment.id,
                                 payload={"file": str(file_path)},
                             )
                             continue
 
                         meta = _load_upload_meta(doc.external_id)
+                        text_is_normalized = _text_is_normalized_from_meta(meta)
                         index_normalize = _index_normalize_from_meta(meta)
-                        normalized_for_builder = _builder_normalized_flag(index_normalize)
 
                         try:
                             raw_bytes = file_path.read_bytes()
@@ -244,17 +258,17 @@ async def build_l1_segments() -> int:
                                 stage="build_l1",
                                 message=f"extract/read failed: {e}",
                                 doc_id=doc.id,
+                                segment_id=segment.id,
                                 payload={"file": str(file_path)},
                             )
                             continue
 
-                        # IMPORTANT:
-                        #   "normalized" here means "already normalized" for C++ builder.
-                        rec = {
-                            "doc_id": str(doc.id),
-                            "text": raw_text,
-                            "normalized": bool(normalized_for_builder),
-                        }
+                        rec = _corpus_record(
+                            doc_id=doc.id,
+                            text=raw_text,
+                            text_is_normalized=text_is_normalized,
+                            index_normalize=index_normalize,
+                        )
                         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                         indexed_doc_ids.add(doc.id)
 
@@ -264,15 +278,16 @@ async def build_l1_segments() -> int:
                     await log_index_error(
                         session,
                         stage="build_l1",
-                        message="segment_corpus.jsonl is empty (no indexable docs)",
+                        message="segment_corpus.jsonl empty (no indexable docs)",
                         segment_id=segment.id,
-                        payload={"shard_id": shard_id, "organization_id": org_id},
+                        payload={"org_id": org_id, "shard_id": shard_id},
                     )
                     await session.commit()
                     continue
 
                 await session.commit()
 
+            # 2) run builder out of transaction
             ok = await _run_etl_index_builder(seg_corpus_path, seg_dir)
             if not ok:
                 async with AsyncSessionLocal() as session:
@@ -289,6 +304,7 @@ async def build_l1_segments() -> int:
                         await session.commit()
                 continue
 
+            # 3) finalize: mark docs indexed, create SegmentDoc rows
             async with AsyncSessionLocal() as session:
                 seg = await session.get(Segment, segment.id)
                 if not seg:
@@ -315,61 +331,66 @@ async def build_l1_segments() -> int:
                     if p.exists():
                         size_bytes += p.stat().st_size
 
-                real_docs = await session.execute(
-                    select(Document).where(Document.id.in_(list(indexed_doc_ids)))
-                )
-                real_docs_list: List[Document] = list(real_docs.scalars())
+                res_docs = await session.execute(select(Document).where(Document.id.in_(list(indexed_doc_ids))))
+                real_docs_list: List[Document] = list(res_docs.scalars())
 
-                for d in real_docs_list:
-                    if d.organization_id != org_id:
-                        seg.status = "error"
-                        await log_index_error(
-                            session,
-                            stage="build_l1",
-                            message="org invariant violated in finalization; abort",
-                            segment_id=seg.id,
-                            doc_id=d.id,
-                            payload={"expected_org_id": org_id, "doc_org_id": d.organization_id, "shard_id": shard_id},
-                        )
-                        await session.commit()
-                        break
-                else:
-                    for doc in real_docs_list:
-                        doc.segment_id = seg.id
-                        doc.status = "indexed"
-                        doc.updated_at = utcnow()
-                        session.add(
-                            SegmentDoc(
-                                segment_id=seg.id,
-                                document_id=doc.id,
-                                shard_id=doc.shard_id,
-                                organization_id=doc.organization_id,
-                            )
-                        )
-
-                    seg.size_bytes = size_bytes
-                    seg.doc_count = len(real_docs_list)
-                    seg.status = "ready"
-                    await session.commit()
-
-                    print(
-                        f"[SEGMENT-L1] Готов L1 id={seg.id}, shard={shard_id}, org={org_id}, "
-                        f"docs={len(real_docs_list)}, bytes={size_bytes}"
+                # invariant check: single org
+                bad = [d.id for d in real_docs_list if d.organization_id != org_id]
+                if bad:
+                    seg.status = "error"
+                    await log_index_error(
+                        session,
+                        stage="build_l1",
+                        message="org invariant violated in finalization",
+                        segment_id=seg.id,
+                        payload={"expected_org_id": org_id, "bad_doc_ids": bad, "shard_id": shard_id},
                     )
-                    total_docs_processed += len(real_docs_list)
+                    await session.commit()
+                    continue
+
+                now2 = utcnow()
+                for doc in real_docs_list:
+                    doc.segment_id = seg.id
+                    doc.status = "indexed"
+                    doc.updated_at = now2
+                    session.add(
+                        SegmentDoc(
+                            segment_id=seg.id,
+                            document_id=doc.id,
+                            shard_id=doc.shard_id,
+                            organization_id=doc.organization_id,
+                        )
+                    )
+
+                seg.size_bytes = int(size_bytes)
+                seg.doc_count = int(len(real_docs_list))
+                seg.status = "ready"
+                await session.commit()
+
+                logger.info(
+                    "[SEGMENT-L1] ready segment_id=%s org=%s shard=%s docs=%s bytes=%s",
+                    seg.id, org_id, shard_id, len(real_docs_list), size_bytes
+                )
+                total_docs_processed += len(real_docs_list)
 
     return total_docs_processed
 
 
-# -------------------------
+# ─────────────────────────────────────────────
 # compact (L1->L2->L3->L4)
-# -------------------------
+# ─────────────────────────────────────────────
 
 async def compact_segments_level(from_level: int) -> int:
+    """
+    Compacts segments per (org_id, shard_id):
+      from_level -> to_level (from_level+1)
+
+    Strict mode:
+      if ANY doc in compaction batch cannot be read/extracted -> new segment is error
+      and compaction batch is NOT promoted.
+    """
     to_level = from_level + 1
     per_compact = cfg_segments_per_compact(from_level)
-
-    total_docs_promoted = 0
 
     async with AsyncSessionLocal() as session:
         pair_rows = await session.execute(
@@ -378,14 +399,19 @@ async def compact_segments_level(from_level: int) -> int:
             .group_by(Segment.organization_id, Segment.shard_id)
             .having(func.count(Segment.id) >= per_compact)
         )
-        pairs: List[Tuple[int, int]] = [(int(r[0]), int(r[1])) for r in pair_rows.fetchall() if r[0] is not None]
+        pairs: List[Tuple[int, int]] = [
+            (int(r[0]), int(r[1])) for r in pair_rows.fetchall() if r[0] is not None
+        ]
 
     if not pairs:
-        print(f"[COMPACT L{from_level}->L{to_level}] нет пар (org, shard) с >= {per_compact} сегментов")
+        logger.info("[COMPACT L%s->L%s] no (org, shard) with >=%s segments", from_level, to_level, per_compact)
         return 0
+
+    total_docs_promoted = 0
 
     for org_id, shard_id in pairs:
         while True:
+            # 1) lock batch segments + docs
             async with AsyncSessionLocal() as session:
                 seg_rows = await session.execute(
                     select(Segment)
@@ -403,7 +429,7 @@ async def compact_segments_level(from_level: int) -> int:
                 if len(batch_segments) < per_compact:
                     break
 
-                seg_ids = [s.id for s in batch_segments]
+                seg_ids = [int(s.id) for s in batch_segments]
 
                 doc_rows = await session.execute(
                     select(Document)
@@ -424,7 +450,6 @@ async def compact_segments_level(from_level: int) -> int:
                     continue
 
                 now = utcnow()
-
                 new_segment = Segment(
                     organization_id=org_id,
                     shard_id=shard_id,
@@ -443,6 +468,11 @@ async def compact_segments_level(from_level: int) -> int:
 
                 seg_dir = _segment_dir(org_id, shard_id, new_segment.id)
                 new_segment.path = f"org_{org_id}/shard_{shard_id}/segment_{new_segment.id}"
+
+                logger.info(
+                    "[COMPACT L%s->L%s] building segment_id=%s org=%s shard=%s from_segments=%s docs=%s",
+                    from_level, to_level, new_segment.id, org_id, shard_id, seg_ids, len(docs)
+                )
 
                 seg_corpus_path = seg_dir / "segment_corpus.jsonl"
                 indexed_doc_ids: List[int] = []
@@ -475,8 +505,8 @@ async def compact_segments_level(from_level: int) -> int:
                             break
 
                         meta = _load_upload_meta(doc.external_id)
+                        text_is_normalized = _text_is_normalized_from_meta(meta)
                         index_normalize = _index_normalize_from_meta(meta)
-                        normalized_for_builder = _builder_normalized_flag(index_normalize)
 
                         try:
                             raw_bytes = file_path.read_bytes()
@@ -496,18 +526,14 @@ async def compact_segments_level(from_level: int) -> int:
                             )
                             break
 
-                        f.write(
-                            json.dumps(
-                                {
-                                    "doc_id": str(doc.id),
-                                    "text": raw_text,
-                                    "normalized": bool(normalized_for_builder),
-                                },
-                                ensure_ascii=False,
-                            )
-                            + "\n"
+                        rec = _corpus_record(
+                            doc_id=doc.id,
+                            text=raw_text,
+                            text_is_normalized=text_is_normalized,
+                            index_normalize=index_normalize,
                         )
-                        indexed_doc_ids.append(doc.id)
+                        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                        indexed_doc_ids.append(int(doc.id))
 
                 if failed or len(indexed_doc_ids) != len(docs):
                     new_segment.status = "error"
@@ -529,6 +555,7 @@ async def compact_segments_level(from_level: int) -> int:
 
                 await session.commit()
 
+            # 2) run builder out of transaction
             ok = await _run_etl_index_builder(seg_corpus_path, seg_dir)
             if not ok:
                 async with AsyncSessionLocal() as session:
@@ -545,6 +572,7 @@ async def compact_segments_level(from_level: int) -> int:
                         await session.commit()
                 continue
 
+            # 3) finalize promotion
             async with AsyncSessionLocal() as session:
                 seg = await session.get(Segment, new_segment.id)
                 if not seg:
@@ -574,10 +602,11 @@ async def compact_segments_level(from_level: int) -> int:
                 res_docs = await session.execute(select(Document).where(Document.id.in_(indexed_doc_ids)))
                 docs2: List[Document] = list(res_docs.scalars())
 
+                now2 = utcnow()
                 for doc in docs2:
                     doc.segment_id = seg.id
                     doc.status = "indexed"
-                    doc.updated_at = utcnow()
+                    doc.updated_at = now2
 
                 await session.execute(
                     delete(SegmentDoc).where(
@@ -600,17 +629,17 @@ async def compact_segments_level(from_level: int) -> int:
                 old_segs: List[Segment] = list(res_old.scalars())
                 for s in old_segs:
                     s.status = "merged"
-                    s.last_compacted_at = utcnow()
+                    s.last_compacted_at = now2
 
-                seg.size_bytes = size_bytes
-                seg.doc_count = len(docs2)
+                seg.size_bytes = int(size_bytes)
+                seg.doc_count = int(len(docs2))
                 seg.status = "ready"
 
                 await session.commit()
 
-                print(
-                    f"[COMPACT L{from_level}->L{to_level}] org={org_id} shard={shard_id}: "
-                    f"готов segment id={seg.id}, docs={len(docs2)}, bytes={size_bytes}, merged_segments={seg_ids}"
+                logger.info(
+                    "[COMPACT L%s->L%s] ready segment_id=%s org=%s shard=%s docs=%s bytes=%s merged=%s",
+                    from_level, to_level, seg.id, org_id, shard_id, len(docs2), size_bytes, seg_ids
                 )
                 total_docs_promoted += len(docs2)
 
