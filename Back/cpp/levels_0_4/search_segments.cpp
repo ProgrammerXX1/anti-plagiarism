@@ -1,11 +1,4 @@
-// cpp/common/search_segments.cpp
-// FIXES (thread-safe cache):
-//  - bounded LRU cache
-//  - per-dir loading coordination: one loader, others wait
-//  - publish engine to cache ONLY after successful load
-//
-// Works with thread_local SearchEngine::search_text.
-
+// cpp/levels_0_4/search_segments.cpp
 #include "search_segments.h"
 #include "search_engine.h"
 
@@ -23,12 +16,14 @@
 
 #include <nlohmann/json.hpp>
 
+#include "text_common.h"
+
 using json = nlohmann::json;
 
 namespace {
 
 // ------------------------
-// LRU cache entries
+// LRU cache + per-dir load wait
 // ------------------------
 
 struct CacheEntry {
@@ -36,14 +31,11 @@ struct CacheEntry {
     std::list<std::string>::iterator lru_it;
 };
 
-// global cache
 static std::mutex g_mx;
 static std::unordered_map<std::string, CacheEntry> g_cache;
-static std::list<std::string> g_lru; // front=MRU, back=LRU
+static std::list<std::string> g_lru;
 
-// loading coordination per dir
 struct LoadingState {
-    bool loading = false;
     bool done = false;
     bool ok = false;
     std::shared_ptr<const SearchEngine> eng;
@@ -75,12 +67,8 @@ static void evict_if_needed_locked() {
     }
 }
 
-// ------------------------
-// index loader with wait
-// ------------------------
-
 static std::shared_ptr<const SearchEngine> get_or_load(const std::string& dir) {
-    // 1) cache fast path
+    // cache hit
     {
         std::lock_guard<std::mutex> lk(g_mx);
         auto it = g_cache.find(dir);
@@ -90,8 +78,7 @@ static std::shared_ptr<const SearchEngine> get_or_load(const std::string& dir) {
         }
     }
 
-    // 2) loading coordination:
-    // if someone is loading, wait; else become the loader
+    // per-dir loading coordination
     std::shared_ptr<LoadingState> st;
     bool i_am_loader = false;
 
@@ -100,46 +87,35 @@ static std::shared_ptr<const SearchEngine> get_or_load(const std::string& dir) {
         auto itL = g_loading.find(dir);
         if (itL == g_loading.end()) {
             st = std::make_shared<LoadingState>();
-            st->loading = true;
-            st->done = false;
-            st->ok = false;
             g_loading.emplace(dir, st);
             i_am_loader = true;
         } else {
             st = itL->second;
-            // if already done, just return result (should be rare)
-            if (st->done) return st->ok ? st->eng : std::shared_ptr<const SearchEngine>{};
         }
+
         if (!i_am_loader) {
             st->cv.wait(lk, [&]() { return st->done; });
             return st->ok ? st->eng : std::shared_ptr<const SearchEngine>{};
         }
     }
 
-    // 3) actual load outside lock
+    // load outside lock
     std::shared_ptr<const SearchEngine> eng;
     {
         auto e = std::make_shared<SearchEngine>();
-        if (e->load(dir)) {
-            eng = e;
-        } else {
-            eng.reset();
-        }
+        if (e->load(dir)) eng = e;
+        else eng.reset();
     }
 
-    // 4) publish result + fill cache + notify waiters
+    // publish
     {
         std::unique_lock<std::mutex> lk(g_mx);
 
-        // set loading state result
         st->eng = eng;
         st->ok = (bool)eng;
-        st->loading = false;
         st->done = true;
 
-        // if loaded ok, insert into LRU cache
         if (eng) {
-            // another thread might have inserted while we loaded (rare but possible)
             auto it = g_cache.find(dir);
             if (it == g_cache.end()) {
                 g_lru.push_front(dir);
@@ -150,22 +126,19 @@ static std::shared_ptr<const SearchEngine> get_or_load(const std::string& dir) {
                 evict_if_needed_locked();
             } else {
                 touch_lru_locked(dir, it->second);
-                // prefer existing entry to avoid churn
                 eng = it->second.eng;
                 st->eng = eng;
             }
         }
 
-        // remove loading state entry (optional)
         g_loading.erase(dir);
-
         st->cv.notify_all();
         return eng;
     }
 }
 
 // ------------------------
-// json malloc helpers
+// JSON malloc helpers
 // ------------------------
 
 static char* malloc_json(const json& j) {
@@ -208,6 +181,11 @@ struct OutHit {
 };
 
 } // namespace
+
+
+// ─────────────────────────────────────────────
+// Search API
+// ─────────────────────────────────────────────
 
 extern "C" char* seg_search_many_json_v3(
     const char* query_utf8,
@@ -264,12 +242,8 @@ extern "C" char* seg_search_many_json_v3(
                 oh.cand_hits = tmp[k].cand_hits;
                 oh.index_dir = dir;
 
-                if ((std::size_t)k < tmp_spans.size()) {
-                    oh.spans = std::move(tmp_spans[(std::size_t)k]);
-                }
-                if (want_matches && (std::size_t)k < tmp_matches.size()) {
-                    oh.matches = std::move(tmp_matches[(std::size_t)k]);
-                }
+                if ((std::size_t)k < tmp_spans.size()) oh.spans = std::move(tmp_spans[(std::size_t)k]);
+                if (want_matches && (std::size_t)k < tmp_matches.size()) oh.matches = std::move(tmp_matches[(std::size_t)k]);
 
                 all.push_back(std::move(oh));
             }
@@ -295,6 +269,7 @@ extern "C" char* seg_search_many_json_v3(
             x["cand_hits"] = h.cand_hits;
             x["index_dir"] = h.index_dir;
 
+            // spans WITHOUT delta
             json sp = json::array();
             for (const auto& s : h.spans) {
                 json z;
@@ -348,8 +323,118 @@ extern "C" char* seg_search_many_json(
     return seg_search_many_json_v2(query_utf8, top_k, index_dirs_utf8, n_dirs, 1);
 }
 
-// excerpt + normalize endpoints + seg_free остаются как у тебя в текущем search_segments.cpp
-// (их можно оставить без изменений, они не держат shared state)
+
+// ─────────────────────────────────────────────
+// Excerpt API (REQUIRED BY PYTHON): seg_excerpt_for_span_json_v2
+// d_from/d_to are SHINGLE indexes. Convert to token window: [d_from .. d_to+k-1].
+// ─────────────────────────────────────────────
+
+extern "C" char* seg_excerpt_for_span_json_v2(
+    const char* text_utf8,
+    int d_from,
+    int d_to,
+    int k_shingle,
+    int max_chars,
+    int normalize_text
+) {
+    try {
+        json j;
+        j["ok"] = false;
+        j["excerpt"] = "";
+        j["char_from"] = 0;
+        j["char_to"] = 0;
+        j["tok_from"] = nullptr;
+        j["tok_to"] = nullptr;
+        j["k"] = k_shingle;
+        j["norm_len"] = 0;
+
+        if (!text_utf8 || k_shingle <= 0) return malloc_json(j);
+        if (d_from < 0 || d_to < d_from) return malloc_json(j);
+
+        std::string norm;
+        if (normalize_text != 0) norm = normalize_for_shingles_simple(std::string(text_utf8));
+        else norm = std::string(text_utf8);
+
+        j["norm_len"] = (int)norm.size();
+
+        std::vector<TokenSpan> spans;
+        spans.reserve(256);
+        tokenize_spans(norm, spans);
+        if (spans.empty()) return malloc_json(j);
+
+        const int tok_from = d_from;
+        const int tok_to_raw = d_to + (k_shingle - 1);
+
+        if (tok_from < 0 || tok_from >= (int)spans.size()) return malloc_json(j);
+        if (tok_to_raw < 0) return malloc_json(j);
+
+        const int tok_to = std::min(tok_to_raw, (int)spans.size() - 1);
+
+        int char_from = (int)spans[(std::size_t)tok_from].off;
+        int char_to   = (int)(spans[(std::size_t)tok_to].off + spans[(std::size_t)tok_to].len);
+
+        if (char_from < 0) char_from = 0;
+        if (char_to < char_from) char_to = char_from;
+        if (char_to > (int)norm.size()) char_to = (int)norm.size();
+
+        if (max_chars > 0) {
+            int want = char_to - char_from;
+            if (want > max_chars) {
+                char_to = char_from + max_chars;
+                if (char_to > (int)norm.size()) char_to = (int)norm.size();
+            }
+        }
+
+        std::string excerpt = norm.substr((std::size_t)char_from, (std::size_t)(char_to - char_from));
+
+        j["ok"] = true;
+        j["excerpt"] = excerpt;
+        j["char_from"] = char_from;
+        j["char_to"] = char_to;
+        j["tok_from"] = tok_from;
+        j["tok_to"] = tok_to;
+        j["k"] = k_shingle;
+
+        return malloc_json(j);
+    } catch (...) {
+        return mk_error("seg_excerpt_for_span_json_v2_exception");
+    }
+}
+
+extern "C" char* seg_excerpt_for_span_json(
+    const char* text_utf8,
+    int d_from,
+    int d_to,
+    int k_shingle,
+    int max_chars
+) {
+    return seg_excerpt_for_span_json_v2(text_utf8, d_from, d_to, k_shingle, max_chars, 1);
+}
+
+
+// ─────────────────────────────────────────────
+// Normalize API
+// ─────────────────────────────────────────────
+
+extern "C" char* seg_normalize_json_v1(const char* text_utf8) {
+    try {
+        json j;
+        j["ok"] = false;
+        j["text"] = "";
+        j["norm_len"] = 0;
+
+        if (!text_utf8) return malloc_json(j);
+
+        std::string norm = normalize_for_shingles_simple(std::string(text_utf8));
+        j["ok"] = true;
+        j["text"] = norm;
+        j["norm_len"] = (int)norm.size();
+
+        return malloc_json(j);
+    } catch (...) {
+        return mk_error("seg_normalize_json_v1_exception");
+    }
+}
 
 extern "C" void seg_free(void* p) {
     std::free(p);

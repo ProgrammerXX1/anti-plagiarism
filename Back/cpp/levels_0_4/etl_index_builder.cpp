@@ -70,8 +70,6 @@ static bool get_text_is_normalized(const simdjson::dom::element& doc) {
 
 static bool atomic_replace_file(const fs::path& tmp, const fs::path& fin) {
     try {
-        // POSIX rename is atomic. std::filesystem::rename may fail if dest exists on some platforms.
-        // We do: remove(dest) then rename(tmp, dest). (dest removal is not atomic, but final rename is.)
         std::error_code ec;
         fs::remove(fin, ec); // best-effort
         fs::rename(tmp, fin);
@@ -276,14 +274,13 @@ int main(int argc, char** argv) {
     const std::uint64_t N_post9  = (std::uint64_t)postings9.size();
     const std::uint64_t N_post13 = 0;
 
-    // ---- write tmp files ----
-    const fs::path bin_fin   = out_dir / "index_native.bin";
-    const fs::path doc_fin   = out_dir / "index_native_docids.json";
-    const fs::path meta_fin  = out_dir / "index_native_meta.json";
+    const fs::path bin_fin  = out_dir / "index_native.bin";
+    const fs::path doc_fin  = out_dir / "index_native_docids.json";
+    const fs::path meta_fin = out_dir / "index_native_meta.json";
 
-    const fs::path bin_tmp   = out_dir / "index_native.bin.tmp";
-    const fs::path doc_tmp   = out_dir / "index_native_docids.json.tmp";
-    const fs::path meta_tmp  = out_dir / "index_native_meta.json.tmp";
+    const fs::path bin_tmp  = out_dir / "index_native.bin.tmp";
+    const fs::path doc_tmp  = out_dir / "index_native_docids.json.tmp";
+    const fs::path meta_tmp = out_dir / "index_native_meta.json.tmp";
 
     // binary tmp
     {
@@ -295,17 +292,19 @@ int main(int argc, char** argv) {
 
         const char magic[4] = {'P','L','A','G'};
         bout.write(magic, 4);
+
         std::uint32_t version = 2;
-        bout.write(reinterpret_cast<char*>(&version), sizeof(version));
-        bout.write(reinterpret_cast<char*>(&N_docs), sizeof(N_docs));
-        bout.write(reinterpret_cast<char*>(&N_post9), sizeof(N_post9));
-        bout.write(reinterpret_cast<char*>(&N_post13), sizeof(N_post13));
+        bout.write(reinterpret_cast<const char*>(&version), sizeof(version));
+        bout.write(reinterpret_cast<const char*>(&N_docs), sizeof(N_docs));
+        bout.write(reinterpret_cast<const char*>(&N_post9), sizeof(N_post9));
+        bout.write(reinterpret_cast<const char*>(&N_post13), sizeof(N_post13));
 
         for (const auto& dm : docs) {
             bout.write(reinterpret_cast<const char*>(&dm.tok_len), sizeof(dm.tok_len));
             bout.write(reinterpret_cast<const char*>(&dm.simhash_hi), sizeof(dm.simhash_hi));
             bout.write(reinterpret_cast<const char*>(&dm.simhash_lo), sizeof(dm.simhash_lo));
         }
+
         for (const auto& p : postings9) {
             bout.write(reinterpret_cast<const char*>(&p.h), sizeof(p.h));
             bout.write(reinterpret_cast<const char*>(&p.did), sizeof(p.did));
@@ -344,7 +343,8 @@ int main(int argc, char** argv) {
             {"span_gap", 0},
             {"max_spans_per_doc", 10},
             {"w_min_doc", 8},
-            {"w_min_query", 9}
+            {"w_min_query", 9},
+            {"alpha", 0.60}
         };
 
         std::ofstream mout(meta_tmp, std::ios::binary);
@@ -360,9 +360,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ---- atomic replace ----
-    if (!atomic_replace_file(bin_tmp, bin_fin))  return 1;
-    if (!atomic_replace_file(doc_tmp, doc_fin))  return 1;
+    if (!atomic_replace_file(bin_tmp, bin_fin)) return 1;
+    if (!atomic_replace_file(doc_tmp, doc_fin)) return 1;
     if (!atomic_replace_file(meta_tmp, meta_fin)) return 1;
 
     std::cout << "[etl_index_builder] built v2 index docs=" << N_docs
