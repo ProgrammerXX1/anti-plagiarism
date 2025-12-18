@@ -15,7 +15,7 @@ from app.db.session import get_db
 from app.models.document import Document
 from app.services.levels_0_4.search_service import search_levels_1_4
 
-router = APIRouter(prefix="/api/prod/v1", tags=["prod_v1"])
+router = APIRouter(prefix="/app", tags=["Worker-Prod"])
 
 
 def utcnow() -> datetime:
@@ -24,7 +24,10 @@ def utcnow() -> datetime:
 
 def _validate_org_id(organization_id: int) -> None:
     if organization_id is None or int(organization_id) <= 0:
-        raise HTTPException(status_code=422, detail="organization_id must be a positive integer")
+        raise HTTPException(
+            status_code=422,
+            detail="organization_id must be a positive integer",
+        )
 
 
 def compute_shard_id(organization_id: int) -> int:
@@ -38,11 +41,6 @@ def compute_shard_id(organization_id: int) -> int:
 
 
 def _cleanup_search_result(search: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    External API:
-      - remove internal fields
-      - expose J/C (j9/c9)
-    """
     hits = search.get("hits") or []
     cleaned = []
 
@@ -62,11 +60,14 @@ def _cleanup_search_result(search: Dict[str, Any]) -> Dict[str, Any]:
     return {"count": int(len(cleaned)), "hits": cleaned}
 
 
+# ─────────────────────────────────────────────
+# API models
+# ─────────────────────────────────────────────
+
 class ProdV1IngestRequest(BaseModel):
     document_id: str
     title: str
     author: Optional[str] = None
-    document_type: Optional[str] = None
     created_at: Optional[str] = None
 
     text: str
@@ -77,12 +78,6 @@ class ProdV1IngestRequest(BaseModel):
 
     do_index: bool = False
     do_search: bool = True
-
-    # single knob (user choice)
-    index_normalize: bool = True
-
-    # search-side normalization toggle (still exposed, but beware mixed-mode indices)
-    normalize_query: bool = True
 
 
 class ProdV1IngestResponse(BaseModel):
@@ -95,6 +90,10 @@ class ProdV1IngestResponse(BaseModel):
     indexed: bool
     search: Optional[Dict[str, Any]] = None
 
+
+# ─────────────────────────────────────────────
+# Endpoint
+# ─────────────────────────────────────────────
 
 @router.post("/ingest", response_model=ProdV1IngestResponse)
 async def prod_v1_ingest(
@@ -112,20 +111,21 @@ async def prod_v1_ingest(
     now = utcnow()
     shard_id = compute_shard_id(req.organization_id)
 
-    # SEARCH-ONLY: do not store anything
+    # ── SEARCH ONLY ────────────────────────────
     if req.do_search and not req.do_index:
         raw = await search_levels_1_4(
             db,
             organization_id=req.organization_id,
             shard_id=shard_id,
-            query=req.text,
-            normalize_query=req.normalize_query,
+            query=req.text,   # уже нормализован
         )
         search_result = _cleanup_search_result(raw)
 
         logger.info(
             "[prod_v1] search-only doc=%s org=%s shard=%s",
-            req.document_id, req.organization_id, shard_id
+            req.document_id,
+            req.organization_id,
+            shard_id,
         )
 
         return ProdV1IngestResponse(
@@ -137,13 +137,12 @@ async def prod_v1_ingest(
             search=search_result,
         )
 
-    # INDEX (and optionally search): store file + Document(uploaded)
+    # ── INDEX ─────────────────────────────────
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     external_id = (
         f"org_{req.organization_id}_"
         f"doc_{req.document_id}_"
-        f"normindex{int(req.index_normalize)}_"
         f"{int(now.timestamp())}_{uuid.uuid4().hex}.txt"
     )
 
@@ -154,11 +153,9 @@ async def prod_v1_ingest(
         "document_id": req.document_id,
         "title": req.title,
         "author": req.author,
-        "document_type": req.document_type,
         "source_created_at": req.created_at,
         "file_name": req.file_name,
         "enable_ocr": req.enable_ocr,
-        "index_normalize": bool(req.index_normalize),
         "saved_at": now.isoformat(),
     }
     (UPLOAD_DIR / f"{external_id}.meta.json").write_text(
@@ -186,8 +183,7 @@ async def prod_v1_ingest(
             db,
             organization_id=req.organization_id,
             shard_id=shard_id,
-            query=req.text,
-            normalize_query=req.normalize_query,
+            query=req.text,   # уже нормализован
         )
         search_result = _cleanup_search_result(raw)
 
@@ -195,8 +191,11 @@ async def prod_v1_ingest(
         await db.commit()
 
     logger.info(
-        "[prod_v1] indexed doc=%s internal=%s org=%s shard=%s index_normalize=%s",
-        req.document_id, doc.id, req.organization_id, shard_id, int(req.index_normalize)
+        "[prod_v1] indexed doc=%s internal=%s org=%s shard=%s",
+        req.document_id,
+        doc.id,
+        req.organization_id,
+        shard_id,
     )
 
     return ProdV1IngestResponse(

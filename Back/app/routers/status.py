@@ -23,7 +23,7 @@ from app.core.config import (
 )
 from app.schemas.level5 import Level5BaseInfo
 
-router = APIRouter(tags=["Admin-levels"])
+router = APIRouter(tags=["Status Loader"])
 
 
 class LevelSegmentItem(BaseModel):
@@ -140,16 +140,16 @@ def _iter_l5_bases() -> List[Level5BaseInfo]:
     return bases
 
 
-@router.get("/levels/config", response_model=LevelsConfigResponse)
-async def get_levels_config() -> LevelsConfigResponse:
-    return LevelsConfigResponse(
-        etl_batch_size=ETL_BATCH_SIZE,
-        docs_per_l1_segment=DOCS_PER_L1_SEGMENT,
-        max_auto_level=MAX_AUTO_LEVEL,
-        segments_per_l2_compact=SEGMENTS_PER_L2_COMPACT,
-        segments_per_l3_compact=SEGMENTS_PER_L3_COMPACT,
-        segments_per_l4_compact=SEGMENTS_PER_L4_COMPACT,
-    )
+# @router.get("/levels/config", response_model=LevelsConfigResponse)
+# async def get_levels_config() -> LevelsConfigResponse:
+#     return LevelsConfigResponse(
+#         etl_batch_size=ETL_BATCH_SIZE,
+#         docs_per_l1_segment=DOCS_PER_L1_SEGMENT,
+#         max_auto_level=MAX_AUTO_LEVEL,
+#         segments_per_l2_compact=SEGMENTS_PER_L2_COMPACT,
+#         segments_per_l3_compact=SEGMENTS_PER_L3_COMPACT,
+#         segments_per_l4_compact=SEGMENTS_PER_L4_COMPACT,
+#     )
 
 
 @router.get("/levels/status", response_model=LevelsStatusResponse)

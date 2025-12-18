@@ -19,8 +19,8 @@ from app.models.segment import Segment
 from app.models.segment_doc import SegmentDoc
 
 router = APIRouter(
-    prefix="/api/admin",
-    tags=["Admin levels"],
+    prefix="/admin",
+    tags=["Controller"],
 )
 
 
