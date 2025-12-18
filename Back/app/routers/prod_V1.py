@@ -41,6 +41,13 @@ def compute_shard_id(organization_id: int) -> int:
 
 
 def _cleanup_search_result(search: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    IMPORTANT:
+      - search_service.py now sets per-hit:
+          C      = marginal coverage contribution (summable to ~1.0)
+          C_doc  = original engine c9 (doc-level coverage)
+      - We must NOT overwrite C with c9 here.
+    """
     hits = search.get("hits") or []
     cleaned = []
 
@@ -52,30 +59,17 @@ def _cleanup_search_result(search: Dict[str, Any]) -> Dict[str, Any]:
                 "doc_id": str(h.get("doc_id", "")),
                 "score": float(h.get("score", 0.0)),
                 "J": float(h.get("j9", 0.0)),
-                "C": float(h.get("c9", 0.0)),
+                # NEW: marginal C (summable)
+                "C": float(h.get("C", 0.0) or 0.0),
+                # keep original doc-level C for debugging/insight
+                "C_doc": float(h.get("C_doc", h.get("c9", 0.0)) or 0.0),
                 "cand_hits": int(h.get("cand_hits", 0) or 0),
                 "segment_level": int(h.get("segment_level", 0) or 0),
                 "match_spans": h.get("match_spans") or [],
             }
         )
 
-    # Никаких q_shingles/per_dir/dirs_* и т.п. наружу не выдаём
     return {"count": int(len(cleaned)), "hits": cleaned}
-
-
-
-def _write_text_atomic(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
-
-
-def _write_json_atomic(path: Path, obj: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
 
 
 class ProdV1IngestRequest(BaseModel):
@@ -106,6 +100,20 @@ class ProdV1IngestResponse(BaseModel):
     search: Optional[Dict[str, Any]] = None
 
 
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _write_json_atomic(path: Path, obj: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 @router.post("/ingest", response_model=ProdV1IngestResponse)
 async def prod_v1_ingest(
     req: ProdV1IngestRequest,
@@ -134,12 +142,10 @@ async def prod_v1_ingest(
         search_result = _cleanup_search_result(raw)
 
         logger.info(
-            "[prod_v1] search-only ext_doc=%s org=%s shard=%s count=%s dirs_with_hits=%s",
+            "[prod_v1] search-only ext_doc=%s org=%s shard=%s",
             req.document_id,
             req.organization_id,
             shard_id,
-            search_result.get("count"),
-            search_result.get("dirs_with_hits"),
         )
 
         return ProdV1IngestResponse(
@@ -229,13 +235,11 @@ async def prod_v1_ingest(
             await db.commit()
 
     logger.info(
-        "[prod_v1] indexed ext_doc=%s internal_id=%s org=%s shard=%s count=%s dirs_with_hits=%s",
+        "[prod_v1] indexed ext_doc=%s internal_id=%s org=%s shard=%s",
         req.document_id,
         getattr(doc, "id", None),
         req.organization_id,
         shard_id,
-        (search_result or {}).get("count") if req.do_search else None,
-        (search_result or {}).get("dirs_with_hits") if req.do_search else None,
     )
 
     return ProdV1IngestResponse(

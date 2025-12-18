@@ -22,6 +22,9 @@ using json = nlohmann::json;
 
 namespace {
 
+constexpr int K = 9;
+constexpr int MIN_SPAN_LEN_SHINGLES = 6;
+
 // ------------------------
 // LRU cache + per-dir load wait
 // ------------------------
@@ -184,10 +187,6 @@ struct OutHit {
     std::vector<MatchSpan> spans;
 };
 
-// ------------------------
-// diversified merge across dirs
-// ------------------------
-
 static bool env_bool(const char* key, bool defv) {
     const char* s = std::getenv(key);
     if (!s || !*s) return defv;
@@ -198,21 +197,16 @@ static bool env_bool(const char* key, bool defv) {
     return defv;
 }
 
-static std::vector<OutHit> diversified_topk(
-    const std::vector<OutHit>& all,
-    int top_k
-) {
+static std::vector<OutHit> diversified_topk(const std::vector<OutHit>& all, int top_k) {
     if (top_k <= 0 || all.empty()) return {};
     if ((int)all.size() <= top_k) return all;
 
-    // group by dir -> indices in `all`
     std::unordered_map<std::string, std::vector<int>> by_dir;
     by_dir.reserve(32);
     for (int i = 0; i < (int)all.size(); ++i) {
         by_dir[all[i].index_dir].push_back(i);
     }
 
-    // sort each dir bucket by score desc
     for (auto& kv : by_dir) {
         auto& idxs = kv.second;
         std::sort(idxs.begin(), idxs.end(), [&](int a, int b) {
@@ -227,7 +221,6 @@ static std::vector<OutHit> diversified_topk(
     std::vector<OutHit> out;
     out.reserve((std::size_t)top_k);
 
-    // 1) take one best from each dir (ordered by that best score)
     struct Head { std::string dir; int idx; double score; };
     std::vector<Head> heads;
     heads.reserve(by_dir.size());
@@ -251,7 +244,6 @@ static std::vector<OutHit> diversified_topk(
     }
     if ((int)out.size() >= top_k) return out;
 
-    // 2) fill remaining by best next across dirs
     while ((int)out.size() < top_k) {
         int best_idx = -1;
         double best_score = -1.0;
@@ -281,10 +273,45 @@ static std::vector<OutHit> diversified_topk(
     return out;
 }
 
+static bool build_full_norm_and_spans(
+    const std::string& q_utf8,
+    bool do_norm,
+    std::string& norm_out,
+    std::vector<TokenSpan>& toks_out
+) {
+    norm_out = do_norm ? normalize_for_shingles_simple(q_utf8) : q_utf8;
+    toks_out.clear();
+    toks_out.reserve(256);
+    tokenize_spans(norm_out, toks_out);
+    return !toks_out.empty();
+}
+
+static std::string slice_by_token_range(
+    const std::string& norm,
+    const std::vector<TokenSpan>& toks,
+    int tok_from,
+    int tok_to_inclusive
+) {
+    if (toks.empty()) return "";
+    if (tok_from < 0) tok_from = 0;
+    if (tok_to_inclusive < tok_from) return "";
+
+    if (tok_from >= (int)toks.size()) return "";
+    if (tok_to_inclusive >= (int)toks.size()) tok_to_inclusive = (int)toks.size() - 1;
+
+    const std::size_t b0 = (std::size_t)toks[(std::size_t)tok_from].off;
+    const TokenSpan& last = toks[(std::size_t)tok_to_inclusive];
+    const std::size_t b1 = (std::size_t)last.off + (std::size_t)last.len;
+
+    if (b0 >= norm.size() || b1 <= b0) return "";
+    const std::size_t end = std::min<std::size_t>(b1, norm.size());
+    return norm.substr(b0, end - b0);
+}
+
 } // namespace
 
 // ─────────────────────────────────────────────
-// Search API
+// Flat Search API
 // ─────────────────────────────────────────────
 
 extern "C" char* seg_search_many_json_v3(
@@ -364,9 +391,8 @@ extern "C" char* seg_search_many_json_v3(
         const bool do_diverse = env_bool("PLAGIO_DIVERSIFY_MERGE", true);
 
         std::vector<OutHit> final_hits;
-        if (do_diverse) {
-            final_hits = diversified_topk(all, top_k);
-        } else {
+        if (do_diverse) final_hits = diversified_topk(all, top_k);
+        else {
             final_hits = all;
             if ((int)final_hits.size() > top_k) final_hits.resize((std::size_t)top_k);
         }
@@ -384,7 +410,6 @@ extern "C" char* seg_search_many_json_v3(
             x["cand_hits"] = h.cand_hits;
             x["index_dir"] = h.index_dir;
 
-            // spans WITHOUT delta
             json sp = json::array();
             for (const auto& s : h.spans) {
                 json z;
@@ -439,8 +464,290 @@ extern "C" char* seg_search_many_json(
 }
 
 // ─────────────────────────────────────────────
-// Excerpt API (REQUIRED BY PYTHON): seg_excerpt_for_span_json_v2
-// d_from/d_to are SHINGLE indexes. Convert to token window: [d_from .. d_to+k-1].
+// Windowed Sources API -> returns segments + token-based C
+// ─────────────────────────────────────────────
+
+extern "C" char* seg_search_windowed_json_v1(
+    const char* query_utf8,
+    int top_k,
+    const char** index_dirs_utf8,
+    int n_dirs,
+    int normalize_query,
+    int include_matches,
+    int win_tokens,
+    int stride_tokens
+) {
+    try {
+        json out;
+        out["segments"] = json::array();
+        out["C"] = 0.0;
+
+        if (!query_utf8 || !index_dirs_utf8 || n_dirs <= 0 || top_k <= 0) {
+            return malloc_json(out);
+        }
+
+        const bool do_norm = (normalize_query != 0);
+        const bool want_matches = (include_matches != 0);
+
+        if (win_tokens <= 0) win_tokens = 120;
+        if (stride_tokens <= 0) stride_tokens = win_tokens;
+        if (stride_tokens > win_tokens) stride_tokens = win_tokens;
+
+        std::string q(query_utf8);
+        std::string norm_full;
+        std::vector<TokenSpan> toks_full;
+
+        if (!build_full_norm_and_spans(q, do_norm, norm_full, toks_full)) {
+            return malloc_json(out);
+        }
+
+        const int N = (int)toks_full.size();
+        if (N < K) {
+            return malloc_json(out);
+        }
+
+        // total query shingles in qpos space
+        const int q_shingles = N - K + 1;
+        if (q_shingles <= 0) return malloc_json(out);
+
+        const bool do_diverse = env_bool("PLAGIO_DIVERSIFY_MERGE", true);
+        const int top_k_per_dir = top_k;
+
+        // doc_id -> list of intervals in GLOBAL qpos space
+        std::unordered_map<std::string, std::vector<std::pair<int,int>>> by_doc;
+        by_doc.reserve(64);
+
+        auto add_interval = [&](const std::string& doc_id, int L, int R) {
+            if (R < L) return;
+            if (L < 0) L = 0;
+            if (R >= q_shingles) R = q_shingles - 1;
+            if (R < L) return;
+            by_doc[doc_id].push_back({L, R});
+        };
+
+        // iterate windows
+        for (int start_tok = 0; start_tok < N; start_tok += stride_tokens) {
+            int end_tok = start_tok + win_tokens - 1;
+            if (end_tok >= N) end_tok = N - 1;
+
+            if ((end_tok - start_tok + 1) < K) break;
+
+            std::string w_text = slice_by_token_range(norm_full, toks_full, start_tok, end_tok);
+            if (w_text.empty()) {
+                if (end_tok == N - 1) break;
+                continue;
+            }
+
+            // window qpos range: [start_tok .. end_tok - K + 1]
+            const int win_q_from = start_tok;
+            const int win_q_to = end_tok - K + 1;
+            if (win_q_to < win_q_from) {
+                if (end_tok == N - 1) break;
+                continue;
+            }
+
+            std::vector<OutHit> all;
+            all.reserve((std::size_t)top_k * (std::size_t)n_dirs);
+
+            for (int i = 0; i < n_dirs; ++i) {
+                const char* cdir = index_dirs_utf8[i];
+                if (!cdir || !cdir[0]) continue;
+                std::string dir(cdir);
+
+                auto eng = get_or_load(dir);
+                if (!eng) continue;
+
+                std::vector<SeHitLite> tmp;
+                tmp.reserve((std::size_t)top_k_per_dir);
+
+                // w_text is normalized slice -> normalize_input=false
+                int got = eng->search_text(w_text, top_k_per_dir, tmp, false);
+                if (got <= 0) continue;
+
+                std::vector<std::vector<MatchSpan>> tmp_spans;
+                eng->collect_spans_for_hits(w_text, tmp, tmp_spans, false);
+
+                std::vector<std::vector<MatchPair>> tmp_matches;
+                if (want_matches) {
+                    eng->collect_matches_for_hits(w_text, tmp, tmp_matches, false);
+                }
+
+                const auto& docids = eng->doc_ids();
+                for (int k = 0; k < got; ++k) {
+                    std::uint32_t did = tmp[k].doc_id_int;
+                    if (did >= docids.size()) continue;
+
+                    OutHit oh;
+                    oh.doc_id = docids[did];
+                    oh.score = tmp[k].score;
+                    oh.j9 = tmp[k].j9;
+                    oh.c9 = tmp[k].c9;
+                    oh.cand_hits = tmp[k].cand_hits;
+                    oh.index_dir = dir;
+
+                    if ((std::size_t)k < tmp_spans.size()) oh.spans = std::move(tmp_spans[(std::size_t)k]);
+                    if (want_matches && (std::size_t)k < tmp_matches.size())
+                        oh.matches = std::move(tmp_matches[(std::size_t)k]);
+
+                    all.push_back(std::move(oh));
+                }
+            }
+
+            if (all.empty()) {
+                if (end_tok == N - 1) break;
+                continue;
+            }
+
+            std::sort(all.begin(), all.end(), [](const OutHit& a, const OutHit& b) {
+                if (a.score != b.score) return a.score > b.score;
+                if (a.cand_hits != b.cand_hits) return a.cand_hits > b.cand_hits;
+                if (a.index_dir != b.index_dir) return a.index_dir < b.index_dir;
+                return a.doc_id < b.doc_id;
+            });
+
+            std::vector<OutHit> final_hits;
+            if (do_diverse) final_hits = diversified_topk(all, top_k);
+            else {
+                final_hits = all;
+                if ((int)final_hits.size() > top_k) final_hits.resize((std::size_t)top_k);
+            }
+
+            // include all participating docs by spans
+            for (auto& h : final_hits) {
+                for (const auto& s : h.spans) {
+                    int L = (int)s.q_from + win_q_from;
+                    int R = (int)s.q_to + win_q_from;
+
+                    if (R < win_q_from || L > win_q_to) continue;
+                    if (L < win_q_from) L = win_q_from;
+                    if (R > win_q_to) R = win_q_to;
+
+                    if ((R - L + 1) < MIN_SPAN_LEN_SHINGLES) continue;
+
+                    add_interval(h.doc_id, L, R);
+                }
+            }
+
+            if (end_tok == N - 1) break;
+        }
+
+        if (by_doc.empty()) return malloc_json(out);
+
+        // merge per-doc qpos intervals into segments
+        struct Seg { std::string doc; int L; int R; }; // qpos interval
+        std::vector<Seg> segs;
+        segs.reserve(128);
+
+        for (auto& kv : by_doc) {
+            auto& iv = kv.second;
+            if (iv.empty()) continue;
+
+            std::sort(iv.begin(), iv.end());
+            int curL = iv[0].first;
+            int curR = iv[0].second;
+
+            for (std::size_t i = 1; i < iv.size(); ++i) {
+                int L = iv[i].first;
+                int R = iv[i].second;
+                if (L <= curR + 1) {
+                    if (R > curR) curR = R;
+                } else {
+                    segs.push_back(Seg{kv.first, curL, curR});
+                    curL = L;
+                    curR = R;
+                }
+            }
+            segs.push_back(Seg{kv.first, curL, curR});
+        }
+
+        if (segs.empty()) return malloc_json(out);
+
+        // convert to TOKEN intervals and compute token coverage union (C_tokens)
+        std::vector<std::pair<int,int>> tok_iv;
+        tok_iv.reserve(segs.size());
+
+        int max_tok = -1;
+        for (const auto& s : segs) {
+            int tok_from = s.L;
+            int tok_to   = s.R + (K - 1);
+
+            if (tok_from < 0) tok_from = 0;
+            if (tok_to < tok_from) tok_to = tok_from;
+            if (tok_from > (N - 1)) tok_from = (N - 1);
+            if (tok_to   > (N - 1)) tok_to   = (N - 1);
+
+            tok_iv.push_back({tok_from, tok_to});
+            if (tok_to > max_tok) max_tok = tok_to;
+        }
+
+        double C_tokens = 0.0;
+        if (!tok_iv.empty() && max_tok >= 0) {
+            std::sort(tok_iv.begin(), tok_iv.end());
+            long long covered = 0;
+            int curL = tok_iv[0].first;
+            int curR = tok_iv[0].second;
+
+            for (std::size_t i = 1; i < tok_iv.size(); ++i) {
+                int L = tok_iv[i].first;
+                int R = tok_iv[i].second;
+                if (L <= curR + 1) {
+                    if (R > curR) curR = R;
+                } else {
+                    covered += (long long)(curR - curL + 1);
+                    curL = L;
+                    curR = R;
+                }
+            }
+            covered += (long long)(curR - curL + 1);
+
+            const long long total = (long long)max_tok + 1;
+            if (total > 0) {
+                C_tokens = (double)covered / (double)total;
+                if (C_tokens < 0.0) C_tokens = 0.0;
+                if (C_tokens > 1.0) C_tokens = 1.0;
+            }
+        }
+        out["C"] = C_tokens;
+
+        // stable sort by token start then doc_id
+        struct TokSeg { std::string doc; int tok_from; int tok_to; };
+        std::vector<TokSeg> tok_segs;
+        tok_segs.reserve(segs.size());
+
+        for (const auto& s : segs) {
+            int tok_from = s.L;
+            int tok_to   = s.R + (K - 1);
+
+            if (tok_from < 0) tok_from = 0;
+            if (tok_to < tok_from) tok_to = tok_from;
+            if (tok_from > (N - 1)) tok_from = (N - 1);
+            if (tok_to   > (N - 1)) tok_to   = (N - 1);
+
+            tok_segs.push_back(TokSeg{s.doc, tok_from, tok_to});
+        }
+
+        std::sort(tok_segs.begin(), tok_segs.end(), [](const TokSeg& a, const TokSeg& b) {
+            if (a.tok_from != b.tok_from) return a.tok_from < b.tok_from;
+            if (a.tok_to != b.tok_to) return a.tok_to < b.tok_to;
+            return a.doc < b.doc;
+        });
+
+        for (auto& s : tok_segs) {
+            json js;
+            js["source_doc_id"] = s.doc;
+            js["q_tok_from"] = s.tok_from;
+            js["q_tok_to"]   = s.tok_to;
+            out["segments"].push_back(std::move(js));
+        }
+
+        return malloc_json(out);
+    } catch (...) {
+        return mk_error("seg_search_windowed_json_v1_exception");
+    }
+}
+
+// ─────────────────────────────────────────────
+// Excerpt API
 // ─────────────────────────────────────────────
 
 extern "C" char* seg_excerpt_for_span_json_v2(

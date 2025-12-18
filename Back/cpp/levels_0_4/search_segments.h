@@ -12,7 +12,6 @@ char* seg_search_many_json(
     int n_dirs
 );
 
-// v2: kept for backward compatibility (always include legacy matches)
 char* seg_search_many_json_v2(
     const char* query_utf8,
     int top_k,
@@ -21,7 +20,6 @@ char* seg_search_many_json_v2(
     int normalize_query
 );
 
-// v3: NEW - allow disabling legacy matches computation/serialization
 char* seg_search_many_json_v3(
     const char* query_utf8,
     int top_k,
@@ -29,6 +27,25 @@ char* seg_search_many_json_v3(
     int n_dirs,
     int normalize_query,
     int include_matches
+);
+
+// Windowed search that returns READY segments (sources) for UI.
+// Output JSON:
+// {
+//   "segments": [
+//     { "source_doc_id": "...", "q_tok_from": int, "q_tok_to": int },
+//     ...
+//   ]
+// }
+char* seg_search_windowed_json_v1(
+    const char* query_utf8,
+    int top_k,
+    const char** index_dirs_utf8,
+    int n_dirs,
+    int normalize_query,
+    int include_matches,
+    int win_tokens,
+    int stride_tokens
 );
 
 char* seg_excerpt_for_span_json(
