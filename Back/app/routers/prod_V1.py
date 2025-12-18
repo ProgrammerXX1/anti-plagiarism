@@ -21,20 +21,13 @@ from app.services.levels_0_4.search_service import search_levels_1_4
 router = APIRouter(prefix="/app", tags=["Worker-Prod"])
 
 
-# ─────────────────────────────────────────────
-# helpers
-# ─────────────────────────────────────────────
-
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
 def _validate_org_id(organization_id: int) -> None:
     if organization_id is None or int(organization_id) <= 0:
-        raise HTTPException(
-            status_code=422,
-            detail="organization_id must be a positive integer",
-        )
+        raise HTTPException(status_code=422, detail="organization_id must be a positive integer")
 
 
 def compute_shard_id(organization_id: int) -> int:
@@ -52,6 +45,8 @@ def _cleanup_search_result(search: Dict[str, Any]) -> Dict[str, Any]:
     cleaned = []
 
     for h in hits:
+        if not isinstance(h, dict):
+            continue
         cleaned.append(
             {
                 "doc_id": str(h.get("doc_id", "")),
@@ -64,7 +59,9 @@ def _cleanup_search_result(search: Dict[str, Any]) -> Dict[str, Any]:
             }
         )
 
+    # Никаких q_shingles/per_dir/dirs_* и т.п. наружу не выдаём
     return {"count": int(len(cleaned)), "hits": cleaned}
+
 
 
 def _write_text_atomic(path: Path, text: str) -> None:
@@ -80,10 +77,6 @@ def _write_json_atomic(path: Path, obj: Dict[str, Any]) -> None:
     tmp.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, path)
 
-
-# ─────────────────────────────────────────────
-# API models
-# ─────────────────────────────────────────────
 
 class ProdV1IngestRequest(BaseModel):
     document_id: str = Field(..., min_length=1)
@@ -113,10 +106,6 @@ class ProdV1IngestResponse(BaseModel):
     search: Optional[Dict[str, Any]] = None
 
 
-# ─────────────────────────────────────────────
-# Endpoint
-# ─────────────────────────────────────────────
-
 @router.post("/ingest", response_model=ProdV1IngestResponse)
 async def prod_v1_ingest(
     req: ProdV1IngestRequest,
@@ -139,16 +128,18 @@ async def prod_v1_ingest(
             db,
             organization_id=req.organization_id,
             shard_id=shard_id,
-            query=req.text,           # уже нормализован
-            normalize_query=False,    # ВАЖНО: никогда не нормализуем
+            query=req.text,
+            normalize_query=False,
         )
         search_result = _cleanup_search_result(raw)
 
         logger.info(
-            "[prod_v1] search-only ext_doc=%s org=%s shard=%s",
+            "[prod_v1] search-only ext_doc=%s org=%s shard=%s count=%s dirs_with_hits=%s",
             req.document_id,
             req.organization_id,
             shard_id,
+            search_result.get("count"),
+            search_result.get("dirs_with_hits"),
         )
 
         return ProdV1IngestResponse(
@@ -173,9 +164,6 @@ async def prod_v1_ingest(
     file_path = UPLOAD_DIR / external_id
     meta_path = UPLOAD_DIR / f"{external_id}.meta.json"
 
-    # IMPORTANT CONTRACT:
-    # - text IS ALREADY normalized
-    # - internal normalizer is NEVER applied
     meta: Dict[str, Any] = {
         "organization_id": int(req.organization_id),
         "document_id": str(req.document_id),
@@ -193,7 +181,6 @@ async def prod_v1_ingest(
         await anyio.to_thread.run_sync(_write_text_atomic, file_path, req.text)
         await anyio.to_thread.run_sync(_write_json_atomic, meta_path, meta)
     except Exception as e:
-        # best-effort cleanup
         for p in (file_path, meta_path):
             try:
                 if p.exists():
@@ -233,7 +220,7 @@ async def prod_v1_ingest(
             organization_id=req.organization_id,
             shard_id=shard_id,
             query=req.text,
-            normalize_query=False,  # строго false
+            normalize_query=False,
         )
         search_result = _cleanup_search_result(raw)
 
@@ -242,11 +229,13 @@ async def prod_v1_ingest(
             await db.commit()
 
     logger.info(
-        "[prod_v1] indexed ext_doc=%s internal_id=%s org=%s shard=%s",
+        "[prod_v1] indexed ext_doc=%s internal_id=%s org=%s shard=%s count=%s dirs_with_hits=%s",
         req.document_id,
         getattr(doc, "id", None),
         req.organization_id,
         shard_id,
+        (search_result or {}).get("count") if req.do_search else None,
+        (search_result or {}).get("dirs_with_hits") if req.do_search else None,
     )
 
     return ProdV1IngestResponse(

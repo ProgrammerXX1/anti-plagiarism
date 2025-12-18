@@ -9,10 +9,6 @@ from typing import Any, Dict, List, Optional
 
 from app.core.logger import logger
 
-# -----------------------------------------------------------------------------
-# Shared library loading (safe-ish)
-# -----------------------------------------------------------------------------
-
 SO_PATH = os.getenv("PLAGIO_SEGMENTS_SO", "/usr/local/lib/libplagio_segments.so")
 if not os.path.exists(SO_PATH):
     alt = "/usr/local/lib/libplagio_segments.so"
@@ -29,12 +25,7 @@ except Exception as e:
     _load_err = f"failed to load {SO_PATH}: {e}"
     logger.error("[native_segments] %s", _load_err)
 
-# -----------------------------------------------------------------------------
-# C API signature
-# -----------------------------------------------------------------------------
-
 if _lib is not None:
-    # v3 search (preferred)
     _lib.seg_search_many_json_v3.argtypes = [
         ctypes.c_char_p,                 # query_utf8
         ctypes.c_int,                    # top_k
@@ -45,7 +36,6 @@ if _lib is not None:
     ]
     _lib.seg_search_many_json_v3.restype = ctypes.c_void_p
 
-    # v2 search (compat)
     _lib.seg_search_many_json_v2.argtypes = [
         ctypes.c_char_p,                 # query_utf8
         ctypes.c_int,                    # top_k
@@ -55,7 +45,6 @@ if _lib is not None:
     ]
     _lib.seg_search_many_json_v2.restype = ctypes.c_void_p
 
-    # excerpt
     _lib.seg_excerpt_for_span_json_v2.argtypes = [
         ctypes.c_char_p, # text_utf8
         ctypes.c_int,    # d_from
@@ -66,36 +55,54 @@ if _lib is not None:
     ]
     _lib.seg_excerpt_for_span_json_v2.restype = ctypes.c_void_p
 
-    # normalize
     _lib.seg_normalize_json_v1.argtypes = [ctypes.c_char_p]
     _lib.seg_normalize_json_v1.restype = ctypes.c_void_p
 
-    # free
     _lib.seg_free.argtypes = [ctypes.c_void_p]
     _lib.seg_free.restype = None
 
 
 def _safe_json_loads(b: bytes) -> Dict[str, Any]:
     """
-    IMPORTANT: do NOT use errors='ignore' because it can silently corrupt JSON.
-    We still guard exceptions and return a structured error.
+    Do NOT use errors='ignore' (it can corrupt JSON).
+    Return structured error for visibility.
     """
+    if not b:
+        return {"count": 0, "hits": [], "error": "empty_native_response"}
+
     try:
-        # JSON emitted by C++ should be UTF-8.
-        s = b.decode("utf-8")
+        s = b.decode("utf-8")  # strict
+    except UnicodeDecodeError as e:
+        return {
+            "count": 0,
+            "hits": [],
+            "error": "bad_utf8",
+            "detail": str(e),
+            "raw_len": len(b),
+        }
+
+    try:
         obj = json.loads(s)
-        if isinstance(obj, dict):
-            return obj
-        return {"count": 0, "hits": [], "error": "bad_json_root"}
     except Exception as e:
-        return {"count": 0, "hits": [], "error": "bad_json", "detail": str(e)}
+        return {
+            "count": 0,
+            "hits": [],
+            "error": "bad_json",
+            "detail": str(e),
+            "raw_len": len(b),
+        }
+
+    if isinstance(obj, dict):
+        # Ensure minimal keys exist
+        obj.setdefault("hits", [])
+        obj.setdefault("count", int(len(obj.get("hits") or [])))
+        return obj
+
+    return {"count": 0, "hits": [], "error": "bad_json_root"}
 
 
 def _ensure_loaded() -> bool:
-    if _lib is not None:
-        return True
-    # no crashes: return empty results
-    return False
+    return _lib is not None
 
 
 def seg_search_many(
@@ -104,8 +111,8 @@ def seg_search_many(
     top_k: int,
     index_dirs: List[str],
     include_matches: bool = False,
-    max_matches_per_doc: Optional[int] = None,  # python-side hard limit if include_matches=True
-    normalize_query: bool = False,              # PROD: always false (query already normalized)
+    max_matches_per_doc: Optional[int] = None,
+    normalize_query: bool = False,  # PROD: always false (query already normalized)
 ) -> Dict[str, Any]:
     if not query or top_k <= 0 or not index_dirs:
         return {"count": 0, "hits": []}
@@ -113,7 +120,7 @@ def seg_search_many(
     if not _ensure_loaded():
         return {"count": 0, "hits": [], "error": "native_not_loaded", "detail": (_load_err or "")}
 
-    # validate dirs (keep existing + dir)
+    # validate dirs
     dirs: List[bytes] = []
     for d in index_dirs:
         p = Path(d)
@@ -147,15 +154,14 @@ def seg_search_many(
             data["error"] = data.get("error") or "bad_hits"
             return data
 
-        # v3 with include_matches=0 should not include "matches" anyway, but keep safe:
+        # strip matches if not requested (keep all top-level debug keys!)
         if not include_matches:
             for h in hits:
                 if isinstance(h, dict):
                     h.pop("matches", None)
-            return data
 
-        # If matches requested, optionally hard-limit arrays on Python side
-        if max_matches_per_doc is not None and max_matches_per_doc >= 0:
+        # optional python-side cap (only when include_matches True)
+        if include_matches and max_matches_per_doc is not None and max_matches_per_doc >= 0:
             for h in hits:
                 if not isinstance(h, dict):
                     continue
@@ -172,6 +178,8 @@ def seg_search_many(
                 m["d_pos"] = d_pos[:n]
                 m["h"] = hh[:n]
 
+        # normalize count
+        data["count"] = int(len(hits))
         return data
     finally:
         _lib.seg_free(ptr)

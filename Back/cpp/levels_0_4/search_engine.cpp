@@ -11,6 +11,7 @@
 
 #include "search_engine.h"
 
+#include <unordered_set>
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -423,6 +424,80 @@ int SearchEngine::search_text(
     }
 
     return keep;
+}
+
+double SearchEngine::coverage_union_for_hits(
+    const std::string& text_utf8,
+    const std::vector<SeHitLite>& hits,
+    bool normalize_input,
+    int* out_q_size,
+    int* out_covered
+) const {
+    if (out_q_size) *out_q_size = 0;
+    if (out_covered) *out_covered = 0;
+
+    if (!loaded_ || hits.empty()) return 0.0;
+
+    // Build query shingles (qsh has duplicates by qpos; we make unique set of hashes)
+    std::string norm;
+    std::vector<TokenSpan> spans;
+    std::vector<QSh> qsh;
+    spans.reserve(256);
+
+    if (!build_query_shingles(text_utf8, norm, spans, qsh, normalize_input))
+        return 0.0;
+
+    if ((int)spans.size() < cfg_.w_min_query)
+        return 0.0;
+
+    std::vector<std::uint64_t> q_uniq;
+    q_uniq.reserve(qsh.size());
+    for (auto& it : qsh) q_uniq.push_back(it.h);
+    std::sort(q_uniq.begin(), q_uniq.end());
+    q_uniq.erase(std::unique(q_uniq.begin(), q_uniq.end()), q_uniq.end());
+
+    const int q_size = (int)q_uniq.size();
+    if (out_q_size) *out_q_size = q_size;
+    if (q_size <= 0) return 0.0;
+
+    // Candidate docs set (top-K)
+    std::unordered_set<std::uint32_t> did_set;
+    did_set.reserve(hits.size() * 2);
+    for (const auto& h : hits) {
+        if (h.doc_id_int < docs_.size()) did_set.insert(h.doc_id_int);
+    }
+    if (did_set.empty()) return 0.0;
+
+    int covered = 0;
+
+    // For each unique query shingle hash:
+    // check postings range; if any posting belongs to did_set => covered++.
+    for (std::uint64_t h : q_uniq) {
+        auto [L, R] = find_postings9_range(h);
+        if (L == R) continue;
+
+        std::uint32_t prev_did = std::numeric_limits<std::uint32_t>::max();
+        bool ok = false;
+
+        for (std::size_t i = L; i < R; ++i) {
+            const std::uint32_t did = post9_[i].did;
+            if (did == prev_did) continue; // postings sorted by (h,did,pos)
+            prev_did = did;
+
+            if (did_set.find(did) != did_set.end()) {
+                ok = true;
+                break;
+            }
+        }
+
+        if (ok) {
+            covered += 1;
+            if (covered == q_size) break;
+        }
+    }
+
+    if (out_covered) *out_covered = covered;
+    return (q_size > 0) ? (double)covered / (double)q_size : 0.0;
 }
 
 

@@ -168,20 +168,120 @@ static char* mk_error(const char* msg) {
     return malloc_json(j);
 }
 
+// ------------------------
+// response struct
+// ------------------------
+
 struct OutHit {
     std::string doc_id;
-    double score;
-    double j9;
-    double c9;
-    int cand_hits;
+    double score = 0.0;
+    double j9 = 0.0;
+    double c9 = 0.0;
+    int cand_hits = 0;
     std::string index_dir;
 
     std::vector<MatchPair> matches;
     std::vector<MatchSpan> spans;
 };
 
-} // namespace
+// ------------------------
+// diversified merge across dirs
+// ------------------------
 
+static bool env_bool(const char* key, bool defv) {
+    const char* s = std::getenv(key);
+    if (!s || !*s) return defv;
+    if (std::strcmp(s, "1") == 0) return true;
+    if (std::strcmp(s, "0") == 0) return false;
+    if (std::strcmp(s, "true") == 0 || std::strcmp(s, "TRUE") == 0) return true;
+    if (std::strcmp(s, "false") == 0 || std::strcmp(s, "FALSE") == 0) return false;
+    return defv;
+}
+
+static std::vector<OutHit> diversified_topk(
+    const std::vector<OutHit>& all,
+    int top_k
+) {
+    if (top_k <= 0 || all.empty()) return {};
+    if ((int)all.size() <= top_k) return all;
+
+    // group by dir -> indices in `all`
+    std::unordered_map<std::string, std::vector<int>> by_dir;
+    by_dir.reserve(32);
+    for (int i = 0; i < (int)all.size(); ++i) {
+        by_dir[all[i].index_dir].push_back(i);
+    }
+
+    // sort each dir bucket by score desc
+    for (auto& kv : by_dir) {
+        auto& idxs = kv.second;
+        std::sort(idxs.begin(), idxs.end(), [&](int a, int b) {
+            const auto& A = all[a];
+            const auto& B = all[b];
+            if (A.score != B.score) return A.score > B.score;
+            if (A.cand_hits != B.cand_hits) return A.cand_hits > B.cand_hits;
+            return A.doc_id < B.doc_id;
+        });
+    }
+
+    std::vector<OutHit> out;
+    out.reserve((std::size_t)top_k);
+
+    // 1) take one best from each dir (ordered by that best score)
+    struct Head { std::string dir; int idx; double score; };
+    std::vector<Head> heads;
+    heads.reserve(by_dir.size());
+    for (auto& kv : by_dir) {
+        if (!kv.second.empty()) {
+            int idx = kv.second[0];
+            heads.push_back(Head{kv.first, idx, all[idx].score});
+        }
+    }
+    std::sort(heads.begin(), heads.end(), [](const Head& a, const Head& b) {
+        return a.score > b.score;
+    });
+
+    std::unordered_map<std::string, int> cursor;
+    cursor.reserve(by_dir.size());
+
+    for (const auto& h : heads) {
+        if ((int)out.size() >= top_k) break;
+        out.push_back(all[h.idx]);
+        cursor[h.dir] = 1;
+    }
+    if ((int)out.size() >= top_k) return out;
+
+    // 2) fill remaining by best next across dirs
+    while ((int)out.size() < top_k) {
+        int best_idx = -1;
+        double best_score = -1.0;
+
+        for (auto& kv : by_dir) {
+            const std::string& dir = kv.first;
+            const auto& idxs = kv.second;
+            int cur = 0;
+            auto itc = cursor.find(dir);
+            if (itc != cursor.end()) cur = itc->second;
+            if (cur >= (int)idxs.size()) continue;
+
+            int idx = idxs[cur];
+            const auto& cand = all[idx];
+            if (cand.score > best_score) {
+                best_score = cand.score;
+                best_idx = idx;
+            }
+        }
+
+        if (best_idx < 0) break;
+
+        out.push_back(all[best_idx]);
+        cursor[all[best_idx].index_dir] += 1;
+    }
+
+    return out;
+}
+
+} // namespace
 
 // ─────────────────────────────────────────────
 // Search API
@@ -207,6 +307,8 @@ extern "C" char* seg_search_many_json_v3(
         std::vector<OutHit> all;
         all.reserve((std::size_t)top_k * (std::size_t)n_dirs);
 
+        const int top_k_per_dir = top_k;
+
         for (int i = 0; i < n_dirs; ++i) {
             const char* cdir = index_dirs_utf8[i];
             if (!cdir || !cdir[0]) continue;
@@ -216,9 +318,9 @@ extern "C" char* seg_search_many_json_v3(
             if (!eng) continue;
 
             std::vector<SeHitLite> tmp;
-            tmp.reserve((std::size_t)top_k);
+            tmp.reserve((std::size_t)top_k_per_dir);
 
-            int got = eng->search_text(q, top_k, tmp, do_norm);
+            int got = eng->search_text(q, top_k_per_dir, tmp, do_norm);
             if (got <= 0) continue;
 
             std::vector<std::vector<MatchSpan>> tmp_spans;
@@ -243,7 +345,8 @@ extern "C" char* seg_search_many_json_v3(
                 oh.index_dir = dir;
 
                 if ((std::size_t)k < tmp_spans.size()) oh.spans = std::move(tmp_spans[(std::size_t)k]);
-                if (want_matches && (std::size_t)k < tmp_matches.size()) oh.matches = std::move(tmp_matches[(std::size_t)k]);
+                if (want_matches && (std::size_t)k < tmp_matches.size())
+                    oh.matches = std::move(tmp_matches[(std::size_t)k]);
 
                 all.push_back(std::move(oh));
             }
@@ -252,15 +355,27 @@ extern "C" char* seg_search_many_json_v3(
         if (all.empty()) return mk_empty_hits();
 
         std::sort(all.begin(), all.end(), [](const OutHit& a, const OutHit& b) {
-            return a.score > b.score;
+            if (a.score != b.score) return a.score > b.score;
+            if (a.cand_hits != b.cand_hits) return a.cand_hits > b.cand_hits;
+            if (a.index_dir != b.index_dir) return a.index_dir < b.index_dir;
+            return a.doc_id < b.doc_id;
         });
-        if ((int)all.size() > top_k) all.resize((std::size_t)top_k);
+
+        const bool do_diverse = env_bool("PLAGIO_DIVERSIFY_MERGE", true);
+
+        std::vector<OutHit> final_hits;
+        if (do_diverse) {
+            final_hits = diversified_topk(all, top_k);
+        } else {
+            final_hits = all;
+            if ((int)final_hits.size() > top_k) final_hits.resize((std::size_t)top_k);
+        }
 
         json j;
-        j["count"] = (int)all.size();
+        j["count"] = (int)final_hits.size();
         j["hits"] = json::array();
 
-        for (auto& h : all) {
+        for (auto& h : final_hits) {
             json x;
             x["doc_id"] = h.doc_id;
             x["score"] = h.score;
@@ -322,7 +437,6 @@ extern "C" char* seg_search_many_json(
 ) {
     return seg_search_many_json_v2(query_utf8, top_k, index_dirs_utf8, n_dirs, 1);
 }
-
 
 // ─────────────────────────────────────────────
 // Excerpt API (REQUIRED BY PYTHON): seg_excerpt_for_span_json_v2
@@ -410,7 +524,6 @@ extern "C" char* seg_excerpt_for_span_json(
 ) {
     return seg_excerpt_for_span_json_v2(text_utf8, d_from, d_to, k_shingle, max_chars, 1);
 }
-
 
 // ─────────────────────────────────────────────
 // Normalize API

@@ -64,11 +64,7 @@ def _spans_to_match_spans(spans: Any) -> List[Dict[str, int]]:
 async def _load_doc_text_and_index_norm(db: AsyncSession, doc_id: int) -> Tuple[Optional[str], bool]:
     """
     Returns (raw_text, index_normalize).
-
-    PROD CONTRACT:
-      - router stores text already normalized
-      - index_normalize MUST be False
-    We still read meta for backward compatibility, but default is False.
+    PROD: router stores text already normalized; index_normalize expected False.
     """
     doc = await db.get(Document, doc_id)
     if not doc or not doc.external_id:
@@ -96,7 +92,7 @@ async def search_levels_1_4(
     organization_id: int,
     shard_id: int,
     query: str,
-    top_k: int = 10,
+    top_k: int = 20,
     include_user_view: bool = True,
     excerpt_max_chars: int = 800,
     normalize_query: bool = False,  # PROD: never normalize; keep arg for compatibility
@@ -106,9 +102,8 @@ async def search_levels_1_4(
 
     PROD CONTRACT:
       - query is already normalized -> normalize_query must be False
-      - excerpt normalization must match index-time -> index_normalize is expected False
     """
-    # Hard safety: prod forbids query normalization (prevents position drift)
+    # Hard safety: prod forbids query normalization
     normalize_query = False
 
     res = await db.execute(
@@ -149,10 +144,13 @@ async def search_levels_1_4(
 
     hits = data.get("hits") or []
 
+    # Attach segment meta by index_dir + convert spans
     for h in hits:
+        if not isinstance(h, dict):
+            continue
         d = h.get("index_dir")
         meta = by_dir.get(d)
-        if not meta:
+        if not meta and d:
             try:
                 dd = str(Path(d))
                 meta = by_dir.get(dd)
@@ -164,10 +162,11 @@ async def search_levels_1_4(
         h["match_spans"] = _spans_to_match_spans(h.get("spans"))
 
     if include_user_view:
-        # cache doc_id -> (text, index_normalize)
         doc_cache: Dict[int, Tuple[Optional[str], bool]] = {}
 
         for h in hits:
+            if not isinstance(h, dict):
+                continue
             doc_id_str = h.get("doc_id")
             try:
                 doc_id_int = int(doc_id_str)
@@ -187,7 +186,6 @@ async def search_levels_1_4(
                 h["user_view"] = {"summary": "Текст документа недоступен", "spans": []}
                 continue
 
-            # PROD: if index_normalize is False (expected), excerpt also must be raw-space.
             normalize_text = bool(index_normalize)
 
             uv_spans = []
@@ -228,4 +226,6 @@ async def search_levels_1_4(
                 "spans": uv_spans,
             }
 
+    # Keep debug fields from native on top-level
+    data["count"] = int(len(hits))
     return data

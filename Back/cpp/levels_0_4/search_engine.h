@@ -75,6 +75,18 @@ public:
         bool normalize_input = true
     ) const;
 
+    // NEW: coverage of query by UNION of hits
+    // Returns coverage in [0..1].
+    // out_q_size = number of UNIQUE query shingles
+    // out_covered = how many of them are present in at least one hit doc
+    double coverage_union_for_hits(
+        const std::string& text_utf8,
+        const std::vector<SeHitLite>& hits,
+        bool normalize_input,
+        int* out_q_size = nullptr,
+        int* out_covered = nullptr
+    ) const;
+
 private:
     struct DocMeta {
         std::uint32_t tok_len;

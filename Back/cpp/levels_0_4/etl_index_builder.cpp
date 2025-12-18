@@ -1,9 +1,11 @@
 // cpp/levels_0_4/etl_index_builder.cpp
 // VERSION 2: postings with positions + per-doc normalization flag (text_is_normalized)
 // + ATOMIC OUTPUT (write *.tmp then rename/replace)
+// + STRICT flag: PLAGIO_STRICT_TEXT_IS_NORMALIZED=1 (missing flags -> treated as NOT normalized)
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -47,6 +49,21 @@ struct ThreadResult {
     std::vector<Posting9> postings9;
 };
 
+static bool env_bool(const char* key, bool defv) {
+    const char* s = std::getenv(key);
+    if (!s || !*s) return defv;
+    if (std::strcmp(s, "1") == 0) return true;
+    if (std::strcmp(s, "0") == 0) return false;
+    if (std::strcmp(s, "true") == 0 || std::strcmp(s, "TRUE") == 0) return true;
+    if (std::strcmp(s, "false") == 0 || std::strcmp(s, "FALSE") == 0) return false;
+    return defv;
+}
+
+static bool has_key(const simdjson::dom::element& e, const char* key) {
+    simdjson::dom::element tmp;
+    return !e.at_key(key).get(tmp);
+}
+
 static bool get_bool_safe(const simdjson::dom::element& e, const char* key, bool defv) {
     simdjson::dom::element v;
     if (e.at_key(key).get(v)) return defv;
@@ -57,15 +74,17 @@ static bool get_bool_safe(const simdjson::dom::element& e, const char* key, bool
 }
 
 static bool get_text_is_normalized(const simdjson::dom::element& doc) {
-    // Prefer new key
-    bool v = get_bool_safe(doc, "text_is_normalized", true);
+    // STRICT: missing both flags => treat as NOT normalized
+    const bool strict = env_bool("PLAGIO_STRICT_TEXT_IS_NORMALIZED", false);
 
-    simdjson::dom::element tmp;
-    if (!doc.at_key("text_is_normalized").get(tmp)) {
-        return v; // new key exists
-    }
-    // fallback legacy
-    return get_bool_safe(doc, "normalized", true);
+    const bool has_new = has_key(doc, "text_is_normalized");
+    const bool has_old = has_key(doc, "normalized");
+
+    if (has_new) return get_bool_safe(doc, "text_is_normalized", true);
+    if (has_old) return get_bool_safe(doc, "normalized", true);
+
+    if (strict) return false;
+    return true; // legacy default (prod contract)
 }
 
 static bool atomic_replace_file(const fs::path& tmp, const fs::path& fin) {
@@ -118,11 +137,8 @@ void process_range(
         std::string text{text_sv};
 
         std::string norm;
-        if (text_is_norm) {
-            norm = std::move(text);
-        } else {
-            norm = normalize_for_shingles_simple(text);
-        }
+        if (text_is_norm) norm = std::move(text);
+        else norm = normalize_for_shingles_simple(text);
 
         spans.clear();
         tokenize_spans(norm, spans);
@@ -366,6 +382,8 @@ int main(int argc, char** argv) {
 
     std::cout << "[etl_index_builder] built v2 index docs=" << N_docs
               << " post9=" << N_post9
-              << " threads=" << used_threads << "\n";
+              << " threads=" << used_threads
+              << " strict_text_is_normalized=" << (env_bool("PLAGIO_STRICT_TEXT_IS_NORMALIZED", false) ? 1 : 0)
+              << "\n";
     return 0;
 }
