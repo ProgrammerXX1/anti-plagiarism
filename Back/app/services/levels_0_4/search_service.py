@@ -21,8 +21,6 @@ K_SHINGLE = 9
 MIN_SPAN_SHINGLES = 6
 MAX_SPANS_PER_HIT = 3
 
-# How many tokens we allow to "bridge" between adjacent covered intervals.
-# With K=9, the theoretical "stitch gap" around source boundaries is up to K-1=8 tokens.
 C_TOK_GAP_CLOSE = K_SHINGLE - 1  # 8
 
 
@@ -65,21 +63,9 @@ def _spans_to_match_spans(spans: Any) -> List[Dict[str, int]]:
 
 
 def _apply_marginal_C_tokens_gapclose(hits: List[Dict[str, Any]]) -> None:
-    """
-    Makes per-hit C summable to ~1.0 for composite texts by:
-      - converting qpos spans to TOKEN spans: tok_to = q_to + (K-1)
-      - measuring coverage on token axis
-      - closing small "stitch gaps" up to C_TOK_GAP_CLOSE tokens in UNION coverage
-
-    Output per hit:
-      - C_doc: original engine c9 (doc-level coverage by unique shingles)
-      - C: marginal TOKEN coverage contribution (summable; aims to be close to 1.0)
-      - C_total_tokens: total token length used for normalization (optional)
-    """
     if not hits:
         return
 
-    # Determine total token length from spans: max(tok_to) + 1
     max_tok = -1
     for h in hits:
         for sp in (h.get("match_spans") or []):
@@ -101,12 +87,8 @@ def _apply_marginal_C_tokens_gapclose(hits: List[Dict[str, Any]]) -> None:
             h["C"] = 0.0
         return
 
-    # covered token positions; gap-closing is handled during union accounting, but marginal needs a consistent rule.
-    # We'll use a boolean cover array for exact marginal contributions, and additionally "gap close" after the fact
-    # by treating small uncovered runs <= gap as covered in the final union baseline.
     covered = [False] * total_tokens
 
-    # Step 1: mark raw covered positions per hit to compute marginal contributions
     for h in hits:
         h["C_doc"] = float(h.get("c9", 0.0) or 0.0)
         new_cov = 0
@@ -120,13 +102,9 @@ def _apply_marginal_C_tokens_gapclose(hits: List[Dict[str, Any]]) -> None:
             if q_to < q_from:
                 continue
 
-            tok_from = q_from
+            tok_from = max(0, q_from)
             tok_to = q_to + (K_SHINGLE - 1)
 
-            if tok_from < 0:
-                tok_from = 0
-            if tok_to < tok_from:
-                tok_to = tok_from
             if tok_from >= total_tokens:
                 continue
             if tok_to >= total_tokens:
@@ -137,18 +115,14 @@ def _apply_marginal_C_tokens_gapclose(hits: List[Dict[str, Any]]) -> None:
                     covered[i] = True
                     new_cov += 1
 
-        # provisional marginal (without gap-closing)
         h["C"] = new_cov / total_tokens
 
-    # Step 2: apply gap-closing to make union closer to 1.0 for stitch gaps.
-    # We need to adjust per-hit marginals so their sum equals the gap-closed union.
-    # We'll do that by computing additional "virtual covered" tokens from closing gaps,
-    # and attributing them to the nearest hit boundary (previous hit) deterministically.
     gap = int(C_TOK_GAP_CLOSE)
     if gap <= 0:
+        for h in hits:
+            h["C_total_tokens"] = total_tokens
         return
 
-    # Rebuild "owner" array: for each token, which hit first covered it (in hit order).
     owner = [-1] * total_tokens
     for idx, h in enumerate(hits):
         for sp in (h.get("match_spans") or []):
@@ -167,7 +141,6 @@ def _apply_marginal_C_tokens_gapclose(hits: List[Dict[str, Any]]) -> None:
                 if owner[i] == -1:
                     owner[i] = idx
 
-    # Close gaps: find uncovered runs whose length <= gap and assign them to the previous non-empty owner.
     i = 0
     added = [0] * len(hits)
     last_owner = -1
@@ -183,9 +156,7 @@ def _apply_marginal_C_tokens_gapclose(hits: List[Dict[str, Any]]) -> None:
         run_len = j - i
 
         if 0 < run_len <= gap and last_owner != -1:
-            # attribute these "stitch" tokens to last_owner
             added[last_owner] += run_len
-            # also fill owner for completeness
             for t in range(i, j):
                 owner[t] = last_owner
 
@@ -194,9 +165,8 @@ def _apply_marginal_C_tokens_gapclose(hits: List[Dict[str, Any]]) -> None:
     if any(added):
         for idx, add_n in enumerate(added):
             if add_n > 0:
-                hits[idx]["C"] = float(hits[idx].get("C", 0.0)) + (add_n / total_tokens)
+                hits[idx]["C"] = float(hits[idx].get("C", 0.0) or 0.0) + (add_n / total_tokens)
 
-    # Optional: expose total_tokens used for normalization
     for h in hits:
         h["C_total_tokens"] = total_tokens
 
@@ -211,6 +181,7 @@ async def _load_doc_text_and_index_norm(db: AsyncSession, doc_id: int) -> Tuple[
         return None, False
 
     meta = _load_upload_meta(doc.external_id)
+    # invariant: input was normalized, internal index normalize is off
     index_normalize = bool(meta.get("index_normalize", False))
 
     try:
@@ -268,10 +239,6 @@ async def search_sources_windowed_1_4(
     win_tokens: int = 120,
     stride_tokens: int = 60,
 ) -> Dict[str, Any]:
-    """
-    Returns:
-      {"C": float, "segments":[{"source_doc_id","q_tok_from","q_tok_to"}, ...]}
-    """
     index_dirs, _by_dir = await _collect_index_dirs(db, organization_id=organization_id, shard_id=shard_id)
 
     data = seg_search_windowed_sources(
@@ -321,19 +288,21 @@ async def search_levels_1_4(
     Flat search: returns {"count","hits":[...]}.
 
     IMPORTANT:
-      - Per-hit C is rewritten to be a *summable* marginal TOKEN coverage contribution.
-      - Original doc-level engine coverage remains as C_doc.
+      - normalize_query forced False (prod invariant).
+      - spans must be present; we call native with include_matches=True but cap matches arrays to 0.
+      - Per-hit C is rewritten to TOKEN-marginal contribution; original doc-level engine coverage kept as C_doc.
     """
     normalize_query = False  # prod safety
 
     index_dirs, by_dir = await _collect_index_dirs(db, organization_id=organization_id, shard_id=shard_id)
 
+    # IMPORTANT: request spans reliably
     data = seg_search_many(
         query=query,
         top_k=top_k,
         index_dirs=index_dirs,
-        include_matches=False,
-        max_matches_per_doc=None,
+        include_matches=True,         # ensure spans exist even if engine gates them
+        max_matches_per_doc=0,        # keep payload small; q_pos/d_pos/h become empty
         normalize_query=normalize_query,
     )
 
@@ -345,6 +314,7 @@ async def search_levels_1_4(
     for h in hits:
         if not isinstance(h, dict):
             continue
+
         d = h.get("index_dir")
         meta = by_dir.get(d)
         if not meta and d:
@@ -356,9 +326,11 @@ async def search_levels_1_4(
         if meta:
             h.update(meta)
 
+        # normalize match_spans
         h["match_spans"] = _spans_to_match_spans(h.get("spans"))
+        # don't expose matches blob in prod response
+        h.pop("matches", None)
 
-    # NEW: rewrite C to token-marginal + stitch-gap closing
     _apply_marginal_C_tokens_gapclose([h for h in hits if isinstance(h, dict)])
 
     if include_user_view:
@@ -385,6 +357,7 @@ async def search_levels_1_4(
                 h["user_view"] = {"summary": "Текст документа недоступен", "spans": []}
                 continue
 
+            # invariant: index_normalize is off, but keep for compatibility
             normalize_text = bool(index_normalize)
             uv_spans = []
             total_sh = 0

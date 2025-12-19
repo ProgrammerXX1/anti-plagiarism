@@ -13,9 +13,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.services.helpers.file_extract import extract_text_from_file_bytes  # NEW
+from app.services.helpers.file_extract import extract_text_from_file_bytes
 from app.core.config import UPLOAD_DIR, N_SHARDS
-from app.core.logger import logger
 from app.db.session import get_db
 from app.models.document import Document
 from app.models.plagiarism_report import PlagiarismReportSource, PlagiarismReportMatch
@@ -44,7 +43,7 @@ class SourceItem(BaseModel):
 
 class MatchSourceItem(BaseModel):
     id: str
-    source_id: str                # internal doc_id (string) — MUST match SourceItem.id for joins
+    source_id: str                # internal doc_id (string) — joins to SourceItem.id
     q_offset: int
     q_limit: int
     s_offset: int
@@ -134,6 +133,7 @@ def _load_upload_meta_by_external_id(external_id: str) -> Dict[str, Any]:
     except Exception:
         return {}
 
+
 def _load_source_text_best_effort(doc: Optional[Document]) -> str:
     """
     Symmetric with indexing:
@@ -218,7 +218,6 @@ async def build_backend_contract(
     """
     processed_at_str = processed_at.isoformat()
 
-    # unique doc_ids
     uniq_doc_ids: List[str] = []
     seen: set[str] = set()
     for h in hits:
@@ -227,7 +226,6 @@ async def build_backend_contract(
             seen.add(did)
             uniq_doc_ids.append(did)
 
-    # fetch Document rows once
     doc_cache: Dict[str, Optional[Document]] = {}
     for did in uniq_doc_ids:
         doc_cache[did] = None
@@ -238,13 +236,18 @@ async def build_backend_contract(
         except Exception:
             doc_cache[did] = None
 
-    # build sources
     sources: List[SourceItem] = []
     for did in uniq_doc_ids:
         doc = doc_cache.get(did)
         meta = _load_upload_meta_by_external_id(doc.external_id) if doc and getattr(doc, "external_id", None) else {}
 
         external_source_id = str(meta.get("source_id") or did)
+        # index_date: prefer doc.created_at if present
+        if doc and getattr(doc, "created_at", None):
+            idx_date = doc.created_at.isoformat()
+        else:
+            idx_date = processed_at_str
+
         sources.append(
             SourceItem(
                 id=did,
@@ -253,18 +256,14 @@ async def build_backend_contract(
                 name=str((getattr(doc, "title", None) or meta.get("title") or "")),
                 url=meta.get("url"),
                 author=(str(getattr(doc, "student_name", None) or meta.get("author") or "") or None),
-                index_date=str(
-                    getattr(doc, "created_at", None).isoformat()
-                    if doc and getattr(doc, "created_at", None)
-                    else processed_at_str
-                ),
+                index_date=str(idx_date),
             )
         )
 
-    # matchsources
     matchsources: List[MatchSourceItem] = []
 
-    normalize_query_offsets = False  # MUST match search normalize_query=False
+    # Invariant: ingestion text already normalized; query offsets computed without extra normalization
+    normalize_query_offsets = False
     match_id = 1
 
     for h in hits:
@@ -275,10 +274,8 @@ async def build_backend_contract(
         doc = doc_cache.get(did)
         source_text = _load_source_text_best_effort(doc)
 
+        # Invariant: indexed source texts are already normalized; excerpt should NOT normalize
         source_norm = False
-        if doc and getattr(doc, "external_id", None):
-            meta = _load_upload_meta_by_external_id(doc.external_id)
-            source_norm = bool(meta.get("index_normalize", False))
 
         spans = h.get("match_spans") or []
         if not isinstance(spans, list):
@@ -327,7 +324,6 @@ async def build_backend_contract(
             )
             match_id += 1
 
-    # percentages (берём C как уже “summable” из search_service)
     c_sum = 0.0
     for h in hits:
         c_sum += float(h.get("C", 0.0) or 0.0)
@@ -357,9 +353,10 @@ async def persist_report(
     shard_id: int,
     processed_at: datetime,
     contract: BackendContractResponse,
+    doc_cache: Optional[Dict[str, Optional[Document]]] = None,
 ) -> None:
     """
-    DB writer (no contract building). No internal rollback of caller’s work except own.
+    DB writer.
     Caller controls commit/rollback scope.
     """
     report = await upsert_report(
@@ -376,8 +373,15 @@ async def persist_report(
         internal_doc_id=None,
     )
 
+    # Build sources with consistent index_date (prefer Document.created_at)
     db_sources: List[PlagiarismReportSource] = []
     for s in contract.sources:
+        doc_dt = None
+        if doc_cache is not None:
+            d = doc_cache.get(s.id)
+            if d and getattr(d, "created_at", None):
+                doc_dt = d.created_at
+
         db_sources.append(
             PlagiarismReportSource(
                 report_id=report.id,
@@ -387,7 +391,7 @@ async def persist_report(
                 name=s.name,
                 url=s.url,
                 author=s.author,
-                index_date=processed_at,
+                index_date=(doc_dt or processed_at),
             )
         )
 
@@ -425,8 +429,6 @@ async def prod_v1_ingest(
         raise HTTPException(status_code=400, detail="Nothing to do")
 
     now = utcnow()
-
-    # пока N_SHARDS=1 -> shard_id=0; но формула единая
     shard_id = compute_shard_id(req.organization_id)
 
     # ── SEARCH ONLY ────────────────────────────
@@ -436,14 +438,32 @@ async def prod_v1_ingest(
             organization_id=req.organization_id,
             shard_id=shard_id,
             query=req.text,
-            normalize_query=False,
+            normalize_query=False,  # forced anyway
         )
         hits = _cleanup_search_hits_for_contract(raw)
+
+        # build doc_cache once and pass into persist_report (index_date consistency)
+        uniq = []
+        seen = set()
+        for h in hits:
+            did = str(h.get("doc_id", "")).strip()
+            if did and did not in seen:
+                seen.add(did)
+                uniq.append(did)
+
+        doc_cache: Dict[str, Optional[Document]] = {}
+        for did in uniq:
+            doc_cache[did] = None
+            if did.isdigit():
+                try:
+                    doc_cache[did] = await db.get(Document, int(did))
+                except Exception:
+                    doc_cache[did] = None
 
         contract = await build_backend_contract(db, req=req, hits=hits, processed_at=now)
 
         try:
-            await persist_report(db, req=req, shard_id=shard_id, processed_at=now, contract=contract)
+            await persist_report(db, req=req, shard_id=shard_id, processed_at=now, contract=contract, doc_cache=doc_cache)
             await db.commit()
         except Exception:
             await db.rollback()
@@ -463,6 +483,7 @@ async def prod_v1_ingest(
     file_path = UPLOAD_DIR / external_id
     meta_path = UPLOAD_DIR / f"{external_id}.meta.json"
 
+    # Invariant: backend sends normalized text to ingest always
     meta: Dict[str, Any] = {
         "organization_id": int(req.organization_id),
         "document_id": str(req.document_id),
@@ -472,8 +493,11 @@ async def prod_v1_ingest(
         "file_name": req.file_name,
         "enable_ocr": bool(req.enable_ocr),
         "saved_at": now.isoformat(),
+
+        # IMPORTANT: normalized input invariant
         "text_is_normalized": True,
         "index_normalize": False,
+
         "module_id": "plagiarism",
         "source_id": str(req.document_id),
         "url": None,
@@ -515,7 +539,6 @@ async def prod_v1_ingest(
                 pass
         raise HTTPException(status_code=500, detail=f"DB commit failed: {e}")
 
-    # optional post-index search
     hits: List[Dict[str, Any]] = []
     if req.do_search:
         raw = await search_levels_1_4(
@@ -527,10 +550,28 @@ async def prod_v1_ingest(
         )
         hits = _cleanup_search_hits_for_contract(raw)
 
+    # doc_cache for index_date consistency
+    uniq = []
+    seen = set()
+    for h in hits:
+        did = str(h.get("doc_id", "")).strip()
+        if did and did not in seen:
+            seen.add(did)
+            uniq.append(did)
+
+    doc_cache: Dict[str, Optional[Document]] = {}
+    for did in uniq:
+        doc_cache[did] = None
+        if did.isdigit():
+            try:
+                doc_cache[did] = await db.get(Document, int(did))
+            except Exception:
+                doc_cache[did] = None
+
     contract = await build_backend_contract(db, req=req, hits=hits, processed_at=now)
 
     try:
-        await persist_report(db, req=req, shard_id=shard_id, processed_at=now, contract=contract)
+        await persist_report(db, req=req, shard_id=shard_id, processed_at=now, contract=contract, doc_cache=doc_cache)
         await db.commit()
     except Exception:
         await db.rollback()
