@@ -55,15 +55,3 @@ services:
     cpuset: "8-23"
     cpus: "16"
     restart: always
-
-  # НЕОБЯЗАТЕЛЬНО, ТОЛЬКО ДЛЯ ОДНОРАЗОВЫХ ЗАПУСКОВ
-  # plagio-enqueue:
-  #   build: .
-  #   command: ["python", "-m", "app.scripts.enqueue_test_tasks"]
-  #   environment:
-  #     - PG_HOST=192.168.75.70
-  #     - PG_PORT=5432
-  #     - PG_DB=oysyn
-  #     - PG_USER=oysyn
-  #     - PG_PASS=2123
-  #   restart: "no"
