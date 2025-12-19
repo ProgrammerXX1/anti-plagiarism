@@ -4,17 +4,17 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.document import Document
 from app.core.config import N_SHARDS
-from app.core.settings_index import calc_shard_id_from_meta
+from app.models.document import Document
 
 
-def calc_shard_id_from_org(organization_id: int) -> int:
+def calc_shard_id(organization_id: int) -> int:
     """
-    Единое распределение для случаев, когда нет meta (university/faculty/group_name).
+    Единственный источник истины по shard_id:
+    shard_id = organization_id % N_SHARDS (если N_SHARDS <= 1 -> 0)
     """
     try:
         n = int(N_SHARDS or 0)
@@ -23,27 +23,6 @@ def calc_shard_id_from_org(organization_id: int) -> int:
     if n <= 1:
         return 0
     return int(organization_id) % n
-
-
-async def list_unsegmented_docs_for_shard(
-    db: AsyncSession,
-    *,
-    organization_id: int,
-    shard_id: int,
-    limit: int,
-) -> list[Document]:
-    res = await db.execute(
-        select(Document)
-        .where(
-            Document.organization_id == organization_id,
-            Document.shard_id == shard_id,
-            Document.segment_id.is_(None),
-            Document.status == "uploaded",
-        )
-        .order_by(Document.id)
-        .limit(limit)
-    )
-    return list(res.scalars().all())
 
 
 async def create_document(
@@ -61,18 +40,10 @@ async def create_document(
     now = datetime.now(timezone.utc)
 
     if shard_id is None:
-        # старое поведение — если есть meta
-        if any([university, faculty, group_name]):
-            shard_id = calc_shard_id_from_meta(
-                university=university,
-                faculty=faculty,
-                group_name=group_name,
-            )
-        else:
-            shard_id = calc_shard_id_from_org(organization_id)
+        shard_id = calc_shard_id(organization_id)
 
     doc = Document(
-        organization_id=organization_id,
+        organization_id=int(organization_id),
         external_id=external_id,
         shard_id=int(shard_id),
         status="uploaded",
@@ -101,7 +72,7 @@ async def set_document_status(
     now = datetime.now(timezone.utc)
     stmt = (
         update(Document)
-        .where(Document.id == doc_id)
+        .where(Document.id == int(doc_id))
         .values(
             status=status,
             segment_id=segment_id,
@@ -114,5 +85,5 @@ async def set_document_status(
 
 
 async def get_document(db: AsyncSession, doc_id: int) -> Optional[Document]:
-    res = await db.execute(select(Document).where(Document.id == doc_id))
+    res = await db.execute(select(Document).where(Document.id == int(doc_id)))
     return res.scalar_one_or_none()

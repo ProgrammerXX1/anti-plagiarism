@@ -1,14 +1,10 @@
+# app/models/document.py
+from __future__ import annotations
+
 from datetime import datetime
 from typing import Optional, List
 
-from sqlalchemy import (
-    BigInteger,
-    Integer,
-    String,
-    Text,
-    DateTime,
-    ForeignKey,
-)
+from sqlalchemy import BigInteger, Integer, String, Text, DateTime, ForeignKey, Index
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -19,20 +15,18 @@ class Document(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
 
-    # NEW
-    organization_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    organization_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    shard_id: Mapped[int] = mapped_column(Integer, nullable=False)
 
     external_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    shard_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
 
     segment_id: Mapped[Optional[int]] = mapped_column(
         BigInteger,
         ForeignKey("segments.id", ondelete="SET NULL"),
         nullable=True,
-        index=True,
     )
 
-    status: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
 
     simhash_hi: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     simhash_lo: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
@@ -53,4 +47,12 @@ class Document(Base):
         "SegmentDoc",
         back_populates="document",
         cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    __table_args__ = (
+        # основной индекс под ETL/L1: uploaded/etl_ok/indexed + segment_id is null
+        Index("idx_documents_org_shard_status_seg", "organization_id", "shard_id", "status", "segment_id"),
+        # полезно для join по сегменту (например, overview/cleanup)
+        Index("idx_documents_segment_id", "segment_id"),
     )

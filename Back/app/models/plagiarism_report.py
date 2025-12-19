@@ -1,3 +1,4 @@
+# app/models/plagiarism_report.py
 from __future__ import annotations
 
 from datetime import datetime
@@ -6,17 +7,18 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.db.base import Base  # где у тебя declarative base
+from app.db.base import Base
+
 
 class PlagiarismReport(Base):
     __tablename__ = "plagiarism_reports"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
 
-    organization_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    organization_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     shard_id: Mapped[int] = mapped_column(Integer, nullable=False)
 
-    document_id: Mapped[str] = mapped_column(Text, nullable=False)  # внешний id запроса
+    document_id: Mapped[str] = mapped_column(Text, nullable=False)
     internal_doc_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     status: Mapped[str] = mapped_column(Text, nullable=False)
@@ -27,11 +29,23 @@ class PlagiarismReport(Base):
     legal_percentage: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     unknown_percentage: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
 
-    sources = relationship("PlagiarismReportSource", back_populates="report", cascade="all, delete-orphan")
-    matches = relationship("PlagiarismReportMatch", back_populates="report", cascade="all, delete-orphan")
+    sources: Mapped[list["PlagiarismReportSource"]] = relationship(
+        "PlagiarismReportSource",
+        back_populates="report",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    matches: Mapped[list["PlagiarismReportMatch"]] = relationship(
+        "PlagiarismReportMatch",
+        back_populates="report",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
     __table_args__ = (
         UniqueConstraint("organization_id", "document_id", name="uq_plagiarism_reports_org_doc"),
+        Index("idx_plagiarism_reports_org_processed", "organization_id", "processed_at"),
+        Index("idx_plagiarism_reports_org_shard_processed", "organization_id", "shard_id", "processed_at"),
     )
 
 
@@ -39,7 +53,12 @@ class PlagiarismReportSource(Base):
     __tablename__ = "plagiarism_report_sources"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    report_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("plagiarism_reports.id", ondelete="CASCADE"), nullable=False)
+
+    report_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("plagiarism_reports.id", ondelete="CASCADE"),
+        nullable=False,
+    )
 
     source_id: Mapped[str] = mapped_column(Text, nullable=False)
     internal_source_doc_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -50,10 +69,12 @@ class PlagiarismReportSource(Base):
     author: Mapped[str | None] = mapped_column(Text, nullable=True)
     index_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
-    report = relationship("PlagiarismReport", back_populates="sources")
+    report: Mapped["PlagiarismReport"] = relationship("PlagiarismReport", back_populates="sources")
 
     __table_args__ = (
         UniqueConstraint("report_id", "source_id", name="uq_pr_sources_report_source"),
+        Index("idx_pr_sources_report", "report_id"),
+        Index("idx_pr_sources_internal_source_doc_id", "internal_source_doc_id"),
     )
 
 
@@ -61,7 +82,12 @@ class PlagiarismReportMatch(Base):
     __tablename__ = "plagiarism_report_matches"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    report_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("plagiarism_reports.id", ondelete="CASCADE"), nullable=False)
+
+    report_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("plagiarism_reports.id", ondelete="CASCADE"),
+        nullable=False,
+    )
 
     source_id: Mapped[str] = mapped_column(Text, nullable=False)
 
@@ -77,9 +103,8 @@ class PlagiarismReportMatch(Base):
     d_from: Mapped[int | None] = mapped_column(Integer, nullable=True)
     d_to: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
-    report = relationship("PlagiarismReport", back_populates="matches")
+    report: Mapped["PlagiarismReport"] = relationship("PlagiarismReport", back_populates="matches")
 
     __table_args__ = (
-        Index("idx_prm_report_id", "report_id"),
         Index("idx_prm_report_source", "report_id", "source_id"),
     )

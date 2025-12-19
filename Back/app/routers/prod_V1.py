@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.helpers.file_extract import extract_text_from_file_bytes  # NEW
 from app.core.config import UPLOAD_DIR, N_SHARDS
 from app.core.logger import logger
 from app.db.session import get_db
@@ -133,11 +134,11 @@ def _load_upload_meta_by_external_id(external_id: str) -> Dict[str, Any]:
     except Exception:
         return {}
 
-
 def _load_source_text_best_effort(doc: Optional[Document]) -> str:
     """
-    Best-effort loader. For now: txt only.
-    If you need docx/pdf support, reuse extract_text_from_file_bytes as in search_service.
+    Symmetric with indexing:
+      - .txt -> decode utf-8
+      - others (docx/pdf/...) -> extract_text_from_file_bytes
     """
     if not doc or not getattr(doc, "external_id", None):
         return ""
@@ -146,7 +147,9 @@ def _load_source_text_best_effort(doc: Optional[Document]) -> str:
         return ""
     try:
         raw = p.read_bytes()
-        return raw.decode("utf-8", errors="ignore")
+        if p.suffix.lower() == ".txt":
+            return raw.decode("utf-8", errors="ignore")
+        return extract_text_from_file_bytes(raw, filename=str(p))
     except Exception:
         return ""
 
@@ -202,30 +205,18 @@ async def _excerpt_offset_limit(
 # Contract builder + DB persist
 # ───────────────────────────────────────────────
 
-async def build_backend_contract_and_persist(
+async def build_backend_contract(
     db: AsyncSession,
     *,
     req: ProdV1IngestRequest,
     hits: List[Dict[str, Any]],
     processed_at: datetime,
-    shard_id: int,
 ) -> BackendContractResponse:
+    """
+    PURE builder (no commits).
+    DB reads are allowed (Document fetch), but no writes and no commit/rollback.
+    """
     processed_at_str = processed_at.isoformat()
-
-    # cache docs by internal doc_id
-    doc_cache: Dict[str, Optional[Document]] = {}
-
-    def get_doc_cached(did: str) -> Optional[Document]:
-        if did in doc_cache:
-            return doc_cache[did]
-        try:
-            doc_cache[did] = None
-            if did.isdigit():
-                # NOTE: db.get is async; cache fill happens outside. Caller must await separately.
-                return None
-        except Exception:
-            return None
-        return None
 
     # unique doc_ids
     uniq_doc_ids: List[str] = []
@@ -237,9 +228,8 @@ async def build_backend_contract_and_persist(
             uniq_doc_ids.append(did)
 
     # fetch Document rows once
+    doc_cache: Dict[str, Optional[Document]] = {}
     for did in uniq_doc_ids:
-        if did in doc_cache:
-            continue
         doc_cache[did] = None
         if not did.isdigit():
             continue
@@ -255,26 +245,28 @@ async def build_backend_contract_and_persist(
         meta = _load_upload_meta_by_external_id(doc.external_id) if doc and getattr(doc, "external_id", None) else {}
 
         external_source_id = str(meta.get("source_id") or did)
-
         sources.append(
             SourceItem(
-                id=did,  # internal key
+                id=did,
                 source_id=external_source_id,
                 module_id=str(meta.get("module_id") or "plagiarism"),
                 name=str((getattr(doc, "title", None) or meta.get("title") or "")),
                 url=meta.get("url"),
                 author=(str(getattr(doc, "student_name", None) or meta.get("author") or "") or None),
-                index_date=str(getattr(doc, "created_at", None).isoformat() if doc and getattr(doc, "created_at", None) else processed_at_str),
+                index_date=str(
+                    getattr(doc, "created_at", None).isoformat()
+                    if doc and getattr(doc, "created_at", None)
+                    else processed_at_str
+                ),
             )
         )
 
-    # matchsources: 2 pairs
+    # matchsources
     matchsources: List[MatchSourceItem] = []
 
-    # MUST match search normalize_query=False for offsets computed on req.text
-    normalize_query_offsets = False
-
+    normalize_query_offsets = False  # MUST match search normalize_query=False
     match_id = 1
+
     for h in hits:
         did = str(h.get("doc_id", "")).strip()
         if not did:
@@ -322,11 +314,10 @@ async def build_backend_contract_and_persist(
                     normalize_text=source_norm,
                 )
 
-            # if source text isn't available, keep record with zeros (better than dropping)
             matchsources.append(
                 MatchSourceItem(
                     id=str(match_id),
-                    source_id=did,  # internal key
+                    source_id=did,
                     q_offset=int(q_offset),
                     q_limit=int(q_limit),
                     s_offset=int(s_offset),
@@ -336,7 +327,7 @@ async def build_backend_contract_and_persist(
             )
             match_id += 1
 
-    # percentages
+    # percentages (берём C как уже “summable” из search_service)
     c_sum = 0.0
     for h in hits:
         c_sum += float(h.get("C", 0.0) or 0.0)
@@ -344,59 +335,6 @@ async def build_backend_contract_and_persist(
 
     plagiarism_pct = round(c_sum * 100.0, 2)
     unknown_pct = round(max(0.0, 100.0 - plagiarism_pct), 2)
-
-    # ── persist to DB ───────────────────────────
-    try:
-        report = await upsert_report(
-            db,
-            organization_id=req.organization_id,
-            shard_id=shard_id,
-            document_id=req.document_id,
-            status="completed",
-            processed_at=processed_at,
-            plagiarism_percentage=plagiarism_pct,
-            selfcite_percentage=0.0,
-            legal_percentage=0.0,
-            unknown_percentage=unknown_pct,
-            internal_doc_id=None,
-        )
-
-        db_sources: List[PlagiarismReportSource] = []
-        for s in sources:
-            db_sources.append(
-                PlagiarismReportSource(
-                    report_id=report.id,
-                    # IMPORTANT: internal join key
-                    source_id=s.id,  # internal doc_id string
-                    internal_source_doc_id=int(s.id) if s.id.isdigit() else None,
-                    module_id=s.module_id,
-                    name=s.name,
-                    url=s.url,
-                    author=s.author,
-                    index_date=processed_at,
-                    # if you want external_source_id in DB, add a column; for now it's in API only
-                )
-            )
-
-        db_matches: List[PlagiarismReportMatch] = []
-        for m in matchsources:
-            db_matches.append(
-                PlagiarismReportMatch(
-                    report_id=report.id,
-                    source_id=m.source_id,  # internal doc_id string
-                    q_offset=m.q_offset,
-                    q_limit=m.q_limit,
-                    s_offset=m.s_offset,
-                    s_limit=m.s_limit,
-                    type=m.type,
-                )
-            )
-
-        await replace_report_children(db, report_id=report.id, sources=db_sources, matches=db_matches)
-        await db.commit()
-    except Exception:
-        await db.rollback()
-        raise
 
     return BackendContractResponse(
         document_id=req.document_id,
@@ -412,6 +350,64 @@ async def build_backend_contract_and_persist(
     )
 
 
+async def persist_report(
+    db: AsyncSession,
+    *,
+    req: ProdV1IngestRequest,
+    shard_id: int,
+    processed_at: datetime,
+    contract: BackendContractResponse,
+) -> None:
+    """
+    DB writer (no contract building). No internal rollback of caller’s work except own.
+    Caller controls commit/rollback scope.
+    """
+    report = await upsert_report(
+        db,
+        organization_id=req.organization_id,
+        shard_id=shard_id,
+        document_id=req.document_id,
+        status=contract.status,
+        processed_at=processed_at,
+        plagiarism_percentage=contract.plagiarism_percentage,
+        selfcite_percentage=contract.selfcite_percentage,
+        legal_percentage=contract.legal_percentage,
+        unknown_percentage=contract.unknown_percentage,
+        internal_doc_id=None,
+    )
+
+    db_sources: List[PlagiarismReportSource] = []
+    for s in contract.sources:
+        db_sources.append(
+            PlagiarismReportSource(
+                report_id=report.id,
+                source_id=s.id,  # internal doc_id string join key
+                internal_source_doc_id=int(s.id) if s.id.isdigit() else None,
+                module_id=s.module_id,
+                name=s.name,
+                url=s.url,
+                author=s.author,
+                index_date=processed_at,
+            )
+        )
+
+    db_matches: List[PlagiarismReportMatch] = []
+    for m in contract.matchsources:
+        db_matches.append(
+            PlagiarismReportMatch(
+                report_id=report.id,
+                source_id=m.source_id,
+                q_offset=m.q_offset,
+                q_limit=m.q_limit,
+                s_offset=m.s_offset,
+                s_limit=m.s_limit,
+                type=m.type,
+            )
+        )
+
+    await replace_report_children(db, report_id=report.id, sources=db_sources, matches=db_matches)
+
+
 # ───────────────────────────────────────────────
 # API
 # ───────────────────────────────────────────────
@@ -425,11 +421,12 @@ async def prod_v1_ingest(
 
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="Empty text")
-
     if not req.do_index and not req.do_search:
         raise HTTPException(status_code=400, detail="Nothing to do")
 
     now = utcnow()
+
+    # пока N_SHARDS=1 -> shard_id=0; но формула единая
     shard_id = compute_shard_id(req.organization_id)
 
     # ── SEARCH ONLY ────────────────────────────
@@ -443,21 +440,16 @@ async def prod_v1_ingest(
         )
         hits = _cleanup_search_hits_for_contract(raw)
 
-        logger.info(
-            "[prod_v1] search-only ext_doc=%s org=%s shard=%s hits=%s",
-            req.document_id,
-            req.organization_id,
-            shard_id,
-            len(hits),
-        )
+        contract = await build_backend_contract(db, req=req, hits=hits, processed_at=now)
 
-        return await build_backend_contract_and_persist(
-            db,
-            req=req,
-            hits=hits,
-            processed_at=now,
-            shard_id=shard_id,
-        )
+        try:
+            await persist_report(db, req=req, shard_id=shard_id, processed_at=now, contract=contract)
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+
+        return contract
 
     # ── INDEX ─────────────────────────────────
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -480,9 +472,8 @@ async def prod_v1_ingest(
         "file_name": req.file_name,
         "enable_ocr": bool(req.enable_ocr),
         "saved_at": now.isoformat(),
-        "text_is_normalized": True,   # assumption (keep)
-        "index_normalize": False,     # keep
-        # optional meta fields (best-effort)
+        "text_is_normalized": True,
+        "index_normalize": False,
         "module_id": "plagiarism",
         "source_id": str(req.document_id),
         "url": None,
@@ -536,23 +527,13 @@ async def prod_v1_ingest(
         )
         hits = _cleanup_search_hits_for_contract(raw)
 
-        if hasattr(doc, "last_checked_at"):
-            doc.last_checked_at = now
-            await db.commit()
+    contract = await build_backend_contract(db, req=req, hits=hits, processed_at=now)
 
-    logger.info(
-        "[prod_v1] indexed ext_doc=%s internal_id=%s org=%s shard=%s hits=%s",
-        req.document_id,
-        getattr(doc, "id", None),
-        req.organization_id,
-        shard_id,
-        len(hits),
-    )
+    try:
+        await persist_report(db, req=req, shard_id=shard_id, processed_at=now, contract=contract)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
 
-    return await build_backend_contract_and_persist(
-        db,
-        req=req,
-        hits=hits,
-        processed_at=now,
-        shard_id=shard_id,
-    )
+    return contract

@@ -1,17 +1,11 @@
 # app/models/index_error.py
-from datetime import datetime
-from typing import Optional
+from __future__ import annotations
 
-from sqlalchemy import (
-    BigInteger,
-    Integer,
-    String,
-    Text,
-    DateTime,
-    ForeignKey,
-    JSON,
-)
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from datetime import datetime
+from typing import Optional, Any, Dict
+
+from sqlalchemy import BigInteger, Integer, String, Text, DateTime, ForeignKey, JSON, Index
+from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
 
@@ -35,9 +29,14 @@ class IndexError(Base):
     stage: Mapped[str] = mapped_column(String(16), nullable=False)
     error_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    payload: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    payload: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
 
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    __table_args__ = (
+        Index("idx_index_errors_stage_created", "stage", "created_at"),
+        Index("idx_index_errors_doc_id", "doc_id"),
+        Index("idx_index_errors_segment_id", "segment_id"),
+        Index("idx_index_errors_created_at", "created_at"),
+    )
