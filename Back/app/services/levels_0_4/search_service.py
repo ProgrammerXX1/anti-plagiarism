@@ -23,6 +23,25 @@ MAX_SPANS_PER_HIT = 3
 
 C_TOK_GAP_CLOSE = K_SHINGLE - 1  # 8
 
+def _load_upload_meta_best_effort(*, doc_id: int, external_id: Optional[str]) -> Dict[str, Any]:
+    # new layout: {doc_id}.meta.json
+    p1 = UPLOAD_DIR / f"{int(doc_id)}.meta.json"
+    if p1.exists():
+        try:
+            return json.loads(p1.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    # legacy: {external_id}.meta.json
+    if external_id:
+        p2 = UPLOAD_DIR / f"{str(external_id)}.meta.json"
+        if p2.exists():
+            try:
+                return json.loads(p2.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+
+    return {}
 
 def _load_upload_meta(external_id: str) -> Dict[str, Any]:
     p = UPLOAD_DIR / f"{external_id}.meta.json"
@@ -170,18 +189,23 @@ def _apply_marginal_C_tokens_gapclose(hits: List[Dict[str, Any]]) -> None:
     for h in hits:
         h["C_total_tokens"] = total_tokens
 
-
 async def _load_doc_text_and_index_norm(db: AsyncSession, doc_id: int) -> Tuple[Optional[str], bool]:
     doc = await db.get(Document, doc_id)
-    if not doc or not doc.external_id:
+    if not doc:
         return None, False
 
-    file_path = UPLOAD_DIR / doc.external_id
+    # new: {doc.id}.txt
+    file_path = UPLOAD_DIR / f"{int(doc.id)}.txt"
+    if not file_path.exists() and getattr(doc, "external_id", None):
+        # legacy: UPLOAD_DIR / external_id (file-key)
+        legacy = UPLOAD_DIR / str(doc.external_id)
+        if legacy.exists():
+            file_path = legacy
+
     if not file_path.exists():
         return None, False
 
-    meta = _load_upload_meta(doc.external_id)
-    # invariant: input was normalized, internal index normalize is off
+    meta = _load_upload_meta_best_effort(doc_id=int(doc.id), external_id=getattr(doc, "external_id", None))
     index_normalize = bool(meta.get("index_normalize", False))
 
     try:
@@ -191,6 +215,7 @@ async def _load_doc_text_and_index_norm(db: AsyncSession, doc_id: int) -> Tuple[
         return extract_text_from_file_bytes(raw, filename=str(file_path)), index_normalize
     except Exception:
         return None, index_normalize
+
 
 
 async def _collect_index_dirs(

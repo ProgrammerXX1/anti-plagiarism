@@ -3,7 +3,6 @@ from __future__ import annotations
 from functools import partial
 import json
 import os
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -124,34 +123,56 @@ def _write_json_atomic(path: Path, obj: Dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def _load_upload_meta_by_external_id(external_id: str) -> Dict[str, Any]:
-    p = UPLOAD_DIR / f"{external_id}.meta.json"
-    if not p.exists():
+def _load_upload_meta_best_effort(doc: Optional[Document]) -> Dict[str, Any]:
+    """
+    New layout:  UPLOAD_DIR/{doc.id}.meta.json
+    Legacy:      UPLOAD_DIR/{doc.external_id}.meta.json   (when external_id used to be a file-key)
+    """
+    if not doc:
         return {}
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+
+    candidates: List[Path] = []
+    if getattr(doc, "id", None) is not None:
+        candidates.append(UPLOAD_DIR / f"{int(doc.id)}.meta.json")
+    if getattr(doc, "external_id", None):
+        candidates.append(UPLOAD_DIR / f"{str(doc.external_id)}.meta.json")
+
+    for p in candidates:
+        if not p.exists():
+            continue
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
 
 
 def _load_source_text_best_effort(doc: Optional[Document]) -> str:
     """
     Symmetric with indexing:
-      - .txt -> decode utf-8
-      - others (docx/pdf/...) -> extract_text_from_file_bytes
+      New layout: UPLOAD_DIR/{doc.id}.txt (utf-8)
+      Legacy:     UPLOAD_DIR/{doc.external_id} (file-key, may be .txt/.pdf/.docx/...)
     """
-    if not doc or not getattr(doc, "external_id", None):
+    if not doc:
         return ""
-    p = UPLOAD_DIR / doc.external_id
-    if not p.exists():
-        return ""
-    try:
-        raw = p.read_bytes()
-        if p.suffix.lower() == ".txt":
-            return raw.decode("utf-8", errors="ignore")
-        return extract_text_from_file_bytes(raw, filename=str(p))
-    except Exception:
-        return ""
+
+    candidates: List[Path] = []
+    if getattr(doc, "id", None) is not None:
+        candidates.append(UPLOAD_DIR / f"{int(doc.id)}.txt")
+    if getattr(doc, "external_id", None):
+        candidates.append(UPLOAD_DIR / str(doc.external_id))
+
+    for p in candidates:
+        if not p.exists():
+            continue
+        try:
+            raw = p.read_bytes()
+            if p.suffix.lower() == ".txt":
+                return raw.decode("utf-8", errors="ignore")
+            return extract_text_from_file_bytes(raw, filename=str(p))
+        except Exception:
+            return ""
+    return ""
 
 
 def _cleanup_search_hits_for_contract(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -239,10 +260,10 @@ async def build_backend_contract(
     sources: List[SourceItem] = []
     for did in uniq_doc_ids:
         doc = doc_cache.get(did)
-        meta = _load_upload_meta_by_external_id(doc.external_id) if doc and getattr(doc, "external_id", None) else {}
+        meta = _load_upload_meta_best_effort(doc)
 
         external_source_id = str(meta.get("source_id") or did)
-        # index_date: prefer doc.created_at if present
+
         if doc and getattr(doc, "created_at", None):
             idx_date = doc.created_at.isoformat()
         else:
@@ -262,7 +283,6 @@ async def build_backend_contract(
 
     matchsources: List[MatchSourceItem] = []
 
-    # Invariant: ingestion text already normalized; query offsets computed without extra normalization
     normalize_query_offsets = False
     match_id = 1
 
@@ -274,7 +294,6 @@ async def build_backend_contract(
         doc = doc_cache.get(did)
         source_text = _load_source_text_best_effort(doc)
 
-        # Invariant: indexed source texts are already normalized; excerpt should NOT normalize
         source_norm = False
 
         spans = h.get("match_spans") or []
@@ -333,7 +352,7 @@ async def build_backend_contract(
     unknown_pct = round(max(0.0, 100.0 - plagiarism_pct), 2)
 
     return BackendContractResponse(
-        document_id=req.document_id,
+        document_id=req.document_id,  # <-- внешний id из запроса
         status="completed",
         processed_at=processed_at_str,
         plagiarism_percentage=plagiarism_pct,
@@ -353,6 +372,7 @@ async def persist_report(
     shard_id: int,
     processed_at: datetime,
     contract: BackendContractResponse,
+    internal_doc_id: Optional[int] = None,
     doc_cache: Optional[Dict[str, Optional[Document]]] = None,
 ) -> None:
     """
@@ -363,17 +383,16 @@ async def persist_report(
         db,
         organization_id=req.organization_id,
         shard_id=shard_id,
-        document_id=req.document_id,
+        document_id=req.document_id,  # <-- внешний id
         status=contract.status,
         processed_at=processed_at,
         plagiarism_percentage=contract.plagiarism_percentage,
         selfcite_percentage=contract.selfcite_percentage,
         legal_percentage=contract.legal_percentage,
         unknown_percentage=contract.unknown_percentage,
-        internal_doc_id=None,
+        internal_doc_id=internal_doc_id,
     )
 
-    # Build sources with consistent index_date (prefer Document.created_at)
     db_sources: List[PlagiarismReportSource] = []
     for s in contract.sources:
         doc_dt = None
@@ -385,7 +404,7 @@ async def persist_report(
         db_sources.append(
             PlagiarismReportSource(
                 report_id=report.id,
-                source_id=s.id,  # internal doc_id string join key
+                source_id=s.id,
                 internal_source_doc_id=int(s.id) if s.id.isdigit() else None,
                 module_id=s.module_id,
                 name=s.name,
@@ -438,13 +457,12 @@ async def prod_v1_ingest(
             organization_id=req.organization_id,
             shard_id=shard_id,
             query=req.text,
-            normalize_query=False,  # forced anyway
+            normalize_query=False,
         )
         hits = _cleanup_search_hits_for_contract(raw)
 
-        # build doc_cache once and pass into persist_report (index_date consistency)
-        uniq = []
-        seen = set()
+        uniq: List[str] = []
+        seen: set[str] = set()
         for h in hits:
             did = str(h.get("doc_id", "")).strip()
             if did and did not in seen:
@@ -463,7 +481,15 @@ async def prod_v1_ingest(
         contract = await build_backend_contract(db, req=req, hits=hits, processed_at=now)
 
         try:
-            await persist_report(db, req=req, shard_id=shard_id, processed_at=now, contract=contract, doc_cache=doc_cache)
+            await persist_report(
+                db,
+                req=req,
+                shard_id=shard_id,
+                processed_at=now,
+                contract=contract,
+                internal_doc_id=None,
+                doc_cache=doc_cache,
+            )
             await db.commit()
         except Exception:
             await db.rollback()
@@ -474,18 +500,32 @@ async def prod_v1_ingest(
     # ── INDEX ─────────────────────────────────
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-    external_id = (
-        f"org_{req.organization_id}_"
-        f"doc_{req.document_id}_"
-        f"{int(now.timestamp())}_{uuid.uuid4().hex}.txt"
+    # 1) create DB row first (store external document_id in DB)
+    doc = Document(
+        external_id=req.document_id,  # <-- внешний id от другого сервиса
+        organization_id=req.organization_id,
+        shard_id=shard_id,
+        status="uploaded",
+        created_at=now,
+        updated_at=now,
+        title=req.title,
+        student_name=req.author,
     )
+    db.add(doc)
 
-    file_path = UPLOAD_DIR / external_id
-    meta_path = UPLOAD_DIR / f"{external_id}.meta.json"
+    try:
+        await db.flush()  # получаем doc.id без commit
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB flush failed: {e}")
 
-    # Invariant: backend sends normalized text to ingest always
+    # 2) write files by internal doc.id (safe unique filenames)
+    file_path = UPLOAD_DIR / f"{int(doc.id)}.txt"
+    meta_path = UPLOAD_DIR / f"{int(doc.id)}.meta.json"
+
     meta: Dict[str, Any] = {
         "organization_id": int(req.organization_id),
+        "internal_doc_id": int(doc.id),
         "document_id": str(req.document_id),
         "title": req.title,
         "author": req.author,
@@ -494,7 +534,6 @@ async def prod_v1_ingest(
         "enable_ocr": bool(req.enable_ocr),
         "saved_at": now.isoformat(),
 
-        # IMPORTANT: normalized input invariant
         "text_is_normalized": True,
         "index_normalize": False,
 
@@ -507,6 +546,7 @@ async def prod_v1_ingest(
         await anyio.to_thread.run_sync(lambda: _write_text_atomic(file_path, req.text))
         await anyio.to_thread.run_sync(lambda: _write_json_atomic(meta_path, meta))
     except Exception as e:
+        await db.rollback()
         for p in (file_path, meta_path):
             try:
                 if p.exists():
@@ -515,30 +555,7 @@ async def prod_v1_ingest(
                 pass
         raise HTTPException(status_code=500, detail=f"Failed to persist upload: {e}")
 
-    doc = Document(
-        external_id=external_id,
-        organization_id=req.organization_id,
-        shard_id=shard_id,
-        status="uploaded",
-        created_at=now,
-        updated_at=now,
-        title=req.title,
-        student_name=req.author,
-    )
-
-    db.add(doc)
-    try:
-        await db.commit()
-        await db.refresh(doc)
-    except Exception as e:
-        for p in (file_path, meta_path):
-            try:
-                if p.exists():
-                    p.unlink()
-            except Exception:
-                pass
-        raise HTTPException(status_code=500, detail=f"DB commit failed: {e}")
-
+    # 3) optional search
     hits: List[Dict[str, Any]] = []
     if req.do_search:
         raw = await search_levels_1_4(
@@ -550,9 +567,8 @@ async def prod_v1_ingest(
         )
         hits = _cleanup_search_hits_for_contract(raw)
 
-    # doc_cache for index_date consistency
-    uniq = []
-    seen = set()
+    uniq: List[str] = []
+    seen: set[str] = set()
     for h in hits:
         did = str(h.get("doc_id", "")).strip()
         if did and did not in seen:
@@ -571,10 +587,25 @@ async def prod_v1_ingest(
     contract = await build_backend_contract(db, req=req, hits=hits, processed_at=now)
 
     try:
-        await persist_report(db, req=req, shard_id=shard_id, processed_at=now, contract=contract, doc_cache=doc_cache)
+        await persist_report(
+            db,
+            req=req,
+            shard_id=shard_id,
+            processed_at=now,
+            contract=contract,
+            internal_doc_id=int(doc.id),
+            doc_cache=doc_cache,
+        )
         await db.commit()
+        await db.refresh(doc)
     except Exception:
         await db.rollback()
+        for p in (file_path, meta_path):
+            try:
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
         raise
 
     return contract

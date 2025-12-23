@@ -1,4 +1,3 @@
-# app/services/levels0_4/etl_service.py
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -13,6 +12,19 @@ from app.models.document import Document
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _upload_text_path_best_effort(doc: Document):
+    # new layout: {doc.id}.txt
+    p1 = UPLOAD_DIR / f"{int(doc.id)}.txt"
+    if p1.exists():
+        return p1
+    # legacy: external_id as file-key
+    if getattr(doc, "external_id", None):
+        p2 = UPLOAD_DIR / str(doc.external_id)
+        if p2.exists():
+            return p2
+    return p1  # default
 
 
 async def process_uploaded_docs() -> int:
@@ -35,18 +47,14 @@ async def process_uploaded_docs() -> int:
             docs: List[Document] = list(result.scalars())
 
             if not docs:
-                # без лишнего спама
                 return 0
 
             now = utcnow()
             processed = 0
 
             for doc in docs:
-                if not doc.external_id:
-                    # doc без файла — лучше оставлять uploaded и логировать отдельно
-                    continue
-
-                file_path = UPLOAD_DIR / doc.external_id
+                # doc.id всегда есть, external_id может быть внешний document_id
+                file_path = _upload_text_path_best_effort(doc)
                 if not file_path.exists():
                     # файл не найден — оставляем uploaded (может приехать позже)
                     continue
