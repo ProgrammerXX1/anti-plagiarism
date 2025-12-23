@@ -14,14 +14,14 @@ services:
       # пороги сегментации (можно и по дефолту оставить)
       - PLAGIO_ETL_BATCH_SIZE=100
       # сколько файлов в L1-сегменте
-      - PLAGIO_DOCS_PER_L1=3
+      - PLAGIO_DOCS_PER_L1=20
       # до какого уровня авто-компактим
-      - PLAGIO_MAX_AUTO_LEVEL=4
+      - PLAGIO_MAX_AUTO_LEVEL=10
       # сколько сегментов нижнего уровня сливаем
       # (для твоего случая: 10 L1 -> 1 L2, 10 L2 -> 1 L3, и т.д.)
-      - PLAGIO_SEGMENTS_PER_L2=3
-      - PLAGIO_SEGMENTS_PER_L3=3
-      - PLAGIO_SEGMENTS_PER_L4=3
+      - PLAGIO_SEGMENTS_PER_L2=10
+      - PLAGIO_SEGMENTS_PER_L3=10
+      - PLAGIO_SEGMENTS_PER_L4=10
       - PLAGIO_SEGMENTS_SO=/usr/local/lib/libplagio_segments.so
 
     volumes:
