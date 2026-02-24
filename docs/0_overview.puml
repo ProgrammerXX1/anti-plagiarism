@@ -63,9 +63,9 @@ seg_cache --> bsearch
 doc_cache --> score
 
 note right of shingle
-  **Posting9:**
-  {hash, doc_id, pos}
-  16 bytes, sorted
+  **Posting5:**
+  {h:u32, doc_id:u32, pos:u32}
+  12 bytes, sorted
 end note
 
 note right of sim

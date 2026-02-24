@@ -22,10 +22,10 @@ note right of bin
   ║ HeaderV2 (28 bytes)            ║
   ╠════════════════════════════════╣
   ║ magic[4] = "PLAG"              ║
-  ║ version = 2                    ║
+  ║ version = 3                    ║
   ║ n_docs: uint32                 ║
-  ║ n_post9: uint64                ║
-  ║ n_post13: uint64 (unused = 0)  ║
+  ║ n_post5: uint64                ║
+  ║ _reserved: uint64 (= 0)        ║
   ╠════════════════════════════════╣
   ║ DocMeta[n_docs] (20 bytes each)║
   ╠════════════════════════════════╣
@@ -33,9 +33,9 @@ note right of bin
   ║ simhash_hi: uint64             ║
   ║ simhash_lo: uint64             ║
   ╠════════════════════════════════╣
-  ║ Posting9[n_post9] (16 bytes)   ║
+  ║ Posting5[n_post5] (12 bytes)   ║
   ╠════════════════════════════════╣
-  ║ h: uint64 (shingle hash)       ║
+  ║ h: uint32 (shingle hash trunc) ║
   ║ did: uint32 (doc internal id)  ║
   ║ pos: uint32 (token position)   ║
   ╚════════════════════════════════╝
@@ -43,10 +43,10 @@ note right of bin
   **Sorted by:** (h, did, pos)
   
   **Size formula:**
-  28 + (20 * N_docs) + (16 * N_shingles)
+  28 + (20 * N_docs) + (12 * N_shingles)
   
   **Example (100K docs, 50M shingles):**
-  28 + 2MB + 800MB ≈ 802 MB
+  28 + 2MB + 600MB ≈ 602 MB
 end note
 
 note right of json

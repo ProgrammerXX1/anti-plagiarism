@@ -48,7 +48,7 @@ endif
 
 if (N_tokens < K_SHINGLE?) then (yes)
   :skip document;
-  note right: K_SHINGLE = 9
+  note right: K_SHINGLE = 5
   stop
 else (no)
 endif
@@ -56,7 +56,7 @@ endif
 :hash_tokens_bytes_spans(text, spans, token_hashes);
 note right
   **For each token:**
-  XXHash64(token_bytes)
+  FNV-1a 64(token_bytes)
   
   **Output:**
   vector<uint64_t> token_hashes
@@ -67,23 +67,23 @@ fork
   :hash_shingle_token_hashes();
   note right
     **For pos = 0 to N_tokens - K:**
-    h = hash(token_hashes[pos..pos+9])
+    h = hash(token_hashes[pos..pos+5])
     
     **shingle_stride** = 1 (default)
     **max_shingles_per_doc** = 50,000
     
     **Output:**
-    N_shingles = N_tokens - 9 + 1
+    N_shingles = N_tokens - 5 + 1
   end note
   
-  :Create Posting9;
+  :Create Posting5;
   note right
-    **Posting9 {**
-      uint64_t h;   // shingle hash
+    **Posting5 {**
+      uint32_t h;   // shingle hash (truncated)
       uint32_t did; // doc internal id
       uint32_t pos; // token position
     **}**
-    Size: 16 bytes
+    Size: 12 bytes
   end note
 fork again
   :simhash128_token_hashes();
