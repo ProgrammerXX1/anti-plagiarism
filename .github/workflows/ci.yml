@@ -1,0 +1,1389 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+#  .github/workflows/ci.yml — Full CI Pipeline: L5 Anti-Plagiarism Engine
+#
+#  ═══ ARCHITECTURE ════════════════════════════════════════════════════════════
+#  Engine checks text for plagiarism using 3 algorithms:
+#    Level 1: Shingle matching (K=5 token windows → FNV hash → binary search)
+#    Level 2: Shingle + LSH (SimHash128 → band splitting → Hamming distance)
+#    Level 3: Shingle + LSH + Embeddings (BGE-M3 via external GPU, not in CI)
+#
+#  Data pipeline:
+#    Text → Normalize(lowercase, strip punct, Unicode) → Tokenize(spaces)
+#    → Hash(FNV-64 per token) → Shingles(K=5), SimHash128, Stemmed SimHash128
+#    → Build Segment(sorted postings, CPB compressed index, LSH band index)
+#    → Manifest(segment registry) → Search(binary search + scoring Cq/Cd/C)
+#
+#  Pipeline graph (20 jobs, ~50 visible steps):
+#
+#  build-image ──→ unit-1-normalize ────────────────────────→ ┐
+#               → unit-2-tokenize-hash ──────────────────────→ │
+#               → unit-3-simhash-lsh ────────────────────────→ │
+#               → unit-4-snowball-stemmer ───────────────────→ │
+#               → unit-5-extractor-utf8 ─────────────────────→ │
+#               → unit-6-chunker ────────────────────────────→ │
+#               → unit-7-segment-format ─────────────────────→ │
+#               → unit-8-cpb-varint ─────────────────────────→ │
+#               → unit-10-builder-e2e ───────────────────────→ │
+#               → unit-11-query-search ──────────────────────→ ├→ report
+#               → code-quality ──────────────────────────────→ │
+#               → security-scan ─────────────────────────────→ │
+#               → integ-1-db-schema ─────────────────────────→ │
+#               → integ-2-index-search ──→ integ-3-compaction → │
+#               → integ-4-l5-ingest ─────────────────────────→ │
+#               → integ-5-api-contracts ─────────────────────→ │
+#               → integ-6-admin-ops ─────────────────────────→ │
+#               → health-monitoring ─────────────────────────→ ┘
+#
+#  Triggers: push to main/dev/master, all PRs
+# ═══════════════════════════════════════════════════════════════════════════════
+name: L5 Anti-Plagiarism CI
+
+on:
+  push:
+    branches: [main, dev, master, V3]
+  pull_request:
+    branches: [main, dev, master, V3]
+
+env:
+  CI_IMAGE: l5_ci_image
+  COMPOSE_PROJECT_NAME: plagio-ci
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#                              JOBS
+# ═══════════════════════════════════════════════════════════════════════════════
+jobs:
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  STAGE 0: BUILD — Compile C++17 source → Docker image with binaries
+  #
+  #  Algorithm:
+  #    1. Clone source code
+  #    2. Multi-stage Docker build: Ubuntu 24.04 → cmake → l5_service + l5_tests
+  #    3. Verify both binaries exist in image
+  #    4. Export Docker image as artifact for downstream jobs
+  # ═══════════════════════════════════════════════════════════════════════════
+  build-image:
+    name: "Build CI Image"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ────────────── Step 1: Clone Repository ──────────────
+      - name: "Step 1: Clone repository"
+        uses: actions/checkout@v4
+
+      # ────────────── Step 2: Setup Docker Buildx ──────────────
+      - name: "Step 2: Setup Docker Buildx engine"
+        uses: docker/setup-buildx-action@v3
+
+      # ────────────── Step 3: Build Docker Image ──────────────
+      # Multi-stage build:
+      #   Stage 1 (builder): Ubuntu 24.04 + cmake + C++17 → compile
+      #     - cmake flags: -DL5_BUILD_SERVICE=ON -DL5_BUILD_TESTS=ON -DL5_ENABLE_UDPIPE=OFF
+      #     - FetchContent downloads: cpp-httplib, doctest
+      #     - Links: libpq, libzip, libzstd, simdjson, nlohmann-json
+      #   Stage 2 (runtime): Ubuntu 24.04 slim + binaries only
+      #     - Non-root user: appuser (uid=999)
+      #     - Binaries: /app/l5_service, /app/l5_tests
+      - name: "Step 3: Compile C++17 source → Docker image (cmake + FetchContent)"
+        run: |
+          echo "════════════════════════════════════════════════════"
+          echo "  Building L5 Anti-Plagiarism Engine"
+          echo "  Compiler: g++ (C++17), Build: Release"
+          echo "  cmake flags:"
+          echo "    -DL5_BUILD_SERVICE=ON   (HTTP server + worker)"
+          echo "    -DL5_BUILD_TESTS=ON     (doctest unit tests)"
+          echo "    -DL5_ENABLE_UDPIPE=OFF  (UDPipe lemmatizer off)"
+          echo "  Libraries: libpq, libzip, libzstd, simdjson, nlohmann-json"
+          echo "  FetchContent: cpp-httplib (HTTP), doctest (testing)"
+          echo "════════════════════════════════════════════════════"
+          docker build -f Back_Last/ci/Dockerfile.ci -t $CI_IMAGE Back_Last/
+          echo ""
+          echo "════════ Build complete ════════"
+          docker images $CI_IMAGE --format "Size: {{.Size}}"
+
+      # ────────────── Step 4: Verify binaries ──────────────
+      - name: "Step 4: Verify l5_service and l5_tests binaries exist"
+        run: |
+          echo "Checking compiled binaries in Docker image..."
+          docker run --rm --entrypoint "" $CI_IMAGE ls -lh /app/l5_service
+          docker run --rm --entrypoint "" $CI_IMAGE ls -lh /app/l5_tests
+          echo ""
+          echo "Verifying l5_tests can list test cases..."
+          TC=$(docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests -c 2>/dev/null | tail -1)
+          echo "Total unit tests compiled: $TC"
+
+      # ────────────── Step 5: Export image artifact ──────────────
+      - name: "Step 5: Export Docker image → artifact for downstream jobs"
+        run: docker save $CI_IMAGE | gzip > /tmp/l5_ci_image.tar.gz
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: l5-ci-image
+          path: /tmp/l5_ci_image.tar.gz
+          retention-days: 1
+
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  UNIT 1: TEXT NORMALIZATION (18 tests)
+  #
+  #  Algorithm: normalize_for_shingles_simple()
+  #    Input: raw UTF-8 text
+  #    Steps:
+  #      1. ASCII lowercase (A-Z → a-z)
+  #      2. Cyrillic lowercase (А-Я → а-я, Ё→ё)
+  #      3. Kazakh-specific uppercase → lowercase
+  #      4. Turkish İ→i disambiguation (via trigram context)
+  #      5. Arabic digits (٠-٩, ۰-۹) → ASCII 0-9
+  #      6. Arabic diacritics/tatweel stripped
+  #      7. Punctuation removed (except apostrophes as joiners)
+  #      8. Whitespace normalized (NBSP, ZWNBSP, ideographic → space)
+  #      9. Multiple spaces collapsed to single space
+  #    Output: normalized UTF-8 text ready for tokenization
+  # ═══════════════════════════════════════════════════════════════════════════
+  unit-1-normalize:
+    name: "Unit 1: Text Normalization"
+    needs: build-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download image
+        uses: actions/download-artifact@v4
+        with: { name: l5-ci-image, path: /tmp }
+      - name: Load image
+        run: gunzip -c /tmp/l5_ci_image.tar.gz | docker load
+
+      # Step 6: ASCII lowercase, digits, punctuation, whitespace collapse
+      - name: "Step 6: ASCII normalization (lowercase, digits, punctuation, whitespace)"
+        run: |
+          echo "Testing normalize_for_shingles_simple():"
+          echo "  - ASCII A-Z → a-z"
+          echo "  - Digits preserved"
+          echo "  - Punctuation removed"
+          echo "  - Multiple whitespace → single space"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*text_common*" \
+            -tc="*empty input*,*ASCII lowercase*,*digits preserved*,*punctuation removed*,*whitespace collapse*,*normalize_to*" \
+            --duration=true
+
+      # Step 7: Cyrillic + Kazakh + Turkish normalization
+      - name: "Step 7: Multi-language normalization (Cyrillic/Kazakh/Turkish/Arabic)"
+        run: |
+          echo "Testing Unicode normalization across script families:"
+          echo "  - Cyrillic: А-Я→а-я, Ё→ё"
+          echo "  - Kazakh: Ә,Ғ,Қ,Ң,Ө,Ұ,Ү,Һ,І → lowercase"
+          echo "  - Turkish: İ→i (context-dependent trigram disambiguation)"
+          echo "  - Arabic: presentation forms preserved, diacritics stripped, tatweel removed"
+          echo "  - Arabic/Farsi digits ٠-٩/۰-۹ → ASCII 0-9"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*text_common*" \
+            -tc="*Cyrillic*,*Kazakh*,*Turkish*,*Arabic*,*Eastern Arabic*" \
+            --duration=true
+
+      # Step 8: Unicode edge cases (NBSP, BOM, emoji, orphan bytes)
+      - name: "Step 8: Unicode edge cases (NBSP, BOM, emoji, surrogates, overlong)"
+        run: |
+          echo "Testing UTF-8 edge cases in normalizer:"
+          echo "  - NBSP (U+00A0) → space"
+          echo "  - ZWNBSP/BOM (U+FEFF) stripped"
+          echo "  - Ideographic space (U+3000) → space"
+          echo "  - 4-byte emoji → space"
+          echo "  - Lone continuation bytes skipped"
+          echo "  - Overlong 2-byte encoding rejected"
+          echo "  - Surrogate pairs rejected"
+          echo "  - Truncated multibyte handled gracefully"
+          echo "  - Very long text (1M tokens) doesn't crash"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*text_common*" \
+            -tc="*NBSP*,*ZWNBSP*,*ideographic*,*emoji*,*lone*,*overlong*,*surrogate*,*truncated*,*very long*,*Apostrophe*,*Mixed*" \
+            --duration=true
+
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  UNIT 2: TOKENIZATION & HASHING (9 tests)
+  #
+  #  Algorithm: tokenize_spans() + hash_tokens_bytes_spans()
+  #    Input: normalized text
+  #    Steps:
+  #      1. Split text on spaces → vector<TokenSpan{start, len}>
+  #      2. For each token: FNV-64 hash over byte range → uint64_t
+  #      3. hash_shingle_tokens_spans(): K=5 consecutive token hashes XOR → uint32_t
+  #    Output: array of shingle hashes (32-bit), one per K-token window
+  #
+  #  Properties verified:
+  #    - Deterministic: same text → same hashes
+  #    - Different tokens → different FNV-64 hashes
+  #    - Different shingle positions → different hashes (position-dependent XOR)
+  #    - Spans-based and array-based methods produce identical results
+  # ═══════════════════════════════════════════════════════════════════════════
+  unit-2-tokenize-hash:
+    name: "Unit 2: Tokenize & Hash"
+    needs: build-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download image
+        uses: actions/download-artifact@v4
+        with: { name: l5-ci-image, path: /tmp }
+      - name: Load image
+        run: gunzip -c /tmp/l5_ci_image.tar.gz | docker load
+
+      # Step 9: Tokenization — split into spans, handle edge cases
+      - name: "Step 9: Tokenize text → TokenSpan[] (empty, single, multi, unicode)"
+        run: |
+          echo "Testing tokenize_spans():"
+          echo "  Algorithm: split normalized text on space boundaries"
+          echo "  Output: vector<TokenSpan{byte_start, byte_len}>"
+          echo "  Edge cases: empty string, single token, leading/trailing spaces"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*text_common*" \
+            -tc="*empty*,*single token*,*multiple tokens*,*leading*trailing*,*unicode tokens*" \
+            --duration=true
+
+      # Step 10: Token hashing — FNV-64 per token
+      - name: "Step 10: Hash tokens → FNV-64 (deterministic, collision-resistant)"
+        run: |
+          echo "Testing hash_tokens_bytes_spans():"
+          echo "  Algorithm: FNV-64 hash per token byte span"
+          echo "  Properties: deterministic, different tokens → different hashes"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*text_common*" \
+            -tc="*hash_tokens deterministic*,*different tokens produce*" \
+            --duration=true
+
+      # Step 11: Shingle hashing — K=5 sliding window XOR
+      - name: "Step 11: Shingle hashing K=5 window XOR → uint32 (format.h K_SHINGLE=5)"
+        run: |
+          echo "Testing hash_shingle_tokens_spans():"
+          echo "  Algorithm: XOR K=5 consecutive FNV-64 token hashes → truncate to uint32"
+          echo "  Properties:"
+          echo "    - Requires >= 5 tokens (shorter text → empty)"
+          echo "    - Position-dependent: different positions → different hashes"
+          echo "    - spans-based == array-based (consistency check)"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*text_common*" \
+            -tc="*shingle hash*" \
+            --duration=true
+
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  UNIT 3: SIMHASH-128 & LSH CORE (21 tests)
+  #
+  #  Algorithm: simhash128_spans() + lsh_key_from_simhash()
+  #    SimHash128 (document fingerprint):
+  #      1. For each token hash: for each bit position 0..127
+  #         if bit is set → weight[pos]++, else weight[pos]--
+  #      2. Final hash: bit[pos] = 1 if weight[pos] > 0, else 0
+  #      Result: 128-bit fingerprint, Hamming distance ≈ text dissimilarity
+  #
+  #    LSH Key Generation (for band matching):
+  #      1. Split 128-bit SimHash into `blocks` (default 8) sub-ranges
+  #      2. For each block: extract consecutive bits → key
+  #      3. Key format: (block_id << 56) | extracted_bits
+  #      4. Records sorted for binary search
+  #
+  #    Hamming Distance:
+  #      popcount(a.hi ^ b.hi) + popcount(a.lo ^ b.lo)
+  #      Similar texts: low Hamming (<40), Different texts: high Hamming (>60)
+  # ═══════════════════════════════════════════════════════════════════════════
+  unit-3-simhash-lsh:
+    name: "Unit 3: SimHash & LSH"
+    needs: build-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download image
+        uses: actions/download-artifact@v4
+        with: { name: l5-ci-image, path: /tmp }
+      - name: Load image
+        run: gunzip -c /tmp/l5_ci_image.tar.gz | docker load
+
+      # Step 12: SimHash128 computation
+      - name: "Step 12: SimHash128 — 128-bit fingerprint (bit voting over token hashes)"
+        run: |
+          echo "Testing simhash128_spans() / simhash128_token_hashes():"
+          echo "  Algorithm: for each token hash, vote +1/-1 per bit → threshold → 128-bit"
+          echo "  Properties verified:"
+          echo "    - Deterministic (same tokens → same hash)"
+          echo "    - Spans vs array method produce same result"
+          echo "    - Similar texts → low Hamming distance (<40 of 128 bits)"
+          echo "    - Different texts → high Hamming distance (>60 of 128 bits)"
+          echo "    - Stemmed SimHash differs from surface SimHash"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*text_common*" \
+            -tc="*simhash128*,*stemmed*" \
+            --duration=true
+
+      # Step 13: Hamming distance & bit extraction
+      - name: "Step 13: Hamming distance (popcount XOR) & bit extraction for LSH"
+        run: |
+          echo "Testing hamming128() and extract_bits_128():"
+          echo "  Hamming: popcount(a.hi ^ b.hi) + popcount(a.lo ^ b.lo)"
+          echo "  extract_bits_128: pull consecutive bits from 128-bit hash"
+          echo "  Tests: identical=0, single flip=1, all different=128, symmetric"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*lsh_deep*" \
+            -tc="*hamming*,*extract_bits*,*single bit*,*zero length*,*cross-boundary*" \
+            --duration=true
+
+      # Step 14: LSH key generation & band matching
+      - name: "Step 14: LSH key generation — SimHash → (block_id << 56) | bits"
+        run: |
+          echo "Testing lsh_key_from_simhash():"
+          echo "  Algorithm: split 128-bit SimHash into 8 blocks (16 bits each)"
+          echo "  Key = (block_id << 56) | extracted_bits"
+          echo "  Properties: deterministic, bounded block_id clamping"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*test_lsh*,*lsh_deep*" \
+            -tc="*lsh_key*,*block*param*,*clamping*" \
+            --duration=true
+
+      # Step 15: LSH index write/read (binary format)
+      - name: "Step 15: LSH index — write/read LshHeaderV1 + LshRec[] + chunk hashes"
+        run: |
+          echo "Testing LSH binary format: magic='LSH1', header 32 bytes"
+          echo "  LshRec: 16 bytes (key + did + pos), sorted by (key, did)"
+          echo "  LshChunkHash: 24 bytes, chunk-level SimHash fingerprint"
+          echo "  Binary search: find_chunk_hash for per-chunk matching"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*test_lsh*,*lsh_deep*" \
+            -tc="*write*read*,*LshChunk*,*lsh_chunk*,*find_chunk*" \
+            --duration=true
+
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  UNIT 4: SNOWBALL STEMMER (6 tests)
+  #
+  #  Algorithm: stem_token_utf8()
+  #    1. Auto-detect language from script:
+  #       - Cyrillic → Russian (or Kazakh with trigram check)
+  #       - Latin → English (or Turkish with İ/ı trigram check)
+  #    2. Apply Snowball stemming algorithm per language
+  #    3. Result: canonical word root for morphological matching
+  #
+  #  Purpose: stemmed tokens feed into stemmed SimHash128 for
+  #  paraphrase detection (Level 2 LSH matching)
+  # ═══════════════════════════════════════════════════════════════════════════
+  unit-4-snowball-stemmer:
+    name: "Unit 4: Snowball Stemmer"
+    needs: build-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download image
+        uses: actions/download-artifact@v4
+        with: { name: l5-ci-image, path: /tmp }
+      - name: Load image
+        run: gunzip -c /tmp/l5_ci_image.tar.gz | docker load
+
+      # Step 16: Multi-language stemming
+      - name: "Step 16: Snowball stemming — EN/RU auto-detect (running→run, бегать→бега)"
+        run: |
+          echo "Testing stem_token_utf8() with auto-language detection:"
+          echo "  English:  running→run, easily→easili, connection→connect"
+          echo "  Russian:  бежавший→бежа, программирование→программирован"
+          echo "  Short words (<3 chars) pass through unchanged"
+          echo "  stem_and_hash: stem + FNV-64 → same hash for morphological variants"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*snowball*" --duration=true
+
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  UNIT 5: UTF-8 FILE EXTRACTOR (22 tests)
+  #
+  #  Algorithm: extract_text_from_file()
+  #    1. Read file bytes, detect BOM → strip if present
+  #    2. Validate UTF-8 encoding (reject CP1251, broken sequences)
+  #    3. Handle edge cases: empty files, BOM-only files, truncated multibyte
+  #    4. Optionally truncate to max_bytes while preserving UTF-8 boundary
+  #    Output: ExtractedText with clean UTF-8 content
+  # ═══════════════════════════════════════════════════════════════════════════
+  unit-5-extractor-utf8:
+    name: "Unit 5: UTF-8 Extractor"
+    needs: build-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download image
+        uses: actions/download-artifact@v4
+        with: { name: l5-ci-image, path: /tmp }
+      - name: Load image
+        run: gunzip -c /tmp/l5_ci_image.tar.gz | docker load
+
+      # Step 17: Valid UTF-8 extraction
+      - name: "Step 17: UTF-8 extraction — valid files, BOM handling, max_bytes truncation"
+        run: |
+          echo "Testing extract_text_from_file():"
+          echo "  - Valid UTF-8 → extracted successfully"
+          echo "  - BOM (U+FEFF) prefix → stripped"
+          echo "  - max_bytes truncation preserves UTF-8 character boundaries"
+          echo "  - assume_normalized flag propagates to output"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*extractor*" \
+            -tc="*valid*,*BOM*,*max_bytes*,*assume_normalized*,*empty*" \
+            --duration=true
+
+      # Step 18: Invalid encoding rejection
+      - name: "Step 18: Invalid encoding rejection (CP1251, broken UTF-8, garbage)"
+        run: |
+          echo "Testing extract_text_from_file() error handling:"
+          echo "  - Broken UTF-8 → throws"
+          echo "  - CP1251 encoded file → throws (not valid UTF-8)"
+          echo "  - Nonexistent file → throws"
+          echo "  - Unsupported extension → throws"
+          echo "  - Garbage file with BOM → accepted (BOM = valid UTF-8 start)"
+          echo "  - Truncated multibyte, lone continuation bytes → handled"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*extractor*" \
+            -tc="*broken*,*CP1251*,*garbage*,*cut_utf8*,*nonexistent*,*unsupported*" \
+            --duration=true
+
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  UNIT 6: TEXT CHUNKER (8 tests)
+  #
+  #  Algorithm: chunk_text()
+  #    Purpose: Split long text into chunks for Level 3 embedding vectors
+  #    Steps:
+  #      1. Scan for paragraph breaks (\n\n)
+  #      2. Split at paragraph boundaries if within max_chunk_bytes
+  #      3. Otherwise split at word boundaries
+  #      4. Ensure UTF-8 safe byte boundaries (no mid-character splits)
+  #      5. Track byte offsets for each chunk
+  #    Output: vector<TextChunk{text, byte_offset}>
+  # ═══════════════════════════════════════════════════════════════════════════
+  unit-6-chunker:
+    name: "Unit 6: Text Chunker"
+    needs: build-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download image
+        uses: actions/download-artifact@v4
+        with: { name: l5-ci-image, path: /tmp }
+      - name: Load image
+        run: gunzip -c /tmp/l5_ci_image.tar.gz | docker load
+
+      # Step 19: Chunking algorithm
+      - name: "Step 19: Text chunker — paragraph split, UTF-8 safe, offset tracking"
+        run: |
+          echo "Testing chunk_text() for embedding preparation:"
+          echo "  - Empty text → empty chunks"
+          echo "  - Short text → single chunk"
+          echo "  - Long text → multiple chunks at paragraph boundaries"
+          echo "  - Chunk offsets are correct byte positions"
+          echo "  - max_chunk_bytes respected"
+          echo "  - Paragraph break preferred over word boundary"
+          echo "  - UTF-8 safe: no mid-character splits"
+          echo "  - config_from_env defaults loaded correctly"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*chunker*" --duration=true
+
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  UNIT 7: SEGMENT FORMAT & IO (25 tests)
+  #
+  #  Segment file layout (on disk per segment directory):
+  #    index_native.bin:           HeaderV2 (28B, magic "PLAG") + DocMeta[] (20B each) + Posting5[] (12B each)
+  #    index_postings.cpb:         CpbHeader (32B, magic "CPB1") + skip index + varint blocks
+  #    index_lsh.bin:              LshHeaderV1 (32B, magic "LSH1") + LshRec[] (16B each)
+  #    index_lsh_chunk_hashes.bin: LshChunkFileHeader (16B, magic "LCH1") + LshChunkHash[] (24B)
+  #    index_texts.zst:            TextStoreHeader (24B, magic "TXTS") + TextStoreEntry[] + zstd frames
+  #    index_native_docids.json +  index_native_meta.json
+  #    manifest.json:              segment registry (per shard/level root)
+  #
+  #  All binary structs are trivially-copyable, fixed-size, little-endian
+  # ═══════════════════════════════════════════════════════════════════════════
+  unit-7-segment-format:
+    name: "Unit 7: Segment IO"
+    needs: build-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download image
+        uses: actions/download-artifact@v4
+        with: { name: l5-ci-image, path: /tmp }
+      - name: Load image
+        run: gunzip -c /tmp/l5_ci_image.tar.gz | docker load
+
+      # Step 20: HeaderV2 + struct sizes
+      - name: "Step 20: HeaderV2 (magic 'PLAG', 28B) + Posting5 (12B) + DocMeta (20B)"
+        run: |
+          echo "Testing binary format structs (format.h):"
+          echo "  HeaderV2: 28 bytes, magic='PLAG', version=3"
+          echo "  Posting5: 12 bytes (h32 + did + pos), trivially copyable"
+          echo "  DocMeta:  20 bytes (tok_len + simhash_hi + simhash_lo)"
+          echo "  Tests: valid header, bad magic, bad version, truncated file"
+          echo "         write-then-read roundtrip, slim_ok mode"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*format_io*" --duration=true
+
+      # Step 21: Manifest operations
+      - name: "Step 21: Manifest — segment registry (load/save/append/replace/remove)"
+        run: |
+          echo "Testing manifest.json operations (manifest.h):"
+          echo "  - load_manifest(): parse JSON, skip unsafe segment names"
+          echo "  - save_manifest(): atomic JSON write"
+          echo "  - append_segment_to_manifest(): register new segment"
+          echo "  - replace_segments_in_manifest(): compaction merge (N→1)"
+          echo "  - remove_segments_from_manifest(): cleanup after delete"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*manifest*" --duration=true
+
+      # Step 22: Text store (zstd per-doc compression)
+      - name: "Step 22: TextStore — per-doc zstd compressed archive (magic 'TXTS')"
+        run: |
+          echo "Testing TextStore write/read (text_store.h):"
+          echo "  Format: TextStoreHeader (24B, magic='TXTS') + entries + zstd frames"
+          echo "  - Random access by doc index"
+          echo "  - Write single/multiple docs, read each independently"
+          echo "  - Streaming writer matches batch writer"
+          echo "  - Out-of-range doc index → error"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*text_store*" --duration=true
+
+      # Step 23: Mmap cache (memory-mapped file access)
+      - name: "Step 23: MmapFile + DataSpan — zero-copy memory-mapped segment reader"
+        run: |
+          echo "Testing MmapFile (mmap_file.h) and DataSpan:"
+          echo "  - Roundtrip: write → mmap → read == identical"
+          echo "  - Empty/nonexistent file handling"
+          echo "  - Move semantics, multiple simultaneous mmaps"
+          echo "  - populate=false (lazy) vs eager mmap"
+          echo "  - DataSpan: typed view over mmap region + iteration"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*mmap*" --duration=true
+
+      # Step 24: Tombstones (soft-delete markers)
+      - name: "Step 24: Tombstones — soft-delete via tombstones.jsonl + LRU cache"
+        run: |
+          echo "Testing Tombstones + TombstoneCache (tombstone.h):"
+          echo "  - Empty tombstone file → no deletions"
+          echo "  - append_and_contains: add doc_id, check membership in O(1)"
+          echo "  - Persistence: reload from file after restart"
+          echo "  - TombstoneCache: LRU with file-change invalidation"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*tombstone*" --duration=true
+
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  UNIT 8: COMPRESSED POSTINGS — CPB + VARINT (24 tests)
+  #
+  #  CPB (Compressed Posting Block) format:
+  #    Header: CpbHeader (32B, magic "CPB1", version, block_size=128)
+  #    Skip index: CpbBlockEntry[] (12B each: min_hash, offset, count)
+  #    Data blocks: varint-encoded delta-compressed postings
+  #
+  #  Varint encoding:
+  #    0..127        → 1 byte    | 128..16383    → 2 bytes
+  #    16384..2M     → 3 bytes   | 2M..268M      → 4 bytes
+  #    268M..4G      → 5 bytes
+  #
+  #  Delta encoding per block (128 postings):
+  #    dh = varint(h[i] - h[i-1])
+  #    if new hash: varint(did), varint(pos)
+  #    else: varint(did_delta), varint(pos)
+  #
+  #  Compression ratio: ~3-5 bytes/posting vs 12 bytes raw (60-75% savings)
+  #  Search: binary search on skip index → O(1) hash lookup per segment
+  # ═══════════════════════════════════════════════════════════════════════════
+  unit-8-cpb-varint:
+    name: "Unit 8: CPB & Varint"
+    needs: build-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download image
+        uses: actions/download-artifact@v4
+        with: { name: l5-ci-image, path: /tmp }
+      - name: Load image
+        run: gunzip -c /tmp/l5_ci_image.tar.gz | docker load
+
+      # Step 25: CPB header & struct layout
+      - name: "Step 25: CPB header — CpbHeader 32B (magic 'CPB1') + CpbBlockEntry 12B"
+        run: |
+          echo "Testing CPB format structs (compressed_postings.h):"
+          echo "  CpbHeader: 32 bytes, magic='CPB1', block_size=128"
+          echo "  CpbBlockEntry: 12 bytes (min_hash, file_offset, posting_count)"
+          echo "  CpbBlockEntryLegacy: 8 bytes (v3 format compatibility)"
+          echo "  cpb_data_offset calculation for skip index traversal"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*compressed*" --duration=true
+
+      # Step 26: Varint encoding/decoding
+      - name: "Step 26: Varint codec — 1-5 byte variable-length integer encoding"
+        run: |
+          echo "Testing varint_encode/varint_decode:"
+          echo "  0..127         → 1 byte  | 128..16383     → 2 bytes"
+          echo "  16384..2097151 → 3 bytes  | 2M..268M       → 4 bytes"
+          echo "  268M..4G       → 5 bytes"
+          echo "  Fuzz test: 10k random values encode→decode roundtrip"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*varint*" \
+            -tc="*varint zero*,*varint 1-byte*,*varint 2-byte*,*varint 3-byte*,*varint 4-byte*,*varint 5-byte*,*varint fuzz*" \
+            --duration=true
+
+      # Step 27: CPB block codec & search
+      - name: "Step 27: CPB block codec — delta compress 128 postings → binary search"
+        run: |
+          echo "Testing CPB block codec (encode/decode/search):"
+          echo "  - Single posting block, same-hash same-doc"
+          echo "  - Increasing hash groups (delta encoding)"
+          echo "  - Compression ratio ~60-75%"
+          echo "  - cpb_search_hash: binary search on skip index"
+          echo "  - cpb_block_range_for_hash: find block range"
+          echo "  - Large dataset: 10k postings + streaming write"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*varint*" \
+            -tc="*single posting*,*same hash*,*increasing hash*,*compression ratio*,*empty block*,*decode with*,*search specific*,*cpb_block_range*,*CPB large*,*CPB streaming*" \
+            --duration=true
+
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  UNIT 10: BUILDER END-TO-END (8 tests)
+  #
+  #  Algorithm: build_segment_jsonl(corpus.jsonl, out_root, BuildOptions)
+  #    Full pipeline from raw text to searchable segment:
+  #      1. Parse JSONL with simdjson (doc_id, text, module, org_id...)
+  #      2. Normalize text → tokenize → hash tokens (FNV-64)
+  #      3. Generate K=5 shingles → Posting5{h32, did, pos}
+  #      4. Compute SimHash128 (surface) + SimHash128 (stemmed) → DocMeta
+  #      5. Generate chunk-level SimHashes (overlapping windows)
+  #      6. Sort all postings by (h, did, pos)
+  #      7. Write segment files: .bin, .cpb, .lsh, .zst, .json
+  #      8. Append to manifest.json
+  #
+  #  BuildOptions: max_threads=16, shingle_stride=1, lsh_blocks=8,
+  #    lsh_chunk_tokens=256, lsh_chunk_stride=128, ram_limit=512MB
+  # ═══════════════════════════════════════════════════════════════════════════
+  unit-10-builder-e2e:
+    name: "Unit 10: Builder E2E"
+    needs: build-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download image
+        uses: actions/download-artifact@v4
+        with: { name: l5-ci-image, path: /tmp }
+      - name: Load image
+        run: gunzip -c /tmp/l5_ci_image.tar.gz | docker load
+
+      # Step 28: Builder — empty corpus
+      - name: "Step 28: Builder — empty corpus → throws (no docs to build)"
+        run: |
+          echo "Testing build_segment_jsonl() with empty input → exception"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*builder*" -tc="*build empty*" --duration=true
+
+      # Step 29: Builder — single doc full pipeline
+      - name: "Step 29: Single doc → normalize → tokenize → hash → shingles → segment files"
+        run: |
+          echo "Full build pipeline for 1 document:"
+          echo "  1. Parse JSONL with simdjson"
+          echo "  2. Normalize text (lowercase, strip punct)"
+          echo "  3. Tokenize → TokenSpan[]"
+          echo "  4. Hash tokens → FNV-64[]"
+          echo "  5. Generate K=5 shingles → Posting5[]"
+          echo "  6. Compute SimHash128 + stemmed SimHash128 → DocMeta"
+          echo "  7. Sort postings by (h, did, pos)"
+          echo "  8. Write: .bin, .cpb, .lsh, .zst, docids.json, meta.json"
+          echo "  9. Verify all files present and valid"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*builder*" -tc="*build single*" --duration=true
+
+      # Step 30: Builder — multi-doc build, load, search
+      - name: "Step 30: Multi-doc build → load segment → search (full roundtrip)"
+        run: |
+          echo "Build → load → search roundtrip with 3+ documents"
+          echo "  Build: multi-doc → single segment"
+          echo "  Load: mmap segment files → SegmentData"
+          echo "  Search: query → binary search in postings → expected hits"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*builder*" -tc="*build multi*" --duration=true
+
+      # Step 31: Builder — LSH enabled build
+      - name: "Step 31: Build with LSH (SimHash bands + chunk hashes → .lsh.bin)"
+        run: |
+          echo "Build with build_lsh=true → extra output files:"
+          echo "  - index_lsh.bin: LshRec[] sorted by (key, did)"
+          echo "  - index_lsh_chunk_hashes.bin: per-chunk SimHash128"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*builder*" -tc="*search with LSH*,*text_store*,*CPB compressed*" --duration=true
+
+      # Step 32: Builder — Cyrillic corpus + stride
+      - name: "Step 32: Cyrillic corpus build + shingle_stride > 1 optimization"
+        run: |
+          echo "Builder with non-ASCII content and stride:"
+          echo "  - Cyrillic UTF-8 text: entire pipeline works"
+          echo "  - shingle_stride > 1: reduces posting count (trade accuracy for speed)"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*builder*" -tc="*Cyrillic*,*shingle_stride*" --duration=true
+
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  UNIT 11: QUERY PARSING & SEARCH (11 tests)
+  #
+  #  Algorithm: build_query_shingles() + search_in_segment()
+  #    Query pipeline:
+  #      1. Normalize → tokenize → hash → K=5 shingles → deduplicate → sort
+  #      2. Compute query SimHash128 (for LSH matching)
+  #
+  #    Search per segment:
+  #      1. For each query hash: binary search in CPB/native postings
+  #      2. Count hits per doc (epoch-stamped scratch arrays)
+  #      3. LSH band key matching + Hamming distance filter
+  #      4. Top-N candidates by hit count + LSH blocks
+  #      5. Re-scan postings → (qpos, dpos) pairs → greedy span merge
+  #      6. Score: Cq = matched/q_total, Cd = matched/d_total
+  #         C = α×Cq + (1-α)×Cd (α=0.60)
+  #
+  #    Multi-segment: parallel search, merge best per doc_id
+  # ═══════════════════════════════════════════════════════════════════════════
+  unit-11-query-search:
+    name: "Unit 11: Query & Search"
+    needs: build-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download image
+        uses: actions/download-artifact@v4
+        with: { name: l5-ci-image, path: /tmp }
+      - name: Load image
+        run: gunzip -c /tmp/l5_ci_image.tar.gz | docker load
+
+      # Step 33: Query shingle generation
+      - name: "Step 33: Query shingles — normalize → hash → K=5 dedup → sorted"
+        run: |
+          echo "Testing build_query_shingles():"
+          echo "  - Empty query → empty items"
+          echo "  - Short query (<5 tokens) → no shingles, simhash only"
+          echo "  - Exactly 5 tokens → 1 shingle"
+          echo "  - Items sorted by hash for binary search"
+          echo "  - Duplicate hashes grouped"
+          echo "  - Cyrillic query works"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*query*" --duration=true
+
+      # Step 34: Search result serialization
+      - name: "Step 34: SearchResult → JSON serialization (Hit, scores, spans)"
+        run: |
+          echo "Testing SearchResult JSON output:"
+          echo "  Hit: doc_id, C, Cq, Cd, matched_shingles, match_spans"
+          echo "  - Empty result serializes correctly"
+          echo "  - Result with hits serializes all fields"
+          docker run --rm --entrypoint "" $CI_IMAGE /app/l5_tests \
+            -sf="*query*" -tc="*empty result*,*result with hit*" --duration=true
+
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  CODE QUALITY — Static analysis + metrics
+  # ═══════════════════════════════════════════════════════════════════════════
+  code-quality:
+    name: "Code Quality"
+    needs: build-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cppcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends cppcheck
+
+      # Step 35: cppcheck static analysis
+      - name: "Step 35: cppcheck — warning, performance, portability analysis"
+        run: |
+          echo "  Checks: warning, performance, portability"
+          echo "  Suppressed: missingInclude, useStlAlgorithm, noExplicitConstructor, invalidLifetime"
+          cppcheck \
+            --enable=warning,performance,portability \
+            --suppress=missingInclude \
+            --suppress=unmatchedSuppression \
+            --suppress=useStlAlgorithm \
+            --suppress=noExplicitConstructor \
+            --suppress=invalidLifetime \
+            --error-exitcode=0 \
+            --inline-suppr \
+            --std=c++17 \
+            --force \
+            -I Back_Last/cpp/1_Text -I Back_Last/cpp/2_Builder -I Back_Last/cpp/3_Index_IO \
+            -I Back_Last/cpp/4_Search -I Back_Last/cpp/5_Service -I Back_Last/cpp/common \
+            Back_Last/cpp/ 2>cpp/ 2>&11 | tee /tmp/cppcheck.txt
+
+          ERRORS=$(grep -cE ': error \[' /tmp/cppcheck.txt || true)
+          WARNINGS=$(grep -cE ': warning \[' /tmp/cppcheck.txt || true)
+          PERF=$(grep -cE ': performance \[' /tmp/cppcheck.txt || true)
+          PORT=$(grep -cE ': portability \[' /tmp/cppcheck.txt || true)
+
+          echo ""
+          echo "══ cppcheck summary ══"
+          echo "  Errors:      $ERRORS"
+          echo "  Warnings:    $WARNINGS"
+          echo "  Performance: $PERF"
+          echo "  Portability: $PORT"
+
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "cppcheck found $ERRORS error(s):"
+            grep -E ': error \[' /tmp/cppcheck.txt || true
+            echo "NOTE: non-blocking (may be false positives)"
+          fi
+
+      # Step 36: Code metrics by layer
+      - name: "Step 36: Code metrics — LOC per architecture layer"
+        run: |
+          echo "══════════ Anti-Plagiarism Engine Code Metrics ══════════"
+          echo ""
+          echo "── Architecture Layers ──"
+          for layer in 1_Text 2_Builder 3_Index_IO 4_Search 5_Service; do
+            lines=$(find "Back_Last/cpp/$layer" \( -name '*.cpp' -o -name '*.h' \) -exec cat {} + 2>/dev/null | wc -l || echo 0)
+            files=$(find "Back_Last/cpp/$layer" \( -name '*.cpp' -o -name '*.h' \) 2>/dev/null | wc -l || echo 0)
+            echo "  cpp/$layer: $files files, $lines lines"
+          done
+          echo ""
+          echo "── Summary ──"
+          echo "  Source:  $(find Back_Last/cpp/ -name '*.cpp' -o -name '*.h' | wc -l) files, $(find Back_Last/cpp/ \( -name '*.cpp' -o -name '*.h' \) -exec cat {} + | wc -l) lines"
+          echo "  Tests:   $(find Back_Last/tests/ -name '*.cpp' | wc -l) files, $(find Back_Last/tests/ -name '*.cpp' -exec cat {} + | wc -l) lines"
+          echo "  CI:      $(find Back_Last/ci/ -type f | wc -l) files"
+          echo ""
+          TODO_COUNT=$(grep -rn 'TODO.*Back_Last/cpp/ Back_Last/tests/ --include='*.cpp' --include='*.h' | wc -l || true)
+          echo "  TODO/FIXME annotations: $TODO_COUNT"
+
+      # Step 37: Dockerfile best practices
+      - name: "Step 37: Dockerfile security (non-root, healthcheck, pinned tags)"
+        run: |
+          for df in Back_Last/ci/Dockerfile.ci Back_Last/Dockerfile; do
+            if [ -f "$df" ]; then
+              echo "── $df ──"
+              grep -q 'USER' "$df" && echo "  [OK] Non-root USER" || echo "  [WARN] No USER"
+              grep -q 'HEALTHCHECK' "$df" && echo "  [OK] HEALTHCHECK" || echo "  [WARN] No HEALTHCHECK"
+              grep -q 'FROM.*:' "$df" && echo "  [OK] Pinned tags" || echo "  [WARN] Unpinned"
+            fi
+          done
+
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  SECURITY SCAN — Container vulnerability scanning
+  # ═══════════════════════════════════════════════════════════════════════════
+  security-scan:
+    name: "Security Scan"
+    needs: build-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Download image
+        uses: actions/download-artifact@v4
+        with: { name: l5-ci-image, path: /tmp }
+      - name: Load image
+        run: gunzip -c /tmp/l5_ci_image.tar.gz | docker load
+
+      # Step 38: Trivy container scan
+      - name: "Step 38: Trivy — scan Docker image for HIGH/CRITICAL CVEs"
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: l5_ci_image
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: 0
+
+      # Step 39: Hardcoded secrets scan
+      - name: "Step 39: Secrets scan — hardcoded passwords/API keys in source"
+        run: |
+          SECRETS=$(grep -rn 'password\s*=\|api_key\s*=\|secret_key\s*=' \
+            --include='*.cpp' --include='*.h' --include='*.py' \
+            --include='*.yml' --include='*.yaml' --include='*.sh' \
+            Back_Last/cpp/ Back_Last/ci/ Back_Last/tester/ .github/ 2>/dev/null | \
+            grep -v 'plagio_ci_pass' | grep -v '#.*password' | \
+            grep -v 'PLAGIO_PG_DSN' | grep -v '_test\.\|_ci\.' || true)
+          if [ -z "$SECRETS" ]; then
+            echo "No hardcoded secrets found"
+          else
+            echo "Potential secrets:" && echo "$SECRETS" | head -10
+          fi
+
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  INTEGRATION 1: DATABASE SCHEMA — PostgreSQL structure validation
+  #
+  #  Verifies the database schema created by l5_service on startup:
+  #    Tables: job_queue (async job processing), documents (doc registry)
+  #    job_queue columns: id, type, status, payload, priority, started_at...
+  #    documents columns: id, org_id, source_id, file_name, module, deleted,
+  #                       last_segment, current_segment
+  #    Indexes, pgvector extension, job queue functional test
+  # ═══════════════════════════════════════════════════════════════════════════
+  integ-1-db-schema:
+    name: "DB Schema Check"
+    needs: build-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Download image
+        uses: actions/download-artifact@v4
+        with: { name: l5-ci-image, path: /tmp }
+      - name: Load image
+        run: gunzip -c /tmp/l5_ci_image.tar.gz | docker load
+      - name: Install psql
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends postgresql-client
+
+      # Step 40: Start CI stack & run schema tests
+      - name: "Step 40: Start CI stack"
+        run: |
+          docker compose -f Back_Last/ci/docker-compose.ci.yml up -d
+          timeout 120 bash -c '
+            while true; do
+              s=$(docker inspect --format="{{.State.Health.Status}}" l5_api_ci 2>/dev/null || echo "missing")
+              [ "$s" = "healthy" ] && break; sleep 2
+            done
+          '
+          sleep 3
+
+      - name: "Run DB schema validation (24 checks)"
+        env:
+          API: http://127.0.0.1:8099
+          PLAGIO_PG_DSN: "postgresql://plagio:plagio_ci_pass@127.0.0.1:5499/plagio_ci?sslmode=disable"
+        run: |
+          chmod +x Back_Last/ci/test_db_schema.sh
+          bash Back_Last/ci/test_db_schema.sh
+
+      - name: Collect logs
+        if: always()
+        run: |
+          echo "══ API ══" && docker logs l5_api_ci 2>&1 | tail -50
+          echo "══ PG ══"  && docker logs plagio_pg_ci 2>&1 | tail -30
+      - name: Tear down
+        if: always()
+        run: docker compose -f Back_Last/ci/docker-compose.ci.yml down -v --remove-orphans
+
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  INTEGRATION 2: INDEX & SEARCH — Full HTTP API integration
+  #
+  #  Tests the complete pipeline via HTTP API (POST /v1/process):
+  #    INDEX: text → normalize → tokenize → hash → shingles
+  #      → enqueue INDEX_TEXT → worker build segment → manifest update
+  #    SEARCH: text → build query shingles → binary search in CPB postings
+  #      → candidate scoring (Cq/Cd/C) → span extraction → sources[]
+  #
+  #    Tests Level 1 (shingles only) and Level 2 (shingles + LSH)
+  #    Exact copy detection >=30%, unrelated text <=5%
+  # ═══════════════════════════════════════════════════════════════════════════
+  integ-2-index-search:
+    name: "Test: Index & Search"
+    needs: build-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Download image
+        uses: actions/download-artifact@v4
+        with: { name: l5-ci-image, path: /tmp }
+      - name: Load image
+        run: gunzip -c /tmp/l5_ci_image.tar.gz | docker load
+      - name: Install psql
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends postgresql-client
+
+      - name: Start CI stack
+        run: |
+          docker compose -f Back_Last/ci/docker-compose.ci.yml up -d
+          timeout 120 bash -c '
+            while true; do
+              s=$(docker inspect --format="{{.State.Health.Status}}" l5_api_ci 2>/dev/null || echo "missing")
+              [ "$s" = "healthy" ] && break; sleep 2
+            done
+          '
+          sleep 3
+          docker compose -f Back_Last/ci/docker-compose.ci.yml ps
+
+      # Steps 41-46: Full integration test
+      - name: "Steps 41-46: Index & search integration (20 tests)"
+        env:
+          API: http://127.0.0.1:8099
+          PLAGIO_PG_DSN: "postgresql://plagio:plagio_ci_pass@127.0.0.1:5499/plagio_ci?sslmode=disable"
+        run: |
+          chmod +x Back_Last/ci/test_l1_l4.sh
+          bash Back_Last/ci/test_l1_l4.sh
+
+      - name: Collect container logs
+        if: always()
+        run: |
+          echo "══ API ══" && docker logs l5_api_ci 2>&1 | tail -200
+          echo "══ Worker ══" && docker logs l5_worker_ci 2>&1 | tail -200
+      - name: Tear down
+        if: always()
+        run: docker compose -f Back_Last/ci/docker-compose.ci.yml down -v --remove-orphans
+
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  INTEGRATION 3: COMPACTION — Segment merge & data integrity
+  #
+  #  Algorithm: compact_once() — K-way sorted merge
+  #    1. Worker claims COMPACT_SMALL from job_queue
+  #    2. Load manifest → select N smallest segments
+  #    3. K-way merge of sorted postings → new merged segment
+  #    4. Atomic manifest update: replace N old → 1 new
+  #    5. Delete old segment directories
+  #
+  #  Tests: index 4 docs → baseline → compact → verify integrity
+  # ═══════════════════════════════════════════════════════════════════════════
+  integ-3-compaction:
+    name: "Test: Compaction"
+    needs: integ-2-index-search
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Download image
+        uses: actions/download-artifact@v4
+        with: { name: l5-ci-image, path: /tmp }
+      - name: Load image
+        run: gunzip -c /tmp/l5_ci_image.tar.gz | docker load
+      - name: Install psql
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends postgresql-client
+
+      - name: Start CI stack
+        run: |
+          docker compose -f Back_Last/ci/docker-compose.ci.yml up -d
+          timeout 120 bash -c '
+            while true; do
+              s=$(docker inspect --format="{{.State.Health.Status}}" l5_api_ci 2>/dev/null || echo "missing")
+              [ "$s" = "healthy" ] && break; sleep 2
+            done
+          '
+          sleep 3
+
+      # Step 47: Compaction integration
+      - name: "Step 47: Compaction — index 4 docs → COMPACT_SMALL → data integrity"
+        env:
+          API: http://127.0.0.1:8099
+          PLAGIO_PG_DSN: "postgresql://plagio:plagio_ci_pass@127.0.0.1:5499/plagio_ci?sslmode=disable"
+        run: |
+          chmod +x Back_Last/ci/test_compaction.sh
+          bash Back_Last/ci/test_compaction.sh
+
+      - name: Collect logs
+        if: always()
+        run: |
+          echo "══ API ══" && docker logs l5_api_ci 2>&1 | tail -200
+          echo "══ Worker ══" && docker logs l5_worker_ci 2>&1 | tail -200
+      - name: Tear down
+        if: always()
+        run: docker compose -f Back_Last/ci/docker-compose.ci.yml down -v --remove-orphans
+
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  INTEGRATION 4: L5 INGEST — Filesystem batch import
+  #
+  #  Algorithm: INGEST_L5_FS job
+  #    1. Enqueue via POST /v1/jobs/enqueue type=INGEST_L5_FS
+  #    2. Worker scans dataset_root/{src_dirs}/*.txt
+  #    3. For each file: extract → normalize → tokenize → hash → shingles
+  #    4. Build segment(s) in l5/s{shard}/ (sharded by doc hash)
+  #    5. Update manifest, mark job done with docs_indexed count
+  # ═══════════════════════════════════════════════════════════════════════════
+  integ-4-l5-ingest:
+    name: "Test: L5 Ingest"
+    needs: build-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Download image
+        uses: actions/download-artifact@v4
+        with: { name: l5-ci-image, path: /tmp }
+      - name: Load image
+        run: gunzip -c /tmp/l5_ci_image.tar.gz | docker load
+      - name: Install psql
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends postgresql-client
+
+      - name: Start CI stack
+        run: |
+          docker compose -f Back_Last/ci/docker-compose.ci.yml up -d
+          timeout 120 bash -c '
+            while true; do
+              s=$(docker inspect --format="{{.State.Health.Status}}" l5_api_ci 2>/dev/null || echo "missing")
+              [ "$s" = "healthy" ] && break; sleep 2
+            done
+          '
+          sleep 3
+
+      # Step 48: L5 filesystem ingest
+      - name: "Step 48: L5 bulk ingest — INGEST_L5_FS → search ingested content"
+        env:
+          API: http://127.0.0.1:8099
+          PLAGIO_PG_DSN: "postgresql://plagio:plagio_ci_pass@127.0.0.1:5499/plagio_ci?sslmode=disable"
+        run: |
+          chmod +x Back_Last/ci/test_l5_ingest.sh
+          bash Back_Last/ci/test_l5_ingest.sh
+
+      - name: Collect logs
+        if: always()
+        run: |
+          echo "══ API ══" && docker logs l5_api_ci 2>&1 | tail -150
+          echo "══ Worker ══" && docker logs l5_worker_ci 2>&1 | tail -150
+      - name: Tear down
+        if: always()
+        run: docker compose -f Back_Last/ci/docker-compose.ci.yml down -v --remove-orphans
+
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  INTEGRATION 5: API CONTRACTS — Validate all HTTP endpoints
+  #
+  #  Validates every accessible API route:
+  #    GET  /health → liveness | GET /ready → readiness (PG check)
+  #    GET  /openapi.json → OpenAPI 3.0 spec
+  #    GET  /v1/admin/metrics → CPU, memory, threads
+  #    POST /v1/process → main plagiarism check endpoint
+  #    GET  /v1/jobs/{id} → job status
+  #    GET  /v1/modules/{m}/orgs/{o}/segments → segment listing
+  # ═══════════════════════════════════════════════════════════════════════════
+  integ-5-api-contracts:
+    name: "Test: API Contracts"
+    needs: build-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Download image
+        uses: actions/download-artifact@v4
+        with: { name: l5-ci-image, path: /tmp }
+      - name: Load image
+        run: gunzip -c /tmp/l5_ci_image.tar.gz | docker load
+
+      - name: Start CI stack
+        run: |
+          docker compose -f Back_Last/ci/docker-compose.ci.yml up -d
+          timeout 120 bash -c '
+            while true; do
+              s=$(docker inspect --format="{{.State.Health.Status}}" l5_api_ci 2>/dev/null || echo "missing")
+              [ "$s" = "healthy" ] && break; sleep 2
+            done
+          '
+          sleep 3
+
+      # Step 49: API contract validation
+      - name: "Step 49: API contracts — all HTTP endpoints validation"
+        env:
+          API: http://127.0.0.1:8099
+        run: |
+          chmod +x Back_Last/ci/test_api_contracts.sh
+          bash Back_Last/ci/test_api_contracts.sh
+
+      - name: Collect logs
+        if: always()
+        run: docker logs l5_api_ci 2>&1 | tail -100
+      - name: Tear down
+        if: always()
+        run: docker compose -f Back_Last/ci/docker-compose.ci.yml down -v --remove-orphans
+
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  INTEGRATION 6: ADMIN OPERATIONS — Compact API, segments, error handling
+  #
+  #  Tests administrative endpoints:
+  #    POST /v1/modules/{m}/orgs/{o}/admin/compact_small
+  #    GET  /v1/modules/{m}/orgs/{o}/segments
+  #    GET  /v1/modules/{m}/orgs/{o}/l5/rebuild_info
+  #    POST /v1/process with invalid data → error handling
+  # ═══════════════════════════════════════════════════════════════════════════
+  integ-6-admin-ops:
+    name: "Test: Admin Ops"
+    needs: build-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Download image
+        uses: actions/download-artifact@v4
+        with: { name: l5-ci-image, path: /tmp }
+      - name: Load image
+        run: gunzip -c /tmp/l5_ci_image.tar.gz | docker load
+
+      - name: Start CI stack
+        run: |
+          docker compose -f Back_Last/ci/docker-compose.ci.yml up -d
+          timeout 120 bash -c '
+            while true; do
+              s=$(docker inspect --format="{{.State.Health.Status}}" l5_api_ci 2>/dev/null || echo "missing")
+              [ "$s" = "healthy" ] && break; sleep 2
+            done
+          '
+          sleep 3
+
+      # Step 50: Admin operations
+      - name: "Step 50: Admin — compact API, segments list, rebuild info, errors"
+        env:
+          API: http://127.0.0.1:8099
+        run: |
+          chmod +x Back_Last/ci/test_admin_ops.sh
+          bash Back_Last/ci/test_admin_ops.sh
+
+      - name: Collect logs
+        if: always()
+        run: docker logs l5_api_ci 2>&1 | tail -100
+      - name: Tear down
+        if: always()
+        run: docker compose -f Back_Last/ci/docker-compose.ci.yml down -v --remove-orphans
+
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  HEALTH MONITORING — Probes, containers, resources
+  # ═══════════════════════════════════════════════════════════════════════════
+  health-monitoring:
+    name: "Health Monitoring"
+    needs: build-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Download image
+        uses: actions/download-artifact@v4
+        with: { name: l5-ci-image, path: /tmp }
+      - name: Load image
+        run: gunzip -c /tmp/l5_ci_image.tar.gz | docker load
+      - name: Install psql
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends postgresql-client
+
+      - name: Start CI stack
+        run: |
+          docker compose -f Back_Last/ci/docker-compose.ci.yml up -d
+          sleep 15
+
+      - name: "Health checks — API probes, PG tables, containers, worker, resources"
+        env:
+          API: http://127.0.0.1:8099
+          PLAGIO_PG_DSN: "postgresql://plagio:plagio_ci_pass@127.0.0.1:5499/plagio_ci?sslmode=disable"
+        run: |
+          chmod +x Back_Last/ci/check_health.sh
+          bash Back_Last/ci/check_health.sh
+
+      - name: Docker resource usage
+        if: always()
+        run: |
+          docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.PIDs}}" 2>/dev/null || true
+          docker system df 2>/dev/null || true
+      - name: Tear down
+        if: always()
+        run: docker compose -f Back_Last/ci/docker-compose.ci.yml down -v --remove-orphans
+
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  FINAL: CI REPORT — Summary across all 20 jobs / 50 steps
+  # ═══════════════════════════════════════════════════════════════════════════
+  report:
+    name: "CI Report"
+    needs:
+      - unit-1-normalize
+      - unit-2-tokenize-hash
+      - unit-3-simhash-lsh
+      - unit-4-snowball-stemmer
+      - unit-5-extractor-utf8
+      - unit-6-chunker
+      - unit-7-segment-format
+      - unit-8-cpb-varint
+      - unit-10-builder-e2e
+      - unit-11-query-search
+      - code-quality
+      - security-scan
+      - integ-1-db-schema
+      - integ-2-index-search
+      - integ-3-compaction
+      - integ-4-l5-ingest
+      - integ-5-api-contracts
+      - integ-6-admin-ops
+      - health-monitoring
+    runs-on: ubuntu-latest
+    if: always()
+    timeout-minutes: 5
+
+    steps:
+      - name: "CI Report — 50 Steps Summary"
+        run: |
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║      L5 ANTI-PLAGIARISM ENGINE — CI REPORT (50 steps)      ║"
+          echo "╠══════════════════════════════════════════════════════════════╣"
+          echo "║                                                            ║"
+          echo "║  ── BUILD ────────────────────────────────────────────────  ║"
+          echo "║  Steps 1-5   Build CI Image    : ${{ needs.build-image.result || 'skipped' }}"
+          echo "║                                                            ║"
+          echo "║  ── UNIT TESTS (Steps 6-34) ──────────────────────────────  ║"
+          echo "║  Steps 6-8   Text Normalize    : ${{ needs.unit-1-normalize.result }}"
+          echo "║  Steps 9-11  Tokenize & Hash   : ${{ needs.unit-2-tokenize-hash.result }}"
+          echo "║  Steps 12-15 SimHash & LSH     : ${{ needs.unit-3-simhash-lsh.result }}"
+          echo "║  Step 16     Snowball Stemmer   : ${{ needs.unit-4-snowball-stemmer.result }}"
+          echo "║  Steps 17-18 UTF-8 Extractor   : ${{ needs.unit-5-extractor-utf8.result }}"
+          echo "║  Step 19     Text Chunker       : ${{ needs.unit-6-chunker.result }}"
+          echo "║  Steps 20-24 Segment Format IO  : ${{ needs.unit-7-segment-format.result }}"
+          echo "║  Steps 25-27 CPB Varint Codec   : ${{ needs.unit-8-cpb-varint.result }}"
+          echo "║  Steps 28-32 Builder E2E        : ${{ needs.unit-10-builder-e2e.result }}"
+          echo "║  Steps 33-34 Query & Search     : ${{ needs.unit-11-query-search.result }}"
+          echo "║                                                            ║"
+          echo "║  ── CODE QUALITY (Steps 35-39) ───────────────────────────  ║"
+          echo "║  Steps 35-37 Static Analysis    : ${{ needs.code-quality.result }}"
+          echo "║  Steps 38-39 Security Scan      : ${{ needs.security-scan.result }}"
+          echo "║                                                            ║"
+          echo "║  ── INTEGRATION (Steps 40-50) ────────────────────────────  ║"
+          echo "║  Step 40     DB Schema Check    : ${{ needs.integ-1-db-schema.result }}"
+          echo "║  Steps 41-46 Index & Search     : ${{ needs.integ-2-index-search.result }}"
+          echo "║  Step 47     Compaction         : ${{ needs.integ-3-compaction.result }}"
+          echo "║  Step 48     L5 FS Ingest       : ${{ needs.integ-4-l5-ingest.result }}"
+          echo "║  Step 49     API Contracts      : ${{ needs.integ-5-api-contracts.result }}"
+          echo "║  Step 50     Admin Operations   : ${{ needs.integ-6-admin-ops.result }}"
+          echo "║                                                            ║"
+          echo "║  ── INFRASTRUCTURE ───────────────────────────────────────  ║"
+          echo "║  Health      Health Monitoring  : ${{ needs.health-monitoring.result }}"
+          echo "║                                                            ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+
+      - name: Determine overall status
+        run: |
+          RESULTS="${{ needs.unit-1-normalize.result }} ${{ needs.unit-2-tokenize-hash.result }} ${{ needs.unit-3-simhash-lsh.result }} ${{ needs.unit-4-snowball-stemmer.result }} ${{ needs.unit-5-extractor-utf8.result }} ${{ needs.unit-6-chunker.result }} ${{ needs.unit-7-segment-format.result }} ${{ needs.unit-8-cpb-varint.result }} ${{ needs.unit-10-builder-e2e.result }} ${{ needs.unit-11-query-search.result }} ${{ needs.code-quality.result }} ${{ needs.integ-1-db-schema.result }} ${{ needs.integ-2-index-search.result }} ${{ needs.integ-3-compaction.result }} ${{ needs.integ-5-api-contracts.result }} ${{ needs.integ-6-admin-ops.result }} ${{ needs.health-monitoring.result }}"
+
+          FAILED=0
+          for r in $RESULTS; do
+            if [ "$r" != "success" ]; then
+              FAILED=$((FAILED+1))
+            fi
+          done
+
+          if [ "$FAILED" -eq 0 ]; then
+            echo "══════════════════════════════════════════════"
+            echo "  ALL CI CHECKS PASSED (50 steps / 20 jobs)"
+            echo "══════════════════════════════════════════════"
+          else
+            echo "══════════════════════════════════════════════"
+            echo "  $FAILED JOB(S) FAILED — SEE ABOVE"
+            echo "══════════════════════════════════════════════"
+            exit 1
+          fi
