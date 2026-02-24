@@ -26,6 +26,8 @@ Back/logs/
 Back/tmp/
 Back/cache/
 Back/data/
+Back/DATA_ROOT_DEV/
+Back/DATA_ROOT_PROD/
 
 # HuggingFace / models
 Back/**/*.safetensors
@@ -47,3 +49,42 @@ Front/yarn-error.log
 Front/pnpm-debug.log
 Front/.eslintcache
 Front/.env*
+
+# archives
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+*.bz2
+*.xz
+*.zst
+
+# python venvs
+.venv/
+venv/
+**/.venv/
+**/venv/
+**/site-packages/
+__pycache__/
+*.pyc
+
+runtime/
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+
+# === Back_Last (C++ service) ===
+Back_Last/build/
+Back_Last/DATA_ROOT_DEV/
+Back_Last/DATA_ROOT_PROD/
+Back_Last/runtime/
+
+# === Test data / archives ===
+archive_test/
+ingest_log.jsonl
+ingest*.jsonl

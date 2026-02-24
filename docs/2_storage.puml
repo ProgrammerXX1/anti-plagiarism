@@ -1,0 +1,94 @@
+@startuml storage
+skinparam backgroundColor white
+skinparam defaultFontName Arial
+skinparam defaultFontSize 10
+
+title 2. SSD STORAGE
+
+package "Segment Directory" {
+  
+  artifact "index_native.bin" as bin {
+  }
+  
+  artifact "index_native_docids.json" as json {
+  }
+  
+}
+
+note right of bin
+  **File Layout:**
+  
+  ╔════════════════════════════════╗
+  ║ HeaderV2 (28 bytes)            ║
+  ╠════════════════════════════════╣
+  ║ magic[4] = "PLAG"              ║
+  ║ version = 2                    ║
+  ║ n_docs: uint32                 ║
+  ║ n_post9: uint64                ║
+  ║ n_post13: uint64 (unused = 0)  ║
+  ╠════════════════════════════════╣
+  ║ DocMeta[n_docs] (20 bytes each)║
+  ╠════════════════════════════════╣
+  ║ tok_len: uint32                ║
+  ║ simhash_hi: uint64             ║
+  ║ simhash_lo: uint64             ║
+  ╠════════════════════════════════╣
+  ║ Posting9[n_post9] (16 bytes)   ║
+  ╠════════════════════════════════╣
+  ║ h: uint64 (shingle hash)       ║
+  ║ did: uint32 (doc internal id)  ║
+  ║ pos: uint32 (token position)   ║
+  ╚════════════════════════════════╝
+  
+  **Sorted by:** (h, did, pos)
+  
+  **Size formula:**
+  28 + (20 * N_docs) + (16 * N_shingles)
+  
+  **Example (100K docs, 50M shingles):**
+  28 + 2MB + 800MB ≈ 802 MB
+end note
+
+note right of json
+  **JSON Array of DocInfo:**
+  
+  [
+    {
+      "doc_id": "unique_identifier",
+      "module": "module_name",
+      "organization_id": "org_123",
+      "external_id": "ext_abc",
+      "source_path": "/uploads/file.txt",
+      "source_name": "original.txt",
+      "preview_text": "First 240 chars..."
+    },
+    ...
+  ]
+  
+  **Fields:**
+  - doc_id: internal unique ID
+  - module: scope for search filtering
+  - organization_id: tenant isolation
+  - external_id: external system reference
+  - source_path: original file location
+  - source_name: original filename
+  - preview_text: UTF-8 safe, max 240 bytes
+  
+  **Size:** variable (typically 200-500 bytes/doc)
+end note
+
+package "Manifest" {
+  artifact "manifest.jsonl" as manifest
+}
+
+note bottom of manifest
+  **Segment Registry:**
+  {"segment_name": "seg_xxx", "path": "seg_xxx/", 
+   "built_at_utc": "20260209_120000",
+   "stats": {"docs": 1000, "k9": 50000}}
+  
+  One line per segment
+  Used by search to enumerate segments
+end note
+
+@enduml

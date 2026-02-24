@@ -1,0 +1,122 @@
+@startuml cache
+skinparam backgroundColor white
+skinparam defaultFontName Arial
+skinparam defaultFontSize 10
+
+title 3. HOT CACHE (RAM)
+
+package "SegmentObjectCache" as seg_cache {
+  
+  class Entry {
+    shared_ptr<SegmentData> seg
+    uint64_t bin_bytes
+    uint64_t mtime_ns
+    bool pinned
+    list_iterator it
+  }
+  
+  class SegmentData {
+    HeaderV2 header
+    vector<DocMeta> docmeta
+    vector<Posting9> postings9
+    path seg_dir
+  }
+  
+}
+
+note right of seg_cache
+  **Configuration:**
+  PLAGIO_SEGOBJ_CACHE_BYTES
+  (environment variable)
+  
+  **Default:** 0 (no limit)
+  **Recommended:** 60 GiB for large indices
+  
+  **Features:**
+  - LRU eviction (least recently used)
+  - pin/unpin for hot segments
+  - mtime validation (reload if changed)
+  - thread-safe get_or_load()
+  - inflight dedup (one load per segment)
+  
+  **Memory per segment:**
+  header: negligible
+  docmeta: 20 * N_docs bytes
+  postings: 16 * N_shingles bytes
+  
+  **Example (1M docs, 500M shingles):**
+  20MB + 8GB = ~8 GB per segment
+end note
+
+package "DocidsCache" as doc_cache {
+  
+  class DocEntry {
+    shared_ptr<vector<DocInfo>> docs
+    uint64_t docids_bytes
+    uint64_t mtime_ns
+    bool pinned
+    list_iterator it
+  }
+  
+  class DocInfo {
+    string doc_id
+    string module
+    string organization_id
+    string external_id
+    string source_path
+    string source_name
+    string preview_text
+  }
+  
+}
+
+note right of doc_cache
+  **Configuration:**
+  PLAGIO_DOCIDS_CACHE_BYTES
+  (environment variable)
+  
+  **Features:**
+  - LRU eviction
+  - thread-safe get_or_load()
+  - inflight dedup
+  
+  **Memory per segment:**
+  ~300-500 bytes per doc (strings)
+  
+  **Example (1M docs):**
+  ~300-500 MB per segment
+end note
+
+package "Cache Flow" {
+  
+  (Search Request) as search
+  (get_or_load) as get
+  (Cache Hit) as hit
+  (Cache Miss) as miss
+  (Load from SSD) as load
+  (LRU Evict) as evict
+  
+  search --> get
+  get --> hit : found in cache
+  get --> miss : not found
+  miss --> load
+  load --> evict : if over budget
+  evict --> get : add to cache
+  
+}
+
+note bottom of "Cache Flow"
+  **Access Pattern:**
+  1. search_out_root() iterates segments
+  2. For each segment: segobj_cache().get_or_load()
+  3. Cache returns shared_ptr (thread-safe)
+  4. Search uses data, refcount keeps alive
+  5. When refcount drops, eligible for eviction
+  
+  **Eviction Policy:**
+  - LRU: remove least recently accessed
+  - Skip pinned entries
+  - Evict until total < budget
+end note
+
+@enduml

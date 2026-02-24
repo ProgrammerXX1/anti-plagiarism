@@ -1,0 +1,93 @@
+@startuml overview
+skinparam backgroundColor white
+skinparam defaultFontName Arial
+skinparam defaultFontSize 10
+skinparam componentStyle rectangle
+
+title Anti-Plagiarism Pipeline Overview
+
+package "1. INDEXING" #FFF3E0 {
+  [Raw Text] as raw
+  [normalize_for_shingles] as norm
+  [tokenize_spans] as tok
+  [hash_tokens] as hash
+  [Shingles K=9] as shingle
+  [Simhash128] as sim
+  
+  raw --> norm
+  norm --> tok
+  tok --> hash
+  hash --> shingle
+  hash --> sim
+}
+
+package "2. STORAGE" #E8F5E9 {
+  database "index_native.bin" as bin {
+    [Header 28B]
+    [DocMeta 20B * N]
+    [Postings 16B * M]
+  }
+  database "docids.json" as json
+}
+
+package "3. CACHE" #FCE4EC {
+  [SegmentObjectCache] as seg_cache
+  [DocidsCache] as doc_cache
+  
+  note bottom of seg_cache
+    LRU, pin/unpin
+    PLAGIO_SEGOBJ_CACHE_BYTES
+  end note
+}
+
+package "4. SEARCH" #E1F5FE {
+  [Query] as query
+  [build_query_shingles] as qbuild
+  [Binary Search] as bsearch
+  [Span Detection] as span
+  [Scoring] as score
+  [TopK Results] as topk
+  
+  query --> qbuild
+  qbuild --> bsearch
+  bsearch --> span
+  span --> score
+  score --> topk
+}
+
+shingle --> bin
+sim --> bin
+bin --> seg_cache
+json --> doc_cache
+seg_cache --> bsearch
+doc_cache --> score
+
+note right of shingle
+  **Posting9:**
+  {hash, doc_id, pos}
+  16 bytes, sorted
+end note
+
+note right of sim
+  **DocMeta:**
+  {tok_len, simhash}
+  20 bytes
+end note
+
+note right of bsearch
+  **Complexity:**
+  O(U * log P + M)
+end note
+
+legend bottom
+  **Resource Summary:**
+  | Component | SSD | RAM |
+  | index_native.bin | 28 + 20*D + 16*S bytes | same when loaded |
+  | docids.json | ~300 bytes/doc | same when parsed |
+  
+  D = docs, S = shingles
+  
+  **CPU:** Index O(text + tok + sh), Search O(U*logP + M)
+endlegend
+
+@enduml

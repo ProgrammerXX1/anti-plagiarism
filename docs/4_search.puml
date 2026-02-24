@@ -1,0 +1,228 @@
+@startuml search
+skinparam backgroundColor white
+skinparam defaultFontName Arial
+skinparam defaultFontSize 10
+
+title 4. SEARCH PIPELINE
+
+start
+
+:Query Text;
+note right
+  Same limits as indexing:
+  max 8 MiB
+end note
+
+:build_query_shingles(query, is_normalized);
+
+partition "Query Processing" {
+  
+  if (is_normalized?) then (yes)
+    :use query as-is;
+  else (no)
+    :normalize_for_shingles_simple();
+  endif
+  
+  :tokenize_spans();
+  
+  :hash_tokens_bytes_spans();
+  
+  :simhash128_token_hashes();
+  note right
+    Query simhash for LSH (future)
+  end note
+  
+  if (N_tokens < K_SHINGLE?) then (yes)
+    :return empty (LSH only possible);
+    stop
+  else (no)
+  endif
+  
+  :Generate shingle hashes;
+  note right
+    For pos = 0 to N_tok - 9:
+    h = hash_shingle_token_hashes()
+  end note
+  
+  :Group by unique hash;
+  note right
+    **QueryHash {**
+      uint64_t h;
+      vector<uint32_t> qpos;
+    **}**
+    
+    Same hash can appear at
+    multiple positions in query
+  end note
+  
+  :Sort items by hash;
+  
+}
+
+:QueryShingles result;
+note right
+  **QueryShingles {**
+    vector<QueryHash> items;
+    uint32_t total_shingles;
+    uint32_t tok_len;
+    uint64_t simhash_hi;
+    uint64_t simhash_lo;
+  **}**
+end note
+
+partition "Multi-Segment Search" {
+  
+  :load_manifest(out_root);
+  
+  :For each segment in manifest;
+  
+  fork
+    :segobj_cache().get_or_load();
+    note right: Load postings + docmeta
+  fork again
+    :docids_cache().get_or_load();
+    note right: Load DocInfo[]
+  end fork
+  
+  :search_in_segment();
+  
+}
+
+partition "Segment Search" {
+  
+  :For each QueryHash in items;
+  
+  :range_for_hash_safe();
+  note right
+    **Binary search:**
+    lower_bound(h)
+    upper_bound(h)
+    
+    **Complexity:** O(log P)
+    P = total postings
+  end note
+  
+  :Collect matched postings;
+  note right
+    For each posting in range:
+    record (did, pos)
+    
+    **Complexity:** O(M)
+    M = matches for this hash
+  end note
+  
+  :SearchScratch (TLS);
+  note right
+    **Epoch stamping:**
+    - hits[did] = count
+    - hits_stamp[did] = epoch
+    - touched_hits[] for iteration
+    
+    **Avoids:** O(N_docs) zeroing
+    **Achieves:** O(M) per query
+  end note
+  
+}
+
+partition "Span Detection" {
+  
+  :For each doc with hits;
+  
+  :Collect all (qpos, dpos) pairs;
+  
+  :Sort by delta = dpos - qpos;
+  note right
+    Same delta = diagonal match
+    Indicates contiguous overlap
+  end note
+  
+  :Group by same delta;
+  
+  :Build spans within delta group;
+  note right
+    **SpanTmp {**
+      q_start, q_end,
+      d_start, d_end,
+      len_shingles
+    **}**
+    
+    Adjacent positions merge
+    Gap allowed: span_gap (default 3)
+  end note
+  
+}
+
+partition "Scoring" {
+  
+  :Merge spans for document;
+  
+  :union_len_inclusive_from_spans();
+  note right
+    Union of covered positions
+    Handles overlapping spans
+  end note
+  
+  :Calculate overlap;
+  note right
+    **C** = total matched shingles
+    **overlap_ratio** = C / union_len
+    
+    Higher C = more similarity
+  end note
+  
+  :Create Hit;
+  note right
+    **Hit {**
+      doc_id, module, org_id,
+      external_id, source_path,
+      C, spans[]
+    **}**
+  end note
+  
+}
+
+partition "Result Aggregation" {
+  
+  :Merge hits across segments;
+  note right
+    Same doc_id from different
+    segments: keep best C
+  end note
+  
+  :Sort by C descending;
+  
+  :Filter by topk;
+  note right
+    Default topk = varies
+    Return top N results
+  end note
+  
+}
+
+:SearchResult;
+note right
+  **SearchResult {**
+    string query;
+    vector<Hit> hits;
+    uint32_t segments_scanned;
+  **}**
+end note
+
+stop
+
+legend right
+  **Complexity Summary:**
+  
+  Query processing: O(Q_tokens + Q_shingles)
+  Per segment: O(U * log P + M)
+  Span detection: O(M * log M) sorting
+  Total: O(S * (U * log P + M))
+  
+  Where:
+  S = segments
+  U = unique query hashes
+  P = postings per segment
+  M = matched postings
+endlegend
+
+@enduml

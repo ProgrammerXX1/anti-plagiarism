@@ -1,0 +1,117 @@
+@startuml indexing
+skinparam backgroundColor white
+skinparam defaultFontName Arial
+skinparam defaultFontSize 10
+
+title 1. INDEXING PIPELINE
+
+start
+
+:Raw Text;
+note right
+  UTF-8
+  max 8 MiB (max_text_bytes_per_doc)
+  from JSONL corpus
+end note
+
+if (text_is_normalized?) then (yes)
+  :skip normalization;
+else (no)
+  :normalize_for_shingles_simple_to();
+  note right
+    **Rules:**
+    1. lowercase ASCII a-z
+    2. lowercase RU/KZ кириллица
+       (0x0400..0x052F)
+    3. lowercase TR: ç ğ ı ö ş ü
+    4. Arabic digits ٠-٩ → 0-9
+    5. punctuation → space
+    6. collapse multiple spaces
+    7. trim trailing space
+  end note
+endif
+
+:tokenize_spans(text, spans);
+note right
+  Split by whitespace (ASCII + NBSP)
+  **Output:**
+  vector<TokenSpan>
+  TokenSpan { start, len }
+end note
+
+:N_tokens = spans.size();
+
+if (N_tokens > max_tokens_per_doc?) then (yes)
+  :truncate spans to max_tokens_per_doc;
+  note right: default = 100,000
+endif
+
+if (N_tokens < K_SHINGLE?) then (yes)
+  :skip document;
+  note right: K_SHINGLE = 9
+  stop
+else (no)
+endif
+
+:hash_tokens_bytes_spans(text, spans, token_hashes);
+note right
+  **For each token:**
+  XXHash64(token_bytes)
+  
+  **Output:**
+  vector<uint64_t> token_hashes
+  size = N_tokens
+end note
+
+fork
+  :hash_shingle_token_hashes();
+  note right
+    **For pos = 0 to N_tokens - K:**
+    h = hash(token_hashes[pos..pos+9])
+    
+    **shingle_stride** = 1 (default)
+    **max_shingles_per_doc** = 50,000
+    
+    **Output:**
+    N_shingles = N_tokens - 9 + 1
+  end note
+  
+  :Create Posting9;
+  note right
+    **Posting9 {**
+      uint64_t h;   // shingle hash
+      uint32_t did; // doc internal id
+      uint32_t pos; // token position
+    **}**
+    Size: 16 bytes
+  end note
+fork again
+  :simhash128_token_hashes();
+  note right
+    **128-bit fingerprint:**
+    hi: uint64_t (bits 0-63)
+    lo: uint64_t (bits 64-127)
+    
+    Used for:
+    - LSH indexing (future)
+    - Near-duplicate detection
+  end note
+  
+  :Create DocMeta;
+  note right
+    **DocMeta {**
+      uint32_t tok_len;
+      uint64_t simhash_hi;
+      uint64_t simhash_lo;
+    **}**
+    Size: 20 bytes
+  end note
+end fork
+
+:Sort postings by (h, did, pos);
+
+:Write to segment files;
+
+stop
+
+@enduml
