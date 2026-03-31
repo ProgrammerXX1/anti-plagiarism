@@ -1,0 +1,24 @@
+=== .doc test (parsed as plain text) ===
+
+--- Symbol substitution ---
+Кaтaстрофa — 3x Latin a
+Пeрeвeсти — 3x Latin e
+Мoлoкo — 3x Latin o
+cоблюдение прaвил — Latin c + a
+Пpорабoтка — Latin p + o
+Улyчшy — 2x Latin y
+xoд — Latin x + o в 'ход'
+Aлгоритм Oбработки — uppercase A + O
+Бiлiм (Kazakh і→i)
+
+--- Spacing ---
+NBSP:   три подряд
+ZWSP:​​​три подряд
+EM:  два подряд
+Обычные     пять     пробелов     подряд
+Микс: +​+   + 
+
+--- Clean ---
+Чистая строка без аномалий.
+English text without any issues.
+Қазақ мәтіні дұрыс жазылған.

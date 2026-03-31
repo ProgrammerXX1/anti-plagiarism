@@ -1,0 +1,1008 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>detect_norm — Anti-Fraud Detection</title>
+<style>
+:root{--bg:#0f1117;--card:#1a1d27;--border:#2a2d3a;--accent:#6c63ff;--accent2:#00d4aa;--red:#ff4757;--orange:#ffa502;--green:#2ed573;--text:#e4e6eb;--muted:#8b8fa3;--code-bg:#12141c}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+.container{max-width:1400px;margin:0 auto;padding:12px 16px}
+.hdr{display:flex;align-items:center;gap:16px;padding:12px 0;border-bottom:1px solid var(--border);margin-bottom:16px}
+.hdr h1{font-size:1.3rem;background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.hdr .ver{font-size:.75rem;color:var(--muted)}
+.hdr .status{display:flex;align-items:center;gap:6px;margin-left:auto;font-size:.8rem}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}.dot.on{background:var(--green);box-shadow:0 0 6px var(--green)}.dot.off{background:var(--red)}
+.btn{padding:8px 18px;border-radius:7px;border:none;font-size:.84rem;font-weight:600;cursor:pointer;transition:.2s}
+.btn-p{background:var(--accent);color:#fff}.btn-p:hover{background:#5a52e0}.btn-p:disabled{opacity:.4;cursor:default}
+.btn-o{background:none;border:1px solid var(--border);color:var(--text)}.btn-o:hover{border-color:var(--accent);color:var(--accent)}
+.btn-g{background:var(--green);color:#000}.btn-g:hover{background:#26c46a}
+.btn-r{background:var(--red);color:#fff}.btn-r:hover{background:#e8414f}
+.btn-sm{padding:5px 12px;font-size:.76rem}
+.tabs{display:flex;gap:3px;margin-bottom:16px;background:var(--card);padding:3px;border-radius:10px;border:1px solid var(--border)}
+.tab{flex:1;padding:10px 6px;text-align:center;border-radius:7px;cursor:pointer;font-size:.82rem;font-weight:600;color:var(--muted);border:none;background:none;transition:.2s}
+.tab:hover{color:var(--text)}.tab.act{background:var(--accent);color:#fff}
+.panel{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:16px}
+.panel h3{font-size:.92rem;margin-bottom:12px;color:var(--muted);display:flex;align-items:center;gap:8px}
+.bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:12px 14px;background:var(--card);border:1px solid var(--border);border-radius:10px;margin-bottom:12px}
+.bar .drop{flex:1;min-width:180px;padding:12px;border:2px dashed var(--border);border-radius:8px;text-align:center;cursor:pointer;transition:.2s;font-size:.84rem;color:var(--muted)}
+.bar .drop:hover,.bar .drop.drag{border-color:var(--accent);background:rgba(108,99,255,.05)}
+.bar .drop.has-file{border-color:var(--accent2);color:var(--accent2)}
+.checks{display:flex;gap:12px;flex-wrap:wrap}
+.checks label{display:flex;align-items:center;gap:4px;font-size:.8rem;cursor:pointer;white-space:nowrap}
+.checks input{accent-color:var(--accent);width:15px;height:15px}
+.bar select{background:var(--code-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:7px 10px;font-size:.82rem;min-width:200px}
+.bar .info{font-size:.78rem;color:var(--muted);margin-left:auto}
+.summary{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.scard{flex:1;min-width:90px;background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px;text-align:center}
+.scard .v{font-size:1.5rem;font-weight:700;line-height:1}
+.scard .l{font-size:.68rem;color:var(--muted);margin-top:2px}
+.scard.tot .v{color:var(--accent)}.scard.sym .v{color:var(--red)}.scard.spc .v{color:var(--orange)}.scard.hid .v{color:var(--accent2)}.scard.tm .v{color:var(--muted);font-size:.95rem}
+.ftype{display:inline-block;padding:2px 8px;border-radius:4px;font-size:.72rem;font-weight:700;margin-right:6px}
+.ftype.change_word{background:rgba(255,71,87,.15);color:var(--red)}
+.ftype.spaces{background:rgba(255,165,2,.15);color:var(--orange)}
+.ftype.hidden_symbols{background:rgba(0,212,170,.15);color:var(--accent2)}
+.ftabs{display:flex;gap:2px;margin-bottom:10px;background:var(--code-bg);padding:3px;border-radius:8px}
+.ftab{flex:1;padding:7px 3px;text-align:center;border-radius:6px;cursor:pointer;font-size:.72rem;font-weight:600;color:var(--muted);border:none;background:none;transition:.2s}
+.ftab:hover{color:var(--text)}.ftab.act{color:#fff}
+.ftab.act.f-all{background:var(--accent)}.ftab.act.f-sym{background:var(--red)}.ftab.act.f-spc{background:var(--orange)}.ftab.act.f-hid{background:var(--accent2)}
+.fitem{padding:10px;background:var(--code-bg);border-radius:7px;margin-bottom:5px;cursor:pointer;transition:.2s;border:1px solid transparent;font-size:.82rem}
+.fitem:hover{border-color:var(--accent)}.fitem.active{border-color:var(--accent);background:rgba(108,99,255,.08)}
+.fitem .fword{font-family:'Cascadia Code',monospace;font-size:.82rem;color:var(--orange);word-break:break-all;margin-top:3px}
+.fitem .foff{color:var(--muted);font-size:.72rem}
+.text-area{width:100%;min-height:180px;max-height:50vh;background:var(--code-bg);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:'Cascadia Code',monospace;font-size:.84rem;line-height:1.7;resize:vertical}
+.text-area:focus{outline:none;border-color:var(--accent)}
+.main-grid{display:grid;grid-template-columns:1fr 380px;gap:12px}
+@media(max-width:900px){.main-grid{grid-template-columns:1fr}}
+.json-view{background:var(--code-bg);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:'Cascadia Code',monospace;font-size:.78rem;line-height:1.5;max-height:500px;overflow:auto;white-space:pre-wrap;word-break:break-all;color:var(--text)}
+.json-view .k{color:var(--accent)}.json-view .s{color:var(--green)}.json-view .n{color:var(--orange)}.json-view .null{color:var(--muted)}
+.curl-box{background:var(--code-bg);border:1px solid var(--border);border-radius:8px;padding:10px;font-family:'Cascadia Code',monospace;font-size:.76rem;line-height:1.5;overflow-x:auto;color:var(--accent2);position:relative}
+.curl-box .copy-btn{position:absolute;top:6px;right:6px;padding:3px 8px;font-size:.68rem;background:var(--border);color:var(--text);border:none;border-radius:4px;cursor:pointer}
+.curl-box .copy-btn:hover{background:var(--accent)}
+.doc-section{margin-bottom:16px;padding:14px;background:var(--code-bg);border:1px solid var(--border);border-radius:10px}
+.doc-section h4{font-size:.88rem;margin-bottom:8px;color:var(--accent)}
+.doc-section p,.doc-section li{font-size:.82rem;line-height:1.6;color:var(--text)}
+.doc-section ul{padding-left:20px;margin:6px 0}
+.doc-section li{margin-bottom:4px}
+.doc-section code{background:var(--card);padding:1px 5px;border-radius:3px;font-size:.78rem;color:var(--accent2)}
+.doc-section table{width:100%;border-collapse:collapse;font-size:.82rem;margin-top:8px}
+.doc-section th,.doc-section td{padding:8px 10px;text-align:left;border-bottom:1px solid var(--border)}
+.doc-section th{color:var(--muted);font-weight:600;font-size:.74rem;text-transform:uppercase}
+.doc-section .ft-badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:.72rem;font-weight:700}
+.doc-section .ft-ws{background:rgba(255,71,87,.15);color:var(--red)}
+.doc-section .ft-sp{background:rgba(255,165,2,.15);color:var(--orange)}
+.doc-section .ft-hs{background:rgba(0,212,170,.15);color:var(--accent2)}
+.api-block{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:12px}
+.api-block h4{font-size:.85rem;margin-bottom:8px;color:var(--accent)}
+.method{display:inline-block;padding:2px 8px;border-radius:4px;font-size:.72rem;font-weight:700;margin-right:6px}
+.method.get{background:rgba(0,212,170,.15);color:var(--accent2)}
+.method.post{background:rgba(255,71,87,.15);color:var(--red)}
+.ep{font-family:'Cascadia Code',monospace;font-size:.82rem}
+.empty{text-align:center;padding:50px 20px;color:var(--muted)}
+.empty .icon{font-size:2.5rem;margin-bottom:10px}
+.spinner{display:inline-block;width:13px;height:13px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:sp .6s linear infinite;vertical-align:middle;margin-right:3px}
+@keyframes sp{to{transform:rotate(360deg)}}
+.test-table{width:100%;border-collapse:collapse;font-size:.82rem}
+.test-table th,.test-table td{padding:8px 10px;text-align:left;border-bottom:1px solid var(--border)}
+.test-table th{color:var(--muted);font-size:.72rem;text-transform:uppercase}
+.test-table tr:hover{background:rgba(108,99,255,.04)}
+.test-table .pass{color:var(--green)}.test-table .fail{color:var(--red)}
+.edit-bar{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
+.edit-badge{font-size:.72rem;padding:2px 8px;border-radius:4px;background:rgba(108,99,255,.15);color:var(--accent)}
+/* Toggle slider */
+.toggle-wrap{display:flex;align-items:center;gap:8px;font-size:.8rem}
+.toggle{position:relative;width:46px;height:24px;border-radius:12px;background:var(--border);cursor:pointer;transition:.3s;flex-shrink:0}
+.toggle.on{background:var(--accent)}
+.toggle .knob{position:absolute;top:2px;left:2px;width:20px;height:20px;border-radius:50%;background:#fff;transition:.3s}
+.toggle.on .knob{left:24px}
+.toggle-label{color:var(--muted);font-size:.76rem;white-space:nowrap}
+.file-preview{background:var(--code-bg);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:'Cascadia Code',monospace;font-size:.8rem;line-height:1.6;max-height:400px;overflow:auto;white-space:pre-wrap;word-break:break-all;color:var(--text);margin-top:8px}
+.file-preview .line-num{display:inline-block;width:32px;text-align:right;margin-right:12px;color:var(--muted);font-size:.7rem;user-select:none;opacity:.6}
+/* Doc submenu */
+.doc-nav{display:flex;gap:2px;margin-bottom:16px;background:var(--code-bg);padding:3px;border-radius:8px;flex-wrap:wrap}
+.doc-nav-btn{padding:8px 14px;border-radius:6px;cursor:pointer;font-size:.76rem;font-weight:600;color:var(--muted);border:none;background:none;transition:.2s;white-space:nowrap}
+.doc-nav-btn:hover{color:var(--text)}
+.doc-nav-btn.act{background:var(--accent);color:#fff}
+.arch-card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:10px}
+.arch-card h5{font-size:.84rem;margin-bottom:6px;display:flex;align-items:center;gap:6px}
+.arch-card .status-ok{color:var(--green);font-weight:700;font-size:.76rem}
+.arch-card .status-fix{color:var(--accent);font-weight:700;font-size:.76rem}
+.arch-card ul{padding-left:18px;margin:4px 0}
+.arch-card li{font-size:.8rem;line-height:1.5;color:var(--text);margin-bottom:3px}
+.arch-card code{background:var(--code-bg);padding:1px 5px;border-radius:3px;font-size:.76rem;color:var(--accent2)}
+.arch-card .val{color:var(--orange);font-weight:600}
+/* Test file view toggle */
+.test-view-header{display:flex;align-items:center;gap:12px;margin-bottom:10px}
+.test-view-header h3{margin-bottom:0}
+::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-track{background:var(--bg)}::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+.hidden{display:none!important}
+</style>
+</head>
+<body>
+<div class="container">
+
+<div class="hdr">
+  <h1>&#x1f6e1;&#xfe0f; detect_norm</h1>
+  <span class="ver">Anti-Fraud Detection &middot; C++17</span>
+  <div class="status"><div class="dot" id="dot"></div><span id="stxt">...</span></div>
+</div>
+
+<div class="tabs">
+  <button class="tab act" data-v="check">&#x1f50d; Проверка файла</button>
+  <button class="tab" data-v="tests">&#x1f9ea; Тестирование</button>
+  <button class="tab" data-v="docs">&#x1f4d6; Документация</button>
+  <button class="tab" data-v="api">&#x1f4e1; API</button>
+</div>
+
+<!-- TAB: File check -->
+<div id="v-check">
+  <div class="bar">
+    <div class="drop" id="drop">&#x1f4c4; Перетащите файл или нажмите &middot; docx doc pptx odt rtf txt pdf (до 50 МБ)</div>
+    <input type="file" id="fi" style="display:none" accept=".pdf,.docx,.doc,.txt,.odt,.pptx,.rtf">
+    <div class="checks">
+      <label><input type="checkbox" id="cSym" checked>&#x1f524; change_word</label>
+      <label><input type="checkbox" id="cSpc" checked>&#x2b1c; spaces</label>
+      <label><input type="checkbox" id="cHid" checked>&#x1f47b; hidden_symbols</label>
+    </div>
+    <button class="btn btn-p" id="btnGo" disabled>&#x1f50d; Проверить</button>
+  </div>
+
+  <!-- File content editor -->
+  <div class="panel hidden" id="editorPanel">
+    <h3>&#x1f4dd; Содержимое файла <span class="edit-badge" id="editBadge"></span></h3>
+    <textarea class="text-area" id="fileText" placeholder="Содержимое файла..."></textarea>
+    <div class="edit-bar">
+      <button class="btn btn-p btn-sm" id="btnRecheck">&#x1f50d; Перепроверить изменённый текст</button>
+      <button class="btn btn-o btn-sm" id="btnResetText">&#x21a9; Сбросить</button>
+      <span style="font-size:.72rem;color:var(--muted);margin-left:auto" id="editInfo">Отредактируйте текст и нажмите &laquo;Перепроверить&raquo;</span>
+    </div>
+  </div>
+
+  <div class="summary hidden" id="summ">
+    <div class="scard tot"><div class="v" id="vTot">0</div><div class="l">Всего</div></div>
+    <div class="scard sym"><div class="v" id="vSym">0</div><div class="l">change_word</div></div>
+    <div class="scard spc"><div class="v" id="vSpc">0</div><div class="l">spaces</div></div>
+    <div class="scard hid"><div class="v" id="vHid">0</div><div class="l">hidden_symbols</div></div>
+    <div class="scard tm"><div class="v" id="vTm">-</div><div class="l">Время (с)</div></div>
+  </div>
+  <div class="main-grid hidden" id="mainArea">
+    <div class="panel" style="max-height:70vh;overflow-y:auto">
+      <h3>&#x1f4c4; <span id="docName"></span></h3>
+      <div id="findingsDetail"></div>
+    </div>
+    <div class="panel" style="max-height:70vh;overflow-y:auto">
+      <h3>&#x26a0;&#xfe0f; Находки <span id="fcount"></span></h3>
+      <div class="ftabs">
+        <button class="ftab act f-all" data-f="all">Все</button>
+        <button class="ftab f-sym" data-f="change_word">&#x1f524; ws</button>
+        <button class="ftab f-spc" data-f="spaces">&#x2b1c; sp</button>
+        <button class="ftab f-hid" data-f="hidden_symbols">&#x1f47b; hs</button>
+      </div>
+      <div id="flist"></div>
+    </div>
+  </div>
+  <div class="empty" id="emptyState">
+    <div class="icon">&#x1f4cb;</div>
+    <p>Загрузите файл для проверки</p>
+  </div>
+</div>
+
+<!-- TAB: Tests -->
+<div id="v-tests" class="hidden">
+  <div class="bar">
+    <span style="font-size:.8rem">&#x1f9ea; Тестовые файлы</span>
+    <select id="tsel"><option value="">&mdash; выберите файл &mdash;</option></select>
+    <button class="btn btn-p btn-sm" id="btnTest">&#x25b6; Запустить</button>
+    <button class="btn btn-g btn-sm" id="btnAll">&#x25b6;&#x25b6; Все тесты</button>
+    <span class="info" id="tinfo"></span>
+  </div>
+  <div id="testResultsArea" class="hidden">
+    <div class="panel">
+      <h3>&#x1f4ca; Результаты тестирования</h3>
+      <table class="test-table" id="testTable">
+        <thead><tr><th>Файл</th><th>Всего</th><th>change_word</th><th>spaces</th><th>hidden_symbols</th><th>Время (с)</th><th>Статус</th></tr></thead>
+        <tbody id="testBody"></tbody>
+      </table>
+    </div>
+  </div>
+  <div class="summary hidden" id="summTest">
+    <div class="scard tot"><div class="v" id="vTotS">0</div><div class="l">Всего</div></div>
+    <div class="scard sym"><div class="v" id="vSymS">0</div><div class="l">change_word</div></div>
+    <div class="scard spc"><div class="v" id="vSpcS">0</div><div class="l">spaces</div></div>
+    <div class="scard hid"><div class="v" id="vHidS">0</div><div class="l">hidden_symbols</div></div>
+    <div class="scard tm"><div class="v" id="vTmS">0</div><div class="l">Время (с)</div></div>
+  </div>
+  <div class="main-grid hidden" id="testDetail">
+    <div class="panel" style="max-height:60vh;overflow-y:auto">
+      <div class="test-view-header">
+        <h3>&#x1f4c4; <span id="testDocName"></span></h3>
+        <div class="toggle-wrap" style="margin-left:auto">
+          <span class="toggle-label" id="toggleLabelLeft" style="color:var(--accent);font-weight:600">&#x1f50d; Результаты</span>
+          <div class="toggle" id="viewToggle"><div class="knob"></div></div>
+          <span class="toggle-label" id="toggleLabelRight">&#x1f4c4; Файл</span>
+        </div>
+      </div>
+      <div id="testFindingsDetail"></div>
+      <div id="testFilePreview" class="hidden"></div>
+    </div>
+    <div class="panel" style="max-height:60vh;overflow-y:auto">
+      <h3>&#x26a0;&#xfe0f; Находки <span id="testFcount"></span></h3>
+      <div id="testFlist"></div>
+    </div>
+  </div>
+</div>
+
+<!-- TAB: Docs -->
+<div id="v-docs" class="hidden">
+  <div class="doc-nav">
+    <button class="doc-nav-btn act" data-doc="general">&#x1f4d6; Общее</button>
+    <button class="doc-nav-btn" data-doc="arch">&#x1f3d7;&#xfe0f; Архитектура</button>
+    <button class="doc-nav-btn" data-doc="detectors">&#x1f50d; Детекторы</button>
+    <button class="doc-nav-btn" data-doc="formats">&#x1f4cb; Форматы</button>
+    <button class="doc-nav-btn" data-doc="perf">&#x26a1; Производительность</button>
+    <button class="doc-nav-btn" data-doc="limits">&#x1f527; Ограничения</button>
+  </div>
+
+  <!-- Sub: General -->
+  <div id="doc-general">
+  <div class="doc-section">
+    <h4>&#x1f6e1;&#xfe0f; О сервисе detect_norm</h4>
+    <p>Высокопроизводительный микросервис обнаружения мошенничества в документах, реализованный на <strong>C++17</strong>. Сервис анализирует загруженные файлы и выявляет три категории подозрительных элементов, которые часто используются для обмана систем проверки на плагиат.</p>
+    <p style="margin-top:8px"><strong>Engine:</strong> C++17 &middot; ICU (Unicode) &middot; libzip &middot; pugixml &middot; cpp-httplib<br>
+    <strong>Порт:</strong> <code>8001</code> &middot; <strong>API:</strong> REST JSON &middot; <strong>Swagger:</strong> <code>/docs</code><br>
+    <strong>Форматы:</strong> DOCX, DOC, PPTX, ODT, RTF, TXT, PDF &middot; <strong>Лимит:</strong> 50 МБ на файл</p>
+  </div>
+  <div class="doc-section">
+    <h4>&#x1f4ca; Три категории обнаружения (fraud_type)</h4>
+    <p>Находки всегда возвращаются в строгом порядке: <span class="ft-badge ft-ws">change_word</span> &rarr; <span class="ft-badge ft-sp">spaces</span> &rarr; <span class="ft-badge ft-hs">hidden_symbols</span></p>
+    <table>
+      <tr><th>fraud_type</th><th>Описание</th><th>Что ищем</th><th>Пример</th></tr>
+      <tr>
+        <td><span class="ft-badge ft-ws">change_word</span></td>
+        <td><strong>Подмена символов (гомоглифы)</strong></td>
+        <td>В слове смешаны символы из разных Unicode-скриптов (кириллица + латиница). Определяется доминирующий скрипт слова, чужие символы помечаются.</td>
+        <td><code>информaтике</code> &mdash; латинская &laquo;a&raquo; в кириллическом слове</td>
+      </tr>
+      <tr>
+        <td><span class="ft-badge ft-sp">spaces</span></td>
+        <td><strong>Аномальные пробелы</strong></td>
+        <td>1) 2+ обычных пробелов подряд<br>2) Unicode-пробелы (NBSP, EM SPACE, EN SPACE, THIN SPACE и др.)<br>3) Невидимые символы (ZWSP, ZWJ, ZWNJ, BOM и др.)</td>
+        <td><code>слово&nbsp;&nbsp;&nbsp;&nbsp;слово</code> &mdash; 4 пробела вместо 1<br><code>[invisible]</code> &mdash; zero-width символ</td>
+      </tr>
+      <tr>
+        <td><span class="ft-badge ft-hs">hidden_symbols</span></td>
+        <td><strong>Скрытый текст</strong></td>
+        <td>1) Почти белый цвет текста (RGB &gt; 240,240,240)<br>2) Цвет текста &#x2248; цвет фона (расстояние &lt; 30)<br>3) Микро-шрифт (&lt; 2pt)</td>
+        <td>Текст цветом <code>rgb(250,251,252)</code> на белом фоне &mdash; не виден при чтении</td>
+      </tr>
+    </table>
+  </div>
+  <div class="doc-section">
+    <h4>&#x1f4e6; Формат ответа</h4>
+    <p>Каждая находка содержит 4 поля:</p>
+    <table>
+      <tr><th>Поле</th><th>Тип</th><th>Описание</th></tr>
+      <tr><td><code>word</code></td><td>string</td><td>Слово или текст, в котором обнаружено нарушение</td></tr>
+      <tr><td><code>offset</code></td><td>integer</td><td>Точная позиция (в байтах) от начала текстового блока</td></tr>
+      <tr><td><code>limit</code></td><td>integer</td><td>Длина нарушения: <code>change_word</code> &rarr; всегда 1; <code>spaces</code> &rarr; кол-во пробелов; <code>hidden_symbols</code> &rarr; длина скрытого текста (символы)</td></tr>
+      <tr><td><code>fraud_type</code></td><td>string</td><td>Одно из: <code>change_word</code>, <code>spaces</code>, <code>hidden_symbols</code></td></tr>
+    </table>
+    <p style="margin-top:8px">Полный ответ DetectionReport:</p>
+    <table>
+      <tr><th>Поле</th><th>Тип</th><th>Описание</th></tr>
+      <tr><td><code>filename</code></td><td>string</td><td>Имя файла</td></tr>
+      <tr><td><code>text</code></td><td>string</td><td><strong>Полный извлечённый текст документа.</strong> Абзацы разделены <code>\n</code>. Сканы/изображения пропускаются</td></tr>
+      <tr><td><code>total_findings</code></td><td>integer</td><td>Общее количество находок</td></tr>
+      <tr><td><code>findings</code></td><td>array</td><td>Массив находок (Finding)</td></tr>
+      <tr><td><code>elapsed_sec</code></td><td>number</td><td>Время обработки (секунды)</td></tr>
+      <tr><td><code>errors</code></td><td>array</td><td>Ошибки парсинга (если есть)</td></tr>
+    </table>
+    <div class="json-view" style="margin-top:8px;max-height:240px">{
+  "filename": "document.docx",
+  "text": "Первый абзац документа\nВторой абзац с нарушениями\n...",
+  "total_findings": 3,
+  "findings": [
+    {"word": "написал", "offset": 17, "limit": 1, "fraud_type": "change_word"},
+    {"word": "    ", "offset": 10, "limit": 4, "fraud_type": "spaces"},
+    {"word": "Скрытый текст", "offset": 27, "limit": 13, "fraud_type": "hidden_symbols"}
+  ],
+  "elapsed_sec": 0.00038,
+  "errors": []
+}</div>
+  </div>
+  </div><!-- /doc-general -->
+
+  <!-- Sub: Architecture -->
+  <div id="doc-arch" class="hidden">
+  <div class="doc-section">
+    <h4>&#x1f3d7;&#xfe0f; Архитектура и многопоточность</h4>
+    <p>Сервис использует <strong>cpp-httplib ThreadPool</strong> для обработки HTTP-запросов. Каждый запрос выполняется в отдельном потоке из пула. Ниже &mdash; подробный аудит всех компонентов.</p>
+  </div>
+
+  <div class="arch-card">
+    <h5>&#x2699;&#xfe0f; Модель потоков <span class="status-ok">&check; Thread-safe</span></h5>
+    <ul>
+      <li><strong>ThreadPool:</strong> <span class="val">2</span> потока (соответствует Docker <code>cpus=2</code>), макс. очередь <span class="val">32</span> запроса</li>
+      <li>Каждый HTTP-обработчик выполняется в отдельном потоке из пула</li>
+      <li>При переполнении очереди (>32) новые подключения ожидают &mdash; защита от OOM</li>
+      <li>Конфигурация: <code>svr.new_task_queue = [] { return new ThreadPool(2, 32); }</code></li>
+    </ul>
+  </div>
+
+  <div class="arch-card">
+    <h5>&#x1f50d; Детекторы <span class="status-ok">&check; Полностью потокобезопасны</span></h5>
+    <ul>
+      <li><strong>symbol_substitution.cpp</strong> &mdash; все статические массивы <code>cyr_homos[]</code>, <code>lat_homos[]</code> объявлены как <code>const</code>. ICU-функция <code>uscript_getScript()</code> thread-safe для чтения. Результат &mdash; новый вектор на стеке</li>
+      <li><strong>spacing_detector.cpp</strong> &mdash; только helper-функции с <code>const</code> switch-блоками. <code>detect_spaces()</code> возвращает новый вектор, нет разделяемого состояния</li>
+      <li><strong>hidden_text_detector.cpp</strong> &mdash; все пороги <code>static constexpr</code>. <code>detect_hidden()</code> создаёт новый вектор на стеке</li>
+    </ul>
+  </div>
+
+  <div class="arch-card">
+    <h5>&#x1f4c4; Парсеры <span class="status-ok">&check; Полностью потокобезопасны</span></h5>
+    <ul>
+      <li><strong>txt_parser.cpp</strong> &mdash; чистая функция, возвращает новый <code>ParsedDocument</code>. Используется для TXT, RTF, PDF</li>
+      <li><strong>docx_parser.cpp</strong> &mdash; ZIP + XML (pugixml). Извлекает <code>word/document.xml</code>, парсит runs с цветом/шрифтом/фоном. Для DOCX и DOC</li>
+      <li><strong>pptx_parser.cpp</strong> &mdash; ZIP + XML. Извлекает <code>ppt/slides/slide*.xml</code>, парсит текст/цвет/размер из <code>&lt;a:r&gt;</code></li>
+      <li><strong>odt_parser.cpp</strong> &mdash; ZIP + XML. Извлекает <code>content.xml</code>, парсит стили из <code>office:automatic-styles</code></li>
+      <li><strong>zip_xml_util.cpp</strong> &mdash; все zip-дескрипторы локальные, нет глобального состояния</li>
+    </ul>
+  </div>
+
+  <div class="arch-card">
+    <h5>&#x1f4be; Данные и модели <span class="status-ok">&check; Потокобезопасны</span></h5>
+    <ul>
+      <li><code>VERSION</code>, <code>PORT</code>, <code>SUPPORTED_EXTS</code> &mdash; <code>static const</code> (инициализируются до запуска потоков)</li>
+      <li><code>tests_dir</code>, <code>static_dir</code> &mdash; захвачены по ссылке в лямбдах, но <strong>только для чтения</strong> после инициализации</li>
+      <li><code>run_detection()</code> &mdash; всё на стеке, нет побочных эффектов</li>
+      <li><code>DetectionReport</code>, <code>Finding</code> &mdash; чистые структуры данных, сериализация без состояния</li>
+    </ul>
+  </div>
+
+  <div class="doc-section" style="margin-top:16px">
+    <h4>&#x1f6e1;&#xfe0f; Отказоустойчивость (Fault Tolerance)</h4>
+    <p>Все меры защиты, реализованные для продакшн-эксплуатации:</p>
+  </div>
+
+  <div class="arch-card">
+    <h5>&#x23f1;&#xfe0f; Таймауты <span class="status-fix">&#x2714; Настроено</span></h5>
+    <ul>
+      <li><code>set_read_timeout(30)</code> &mdash; медленный клиент не блокирует поток дольше 30 сек на чтении</li>
+      <li><code>set_write_timeout(30)</code> &mdash; защита от зависания при записи ответа</li>
+      <li><code>set_idle_interval(5)</code> &mdash; проверка keep-alive соединений каждые 5 сек</li>
+    </ul>
+  </div>
+
+  <div class="arch-card">
+    <h5>&#x1f6a8; Обработка исключений <span class="status-fix">&#x2714; Настроено</span></h5>
+    <ul>
+      <li><strong>Global exception handler</strong> &mdash; <code>svr.set_exception_handler()</code> ловит любое необработанное исключение, возвращает <code>{"detail": "..."}</code> с кодом <span class="val">500</span></li>
+      <li><strong>try-catch в POST-обработчиках</strong> &mdash; все <code>/detect</code>, <code>/detect/symbols</code>, <code>/detect/spaces</code>, <code>/detect/hidden</code>, <code>/tests/run/{file}</code> обёрнуты в try-catch &rarr; <span class="val">422</span> + JSON при ошибке парсинга</li>
+      <li>Битый ZIP/DOCX, corrupted XML, bad_alloc &mdash; всё корректно возвращает JSON-ошибку вместо краша</li>
+    </ul>
+  </div>
+
+  <div class="arch-card">
+    <h5>&#x1f512; Безопасность <span class="status-fix">&#x2714; Настроено</span></h5>
+    <ul>
+      <li><strong>Path traversal защита</strong> &mdash; <code>is_safe_filename()</code> блокирует: <code>..</code>, <code>/</code>, <code>\</code>, скрытые файлы (начинающиеся с <code>.</code>)</li>
+      <li>Эндпоинты <code>/tests/run/{file}</code> и <code>/tests/file/{file}</code> валидируют имя файла перед обращением к диску</li>
+      <li><strong>Payload limit:</strong> <code>set_payload_max_length(50 MB)</code> &mdash; защита от гигантских загрузок</li>
+      <li><strong>CORS:</strong> заголовки Access-Control-Allow-Origin для всех ответов</li>
+    </ul>
+  </div>
+
+  <div class="arch-card">
+    <h5>&#x1f504; Перезапуск <span class="status-fix">&#x2714; Настроено</span></h5>
+    <ul>
+      <li>Docker Compose: <code>restart: unless-stopped</code> &mdash; автоматический перезапуск при крашах</li>
+      <li>Health-check через <code>GET /health</code> &mdash; мониторинг доступности</li>
+    </ul>
+  </div>
+
+  <div class="doc-section" style="margin-top:16px">
+    <h4>&#x1f4ca; Сводная таблица аудита</h4>
+    <table>
+      <tr><th>Компонент</th><th>Файл</th><th>Разделяемое состояние</th><th>Статус</th></tr>
+      <tr><td>symbol_substitution</td><td><code>symbol_substitution.cpp</code></td><td>const массивы, ICU read-only</td><td style="color:var(--green)">&#x2705; Safe</td></tr>
+      <tr><td>spacing_detector</td><td><code>spacing_detector.cpp</code></td><td>const switch, нет state</td><td style="color:var(--green)">&#x2705; Safe</td></tr>
+      <tr><td>hidden_text_detector</td><td><code>hidden_text_detector.cpp</code></td><td>constexpr пороги</td><td style="color:var(--green)">&#x2705; Safe</td></tr>
+      <tr><td>txt_parser</td><td><code>txt_parser.cpp</code></td><td>чистая функция</td><td style="color:var(--green)">&#x2705; Safe</td></tr>
+      <tr><td>docx_parser</td><td><code>docx_parser.cpp</code></td><td>локальный pugi::xml_document</td><td style="color:var(--green)">&#x2705; Safe</td></tr>
+      <tr><td>pptx_parser</td><td><code>pptx_parser.cpp</code></td><td>локальный pugi::xml_document</td><td style="color:var(--green)">&#x2705; Safe</td></tr>
+      <tr><td>odt_parser</td><td><code>odt_parser.cpp</code></td><td>локальный pugi::xml_document</td><td style="color:var(--green)">&#x2705; Safe</td></tr>
+      <tr><td>zip_xml_util</td><td><code>zip_xml_util.cpp</code></td><td>локальные zip handles</td><td style="color:var(--green)">&#x2705; Safe</td></tr>
+      <tr><td>models</td><td><code>models.h / .cpp</code></td><td>чистые данные</td><td style="color:var(--green)">&#x2705; Safe</td></tr>
+      <tr><td>handlers (main.cpp)</td><td><code>main.cpp</code></td><td>const globals + stack locals</td><td style="color:var(--green)">&#x2705; Safe</td></tr>
+      <tr><td>ThreadPool</td><td><code>httplib.h</code></td><td>2 потока, очередь 32</td><td style="color:var(--green)">&#x2705; Bounded</td></tr>
+    </table>
+  </div>
+  </div><!-- /doc-arch -->
+
+  <!-- Sub: Detectors -->
+  <div id="doc-detectors" class="hidden">
+  <div class="doc-section">
+    <h4>&#x1f4ca; Три категории обнаружения (fraud_type)</h4>
+    <p>Находки всегда возвращаются в строгом порядке: <span class="ft-badge ft-ws">change_word</span> &rarr; <span class="ft-badge ft-sp">spaces</span> &rarr; <span class="ft-badge ft-hs">hidden_symbols</span></p>
+    <table>
+      <tr><th>fraud_type</th><th>Описание</th><th>Что ищем</th><th>Пример</th></tr>
+      <tr>
+        <td><span class="ft-badge ft-ws">change_word</span></td>
+        <td><strong>Подмена символов (гомоглифы)</strong></td>
+        <td>В слове смешаны символы из разных Unicode-скриптов (кириллица + латиница). Определяется доминирующий скрипт слова, чужие символы помечаются.</td>
+        <td><code>информaтике</code> &mdash; латинская &laquo;a&raquo; в кириллическом слове</td>
+      </tr>
+      <tr>
+        <td><span class="ft-badge ft-sp">spaces</span></td>
+        <td><strong>Аномальные пробелы</strong></td>
+        <td>1) 2+ обычных пробелов подряд<br>2) Unicode-пробелы (NBSP, EM SPACE, EN SPACE, THIN SPACE и др.)<br>3) Невидимые символы (ZWSP, ZWJ, ZWNJ, BOM и др.)</td>
+        <td><code>слово&nbsp;&nbsp;&nbsp;&nbsp;слово</code> &mdash; 4 пробела вместо 1<br><code>[invisible]</code> &mdash; zero-width символ</td>
+      </tr>
+      <tr>
+        <td><span class="ft-badge ft-hs">hidden_symbols</span></td>
+        <td><strong>Скрытый текст</strong></td>
+        <td>1) Почти белый цвет текста (RGB &gt; 240,240,240)<br>2) Цвет текста &#x2248; цвет фона (расстояние &lt; 30)<br>3) Микро-шрифт (&lt; 2pt)</td>
+        <td>Текст цветом <code>rgb(250,251,252)</code> на белом фоне &mdash; не виден при чтении</td>
+      </tr>
+    </table>
+  </div>
+  <div class="doc-section">
+    <h4>&#x1f4e6; Формат ответа</h4>
+    <p>Каждая находка содержит 4 поля:</p>
+    <table>
+      <tr><th>Поле</th><th>Тип</th><th>Описание</th></tr>
+      <tr><td><code>word</code></td><td>string</td><td>Слово или текст, в котором обнаружено нарушение</td></tr>
+      <tr><td><code>offset</code></td><td>integer</td><td>Точная позиция (в байтах) от начала текстового блока</td></tr>
+      <tr><td><code>limit</code></td><td>integer</td><td>Длина нарушения: <code>change_word</code> &rarr; всегда 1; <code>spaces</code> &rarr; кол-во пробелов; <code>hidden_symbols</code> &rarr; длина скрытого текста (символы)</td></tr>
+      <tr><td><code>fraud_type</code></td><td>string</td><td>Одно из: <code>change_word</code>, <code>spaces</code>, <code>hidden_symbols</code></td></tr>
+    </table>
+    <p style="margin-top:8px">Полный ответ DetectionReport:</p>
+    <div class="json-view" style="margin-top:8px;max-height:240px">{
+  "filename": "document.docx",
+  "text": "Полный текст документа...",
+  "total_findings": 3,
+  "findings": [
+    {"word": "написал", "offset": 17, "limit": 1, "fraud_type": "change_word"},
+    {"word": "    ", "offset": 10, "limit": 4, "fraud_type": "spaces"},
+    {"word": "Скрытый текст", "offset": 27, "limit": 13, "fraud_type": "hidden_symbols"}
+  ],
+  "elapsed_sec": 0.00038,
+  "errors": []
+}</div>
+  </div>
+  </div><!-- /doc-detectors -->
+
+  <!-- Sub: Formats -->
+  <div id="doc-formats" class="hidden">
+  <div class="doc-section">
+    <h4>&#x1f4cb; Поддерживаемые форматы</h4>
+    <p><strong>Максимальный размер файла: 50 МБ</strong></p>
+    <table>
+      <tr><th>Формат</th><th>Парсер</th><th>Обработка</th><th>change_word</th><th>spaces</th><th>hidden_symbols</th></tr>
+      <tr>
+        <td><code>.docx</code></td>
+        <td>ZIP + XML (pugixml)</td>
+        <td>Извлечение <code>word/document.xml</code>: текстовые runs с цветом, шрифтом, фоном</td>
+        <td style="color:var(--green)">&#x2714;</td><td style="color:var(--green)">&#x2714;</td><td style="color:var(--green)">&#x2714;</td>
+      </tr>
+      <tr>
+        <td><code>.doc</code></td>
+        <td>ZIP + XML</td>
+        <td>Обработка как DOCX (поддержка зависит от формата файла)</td>
+        <td style="color:var(--green)">&#x2714;</td><td style="color:var(--green)">&#x2714;</td><td style="color:var(--orange)">&#x26a0;</td>
+      </tr>
+      <tr>
+        <td><code>.pptx</code></td>
+        <td>ZIP + XML (pugixml)</td>
+        <td>Извлечение <code>ppt/slides/slide*.xml</code>: текст, цвет, размер шрифта из <code>&lt;a:r&gt;</code></td>
+        <td style="color:var(--green)">&#x2714;</td><td style="color:var(--green)">&#x2714;</td><td style="color:var(--green)">&#x2714;</td>
+      </tr>
+      <tr>
+        <td><code>.odt</code></td>
+        <td>ZIP + XML (pugixml)</td>
+        <td>Извлечение <code>content.xml</code>: текст + стили из <code>office:automatic-styles</code> (цвет, размер, фон)</td>
+        <td style="color:var(--green)">&#x2714;</td><td style="color:var(--green)">&#x2714;</td><td style="color:var(--green)">&#x2714;</td>
+      </tr>
+      <tr>
+        <td><code>.rtf</code></td>
+        <td>Текстовый (UTF-8)</td>
+        <td>Разбивка по строкам, без информации о стилях</td>
+        <td style="color:var(--green)">&#x2714;</td><td style="color:var(--green)">&#x2714;</td><td style="color:var(--muted)">&mdash;</td>
+      </tr>
+      <tr>
+        <td><code>.txt</code></td>
+        <td>Текстовый (UTF-8)</td>
+        <td>Разбивка по строкам</td>
+        <td style="color:var(--green)">&#x2714;</td><td style="color:var(--green)">&#x2714;</td><td style="color:var(--muted)">&mdash;</td>
+      </tr>
+      <tr>
+        <td><code>.pdf</code></td>
+        <td>poppler-cpp</td>
+        <td>Извлечение текстового слоя (poppler). Без OCR &mdash; сканы пропускаются. Без информации о стилях</td>
+        <td style="color:var(--green)">&#x2714;</td><td style="color:var(--green)">&#x2714;</td><td style="color:var(--muted)">&mdash;</td>
+      </tr>
+    </table>
+    <p style="margin-top:8px;font-size:.78rem;color:var(--muted)">&#x2714; &mdash; полная поддержка &middot; &#x26a0; &mdash; частичная &middot; &mdash; &mdash; нет данных о стилях (формат не содержит информации о цвете/шрифте)</p>
+  </div>
+  </div><!-- /doc-formats -->
+
+  <!-- Sub: Performance -->
+  <div id="doc-perf" class="hidden">
+  <div class="doc-section">
+    <h4>&#x26a1; Производительность</h4>
+    <ul>
+      <li>TXT 62 КБ (500 абзацев): <strong>~5 мс</strong> server-side</li>
+      <li>DOCX файлы: <strong>~0.2 мс</strong> server-side</li>
+      <li>Engine: C++17 с <code>-O3 -march=native</code>, ICU для Unicode-классификации</li>
+      <li>Все детекторы работают in-memory, без обращения к диску после загрузки файла</li>
+    </ul>
+  </div>
+  </div><!-- /doc-perf -->
+
+  <!-- Sub: Limits -->
+  <div id="doc-limits" class="hidden">
+  <div class="doc-section">
+    <h4>&#x1f527; Ограничения</h4>
+    <table>
+      <tr><th>Параметр</th><th>Значение</th><th>Описание</th></tr>
+      <tr><td><strong>Макс. размер файла</strong></td><td><code>50 МБ</code></td><td>HTTP payload limit. Файлы больше 50 МБ отклоняются сервером</td></tr>
+      <tr><td><strong>Потоки обработки</strong></td><td><code>2</code></td><td>ThreadPool = 2 потока (Docker cpus=2), очередь до 32 запросов</td></tr>
+      <tr><td><strong>Таймаут чтения/записи</strong></td><td><code>30 сек</code></td><td>Медленный клиент не блокирует поток дольше 30 секунд</td></tr>
+    </table>
+    <h4 style="margin-top:16px">Ограничения по детекторам</h4>
+    <ul>
+      <li><span class="ft-badge ft-ws">change_word</span> работает только для <strong>кириллица &#x2194; латиница</strong>. Языки: русский, английский, казахский, турецкий</li>
+      <li>Определяется <strong>доминирующий скрипт</strong> слова (по количеству букв). Однобуквенные слова пропускаются</li>
+      <li><span class="ft-badge ft-sp">spaces</span>: одиночный обычный пробел не является находкой &mdash; только 2+ подряд или специальные Unicode-пробелы</li>
+      <li><span class="ft-badge ft-hs">hidden_symbols</span> определяется только в форматах со стилями (<code>.docx</code>, <code>.pptx</code>, <code>.odt</code>). Для <code>.txt</code>, <code>.rtf</code>, <code>.pdf</code> нет информации о цвете/шрифте</li>
+    </ul>
+    <h4 style="margin-top:16px">Ограничения по форматам</h4>
+    <ul>
+      <li><code>.pdf</code> &mdash; извлекается <strong>текстовый слой</strong> через poppler-cpp. Без OCR &mdash; сканированные страницы пропускаются. Нет данных о стилях (hidden_symbols не работает). Для полного анализа рекомендуется <code>.docx</code></li>
+      <li><code>.doc</code> &mdash; старый бинарный формат Word. Обработка как DOCX (ограниченная совместимость)</li>
+      <li><code>.docx</code> &mdash; парсится <code>word/document.xml</code>. Текст в колонтитулах (headers/footers) и текстовых блоках (text boxes) не анализируется</li>
+      <li><code>.pptx</code> &mdash; парсятся все слайды <code>ppt/slides/slide*.xml</code>. Заметки докладчика и мастер-слайды не анализируются</li>
+      <li><code>.odt</code> &mdash; парсится <code>content.xml</code>. Стили из <code>office:automatic-styles</code> (цвет, размер, фон)</li>
+      <li><strong>Offset</strong> считается в <strong>байтах</strong> от начала текстового run (UTF-8: кириллица = 2 байта/символ)</li>
+    </ul>
+  </div>
+  </div><!-- /doc-limits -->
+
+  <div class="doc-section">
+    <h4>&#x1f517; Внешние ссылки</h4>
+    <ul>
+      <li><a href="/docs" style="color:var(--accent)">Swagger UI</a> &mdash; интерактивная документация API</li>
+      <li><a href="/redoc" style="color:var(--accent)">ReDoc</a> &mdash; альтернативная документация</li>
+      <li><a href="/openapi.json" style="color:var(--accent)">openapi.json</a> &mdash; OpenAPI 3.1 спецификация</li>
+    </ul>
+  </div>
+</div>
+
+<!-- TAB: API -->
+<div id="v-api" class="hidden">
+  <div class="api-block">
+    <h4>&#x1f4e1; Полный ответ API (JSON)</h4>
+    <p style="font-size:.78rem;color:var(--muted);margin-bottom:8px">Отправьте файл на любой вкладке &mdash; здесь отобразится полный JSON-ответ.</p>
+    <div class="json-view" id="apiJson" style="min-height:100px">Отправьте файл для получения ответа</div>
+  </div>
+  <div class="api-block">
+    <h4>&#x1f4bb; curl-пример</h4>
+    <div class="curl-box">
+      <button class="copy-btn" onclick="copyEl('curlCmd')">&#x1f4cb;</button>
+      <code id="curlCmd">curl -X POST http://<span id="curlHost"></span>/detect \
+  -F "file=@document.docx"</code>
+    </div>
+  </div>
+  <div class="api-block">
+    <h4>&#x1f4cb; Эндпоинты</h4>
+    <table style="width:100%;border-collapse:collapse;font-size:.82rem">
+      <tr style="border-bottom:1px solid var(--border)">
+        <td style="padding:8px"><span class="method get">GET</span></td>
+        <td class="ep">/health</td><td style="color:var(--muted)">Статус сервиса, версия</td></tr>
+      <tr style="border-bottom:1px solid var(--border)">
+        <td style="padding:8px"><span class="method get">GET</span></td>
+        <td class="ep">/formats</td><td style="color:var(--muted)">Список поддерживаемых форматов</td></tr>
+      <tr style="border-bottom:1px solid var(--border)">
+        <td style="padding:8px"><span class="method post">POST</span></td>
+        <td class="ep">/detect</td><td style="color:var(--muted)">Полная проверка. Query: check_symbols, check_spaces, check_hidden</td></tr>
+      <tr style="border-bottom:1px solid var(--border)">
+        <td style="padding:8px"><span class="method post">POST</span></td>
+        <td class="ep">/detect/symbols</td><td style="color:var(--muted)">Только change_word</td></tr>
+      <tr style="border-bottom:1px solid var(--border)">
+        <td style="padding:8px"><span class="method post">POST</span></td>
+        <td class="ep">/detect/spaces</td><td style="color:var(--muted)">Только spaces</td></tr>
+      <tr style="border-bottom:1px solid var(--border)">
+        <td style="padding:8px"><span class="method post">POST</span></td>
+        <td class="ep">/detect/hidden</td><td style="color:var(--muted)">Только hidden_symbols</td></tr>
+      <tr style="border-bottom:1px solid var(--border)">
+        <td style="padding:8px"><span class="method get">GET</span></td>
+        <td class="ep">/tests/list</td><td style="color:var(--muted)">Список тестовых файлов</td></tr>
+      <tr style="border-bottom:1px solid var(--border)">
+        <td style="padding:8px"><span class="method post">POST</span></td>
+        <td class="ep">/tests/run/{file}</td><td style="color:var(--muted)">Запуск теста на файле</td></tr>
+      <tr style="border-bottom:1px solid var(--border)">
+        <td style="padding:8px"><span class="method get">GET</span></td>
+        <td class="ep">/tests/file/{file}</td><td style="color:var(--muted)">Скачать тестовый файл</td></tr>
+      <tr style="border-bottom:1px solid var(--border)">
+        <td style="padding:8px"><span class="method get">GET</span></td>
+        <td class="ep">/docs</td><td style="color:var(--muted)">Swagger UI</td></tr>
+      <tr>
+        <td style="padding:8px"><span class="method get">GET</span></td>
+        <td class="ep">/openapi.json</td><td style="color:var(--muted)">OpenAPI 3.1 спецификация</td></tr>
+    </table>
+  </div>
+  <div class="api-block">
+    <h4>&#x1f4e6; Формат Finding</h4>
+    <div class="json-view" style="max-height:180px">// DetectionReport содержит text + findings:
+{
+  "filename": "file.docx",
+  "text": "Весь текст документа...",   // полный текст, \n между абзацами
+  "total_findings": 1,
+  "findings": [{
+    "word": "написал",    // слово с нарушением
+    "offset": 17,          // позиция (байты) от начала run
+    "limit": 1,            // длина: spaces→кол-во, change_word→1, hidden→длина
+    "fraud_type": "change_word"  // change_word | spaces | hidden_symbols
+  }],
+  "elapsed_sec": 0.00038,
+  "errors": []
+}</div>
+  </div>
+</div>
+
+</div>
+
+<script>
+const B=window.location.origin;
+let DATA=null,FILTER='all',ORIG_TEXT='';
+document.getElementById('curlHost').textContent=location.host;
+
+(async()=>{
+  try{
+    const r=await fetch(B+'/health');
+    const d=await r.json();
+    document.getElementById('dot').className='dot on';
+    document.getElementById('stxt').textContent='v'+d.version+' \u00b7 C++';
+  }catch{
+    document.getElementById('dot').className='dot off';
+    document.getElementById('stxt').textContent='offline';
+  }
+})();
+
+document.querySelectorAll('.tab').forEach(t=>{
+  t.onclick=()=>{
+    document.querySelectorAll('.tab').forEach(x=>x.classList.remove('act'));
+    t.classList.add('act');
+    ['check','tests','docs','api'].forEach(v=>{
+      document.getElementById('v-'+v).classList.toggle('hidden',v!==t.dataset.v);
+    });
+  };
+});
+
+// Doc sub-navigation
+document.querySelectorAll('.doc-nav-btn').forEach(b=>{
+  b.onclick=()=>{
+    document.querySelectorAll('.doc-nav-btn').forEach(x=>x.classList.remove('act'));
+    b.classList.add('act');
+    ['general','arch','detectors','formats','perf','limits'].forEach(s=>{
+      const el=document.getElementById('doc-'+s);
+      if(el) el.classList.toggle('hidden',s!==b.dataset.doc);
+    });
+  };
+});
+
+function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML}
+function countByType(findings,type){return findings.filter(f=>f.fraud_type===type).length}
+function syntaxHL(json){
+  return json
+    .replace(/(".*?")\s*:/g,'<span class="k">$1</span>:')
+    .replace(/:\s*(".*?")/g,': <span class="s">$1</span>')
+    .replace(/:\s*(\d+\.?\d*)/g,': <span class="n">$1</span>')
+    .replace(/:\s*(null)/g,': <span class="null">$1</span>')
+    .replace(/:\s*(true|false)/g,': <span class="n">$1</span>');
+}
+function copyEl(id){navigator.clipboard.writeText(document.getElementById(id).textContent)}
+
+const TYPE_SHORT={change_word:'Подмена',spaces:'Пробелы',hidden_symbols:'Скрытый'};
+
+function isTextFile(name){
+  return /\.(txt|rtf|csv|md|log|json|xml|html|htm|css|js|py|cpp|h|c|java)$/i.test(name);
+}
+
+function buildFindingsHtml(findings,filter){
+  const ff=findings.filter(f=>filter==='all'||f.fraud_type===filter);
+  if(!ff.length)return '<p style="color:var(--green);text-align:center;padding:16px">\u2705 Нет аномалий</p>';
+  return ff.map((f,i)=>
+    '<div class="fitem" data-idx="'+i+'">'+
+    '<span class="ftype '+f.fraud_type+'">'+(TYPE_SHORT[f.fraud_type]||f.fraud_type)+'</span>'+
+    '<span class="foff">offset: '+f.offset+' &middot; limit: '+f.limit+'</span>'+
+    '<div class="fword">'+esc(f.word)+'</div>'+
+    '</div>'
+  ).join('');
+}
+
+function buildGroupedDetail(data){
+  const f=data.findings||[];
+  if(!f.length)return '<p style="color:var(--green);text-align:center;padding:20px">\u2705 Документ чистый \u2014 аномалий не обнаружено</p>';
+  const groups=[
+    {type:'change_word',label:'\ud83d\udd24 change_word \u2014 Подмена символов',cls:'ft-ws',items:f.filter(x=>x.fraud_type==='change_word')},
+    {type:'spaces',label:'\u2b1c spaces \u2014 Аномальные пробелы',cls:'ft-sp',items:f.filter(x=>x.fraud_type==='spaces')},
+    {type:'hidden_symbols',label:'\ud83d\udc7b hidden_symbols \u2014 Скрытый текст',cls:'ft-hs',items:f.filter(x=>x.fraud_type==='hidden_symbols')}
+  ];
+  let html='';
+  groups.forEach(g=>{
+    if(!g.items.length)return;
+    html+='<div style="margin-bottom:16px">';
+    html+='<h4 style="font-size:.84rem;margin-bottom:8px"><span class="ft-badge '+g.cls+'">'+g.type+'</span> '+g.label+' ('+g.items.length+')</h4>';
+    html+='<table style="width:100%;border-collapse:collapse;font-size:.82rem">';
+    html+='<tr style="border-bottom:1px solid var(--border)"><th style="padding:6px;text-align:left;color:var(--muted);font-size:.72rem">word</th><th style="padding:6px;text-align:left;color:var(--muted);font-size:.72rem">offset</th><th style="padding:6px;text-align:left;color:var(--muted);font-size:.72rem">limit</th></tr>';
+    g.items.forEach(item=>{
+      html+='<tr style="border-bottom:1px solid var(--border)">';
+      html+='<td style="padding:6px;font-family:monospace;color:var(--orange);word-break:break-all">'+esc(item.word)+'</td>';
+      html+='<td style="padding:6px;color:var(--muted)">'+item.offset+'</td>';
+      html+='<td style="padding:6px;color:var(--accent)">'+item.limit+'</td>';
+      html+='</tr>';
+    });
+    html+='</table></div>';
+  });
+  return html;
+}
+
+function fillSummary(prefix,data){
+  const f=data.findings||[];
+  document.getElementById('vTot'+prefix).textContent=data.total_findings;
+  document.getElementById('vSym'+prefix).textContent=countByType(f,'change_word');
+  document.getElementById('vSpc'+prefix).textContent=countByType(f,'spaces');
+  document.getElementById('vHid'+prefix).textContent=countByType(f,'hidden_symbols');
+  document.getElementById('vTm'+prefix).textContent=data.elapsed_sec!=null?data.elapsed_sec.toFixed(5):'-';
+}
+
+function renderApiJson(d){
+  document.getElementById('apiJson').innerHTML=syntaxHL(JSON.stringify(d,null,2));
+  document.getElementById('curlCmd').innerHTML='curl -X POST '+location.origin+'/detect \\\n  -F "file=@'+esc(d.filename)+'"';
+}
+
+// ======== File check ========
+const drop=document.getElementById('drop'),fi=document.getElementById('fi'),btnGo=document.getElementById('btnGo');
+let FILE=null;
+drop.onclick=()=>fi.click();
+drop.ondragover=e=>{e.preventDefault();drop.classList.add('drag')};
+drop.ondragleave=()=>drop.classList.remove('drag');
+drop.ondrop=e=>{e.preventDefault();drop.classList.remove('drag');if(e.dataTransfer.files.length)pickFile(e.dataTransfer.files[0])};
+fi.onchange=()=>{if(fi.files.length)pickFile(fi.files[0])};
+
+function pickFile(f){
+  FILE=f;
+  drop.textContent='\ud83d\udcce '+f.name+' ('+(f.size/1024).toFixed(1)+' KB)';
+  drop.classList.add('has-file');
+  btnGo.disabled=false;
+  // Read text content for editable files
+  if(isTextFile(f.name)){
+    const reader=new FileReader();
+    reader.onload=function(e){
+      ORIG_TEXT=e.target.result;
+      document.getElementById('fileText').value=ORIG_TEXT;
+      document.getElementById('editorPanel').classList.remove('hidden');
+      document.getElementById('editBadge').textContent=f.name+' \u2014 можно редактировать';
+      document.getElementById('editInfo').textContent='Отредактируйте текст и нажмите \u00abПерепроверить\u00bb';
+    };
+    reader.readAsText(f,'UTF-8');
+  } else {
+    document.getElementById('editorPanel').classList.add('hidden');
+    ORIG_TEXT='';
+  }
+}
+
+btnGo.onclick=async()=>{
+  if(!FILE)return;
+  btnGo.disabled=true;btnGo.innerHTML='<span class="spinner"></span>...';
+  const p=new URLSearchParams({
+    check_symbols:document.getElementById('cSym').checked,
+    check_spaces:document.getElementById('cSpc').checked,
+    check_hidden:document.getElementById('cHid').checked
+  });
+  const fd=new FormData();fd.append('file',FILE);
+  try{
+    const r=await fetch(B+'/detect?'+p,{method:'POST',body:fd});
+    const d=await r.json();
+    if(!r.ok){alert(d.detail||'\u041e\u0448\u0438\u0431\u043a\u0430');return}
+    DATA=d;renderFileResults(d);renderApiJson(d);
+  }catch(e){alert(e.message)}
+  finally{btnGo.disabled=false;btnGo.innerHTML='\ud83d\udd0d \u041f\u0440\u043e\u0432\u0435\u0440\u0438\u0442\u044c'}
+};
+
+// Re-check edited text
+document.getElementById('btnRecheck').onclick=async()=>{
+  const text=document.getElementById('fileText').value;
+  if(!text.trim()){alert('\u0422\u0435\u043a\u0441\u0442 \u043f\u0443\u0441\u0442');return}
+  const btn=document.getElementById('btnRecheck');
+  btn.disabled=true;btn.innerHTML='<span class="spinner"></span>...';
+  const fname=FILE?FILE.name:'edited.txt';
+  const blob=new Blob([text],{type:'text/plain'});
+  const file=new File([blob],fname.replace(/\.[^.]+$/,'.txt'));
+  const p=new URLSearchParams({
+    check_symbols:document.getElementById('cSym').checked,
+    check_spaces:document.getElementById('cSpc').checked,
+    check_hidden:document.getElementById('cHid').checked
+  });
+  const fd=new FormData();fd.append('file',file);
+  try{
+    const r=await fetch(B+'/detect?'+p,{method:'POST',body:fd});
+    const d=await r.json();
+    if(!r.ok){alert(d.detail||'\u041e\u0448\u0438\u0431\u043a\u0430');return}
+    DATA=d;renderFileResults(d);renderApiJson(d);
+    document.getElementById('editInfo').textContent='\u2713 \u041f\u0435\u0440\u0435\u043f\u0440\u043e\u0432\u0435\u0440\u0435\u043d\u043e: '+d.total_findings+' \u043d\u0430\u0445\u043e\u0434\u043e\u043a \u0437\u0430 '+(d.elapsed_sec?.toFixed(5)||'?')+' \u0441';
+  }catch(e){alert(e.message)}
+  finally{btn.disabled=false;btn.innerHTML='\ud83d\udd0d \u041f\u0435\u0440\u0435\u043f\u0440\u043e\u0432\u0435\u0440\u0438\u0442\u044c \u0438\u0437\u043c\u0435\u043d\u0451\u043d\u043d\u044b\u0439 \u0442\u0435\u043a\u0441\u0442'}
+};
+
+// Reset text to original
+document.getElementById('btnResetText').onclick=()=>{
+  document.getElementById('fileText').value=ORIG_TEXT;
+  document.getElementById('editInfo').textContent='\u0422\u0435\u043a\u0441\u0442 \u0441\u0431\u0440\u043e\u0448\u0435\u043d \u043a \u043e\u0440\u0438\u0433\u0438\u043d\u0430\u043b\u0443';
+};
+
+function renderFileResults(d){
+  document.getElementById('emptyState').classList.add('hidden');
+  document.getElementById('summ').classList.remove('hidden');
+  document.getElementById('mainArea').classList.remove('hidden');
+  fillSummary('',d);
+  document.getElementById('docName').textContent=d.filename;
+  document.getElementById('fcount').textContent='('+d.total_findings+')';
+  document.getElementById('findingsDetail').innerHTML=buildGroupedDetail(d);
+  document.getElementById('flist').innerHTML=buildFindingsHtml(d.findings||[],FILTER);
+}
+
+document.querySelectorAll('.ftab').forEach(t=>{
+  t.onclick=()=>{
+    document.querySelectorAll('.ftab').forEach(x=>x.classList.remove('act'));
+    t.classList.add('act');
+    FILTER=t.dataset.f;
+    if(DATA)document.getElementById('flist').innerHTML=buildFindingsHtml(DATA.findings||[],FILTER);
+  };
+});
+
+// ======== Tests ========
+(async()=>{
+  try{
+    const r=await fetch(B+'/tests/list');
+    const d=await r.json();
+    const s=document.getElementById('tsel');
+    d.files.forEach(f=>{const o=document.createElement('option');o.value=f;o.textContent=f;s.appendChild(o)});
+  }catch{}
+})();
+
+document.getElementById('btnTest').onclick=async()=>{
+  const f=document.getElementById('tsel').value;
+  if(!f)return;
+  document.getElementById('tinfo').innerHTML='<span class="spinner"></span>'+f;
+  try{
+    const r=await fetch(B+'/tests/run/'+f,{method:'POST'});
+    const d=await r.json();
+    if(!r.ok){alert(d.detail);return}
+    DATA=d;showSingleTestResult(d);renderApiJson(d);
+    document.getElementById('tinfo').textContent='\u2713 '+f;
+  }catch(e){document.getElementById('tinfo').textContent='\u2717 '+e.message}
+};
+
+let TEST_VIEW_FILE=false; // false = results, true = file content
+let CURRENT_TEST_FILE=''; // current test filename for content loading
+let CURRENT_TEST_DATA=null; // current test detection data
+
+function showSingleTestResult(d){
+  document.getElementById('testResultsArea').classList.add('hidden');
+  document.getElementById('summTest').classList.remove('hidden');
+  document.getElementById('testDetail').classList.remove('hidden');
+  fillSummary('S',d);
+  document.getElementById('testDocName').textContent=d.filename;
+  document.getElementById('testFcount').textContent='('+d.total_findings+')';
+  document.getElementById('testFindingsDetail').innerHTML=buildGroupedDetail(d);
+  document.getElementById('testFlist').innerHTML=buildFindingsHtml(d.findings||[],'all');
+  CURRENT_TEST_FILE=d.filename;
+  CURRENT_TEST_DATA=d;
+  // Reset toggle to results view
+  TEST_VIEW_FILE=false;
+  document.getElementById('viewToggle').classList.remove('on');
+  document.getElementById('testFindingsDetail').classList.remove('hidden');
+  document.getElementById('testFilePreview').classList.add('hidden');
+  document.getElementById('testFilePreview').innerHTML='';
+  updateToggleLabels();
+}
+
+function updateToggleLabels(){
+  const ll=document.getElementById('toggleLabelLeft');
+  const lr=document.getElementById('toggleLabelRight');
+  if(TEST_VIEW_FILE){
+    ll.style.color='var(--muted)'; ll.style.fontWeight='normal';
+    lr.style.color='var(--accent)'; lr.style.fontWeight='600';
+  } else {
+    ll.style.color='var(--accent)'; ll.style.fontWeight='600';
+    lr.style.color='var(--muted)'; lr.style.fontWeight='normal';
+  }
+}
+
+async function loadFilePreview(filename){
+  const preview=document.getElementById('testFilePreview');
+  preview.innerHTML='<div style="text-align:center;padding:20px;color:var(--muted)"><span class="spinner"></span> Загрузка...</div>';
+  try {
+    const r=await fetch(B+'/tests/file/'+encodeURIComponent(filename));
+    if(!r.ok){preview.innerHTML='<p style="color:var(--red);padding:12px">\u2717 Не удалось загрузить файл ('+r.status+')</p>';return;}
+    const ct=r.headers.get('content-type')||'';
+    // Binary files (docx etc.)
+    if(filename.endsWith('.docx')||filename.endsWith('.doc')||filename.endsWith('.pdf')||filename.endsWith('.odt')||filename.endsWith('.pptx')||filename.endsWith('.zip')){
+      const blob=await r.blob();
+      const sz=(blob.size/1024).toFixed(1);
+      preview.innerHTML='<div class="file-preview" style="text-align:center;padding:30px">'+
+        '<div style="font-size:2rem;margin-bottom:8px">\ud83d\udce6</div>'+
+        '<p style="margin-bottom:8px">Бинарный файл: <strong>'+esc(filename)+'</strong> ('+sz+' КБ)</p>'+
+        '<p style="color:var(--muted);font-size:.76rem">Просмотр содержимого недоступен для данного формата.'+
+        '<br>Используйте кнопку ниже для скачивания.</p>'+
+        '<a href="'+B+'/tests/file/'+encodeURIComponent(filename)+'" class="btn btn-o btn-sm" style="display:inline-block;margin-top:10px;text-decoration:none">\u2b07 Скачать файл</a>'+
+        '</div>';
+      return;
+    }
+    // Text files
+    const text=await r.text();
+    const lines=text.split('\n');
+    let html='<div class="file-preview">';
+    lines.forEach((line,i)=>{
+      html+='<span class="line-num">'+(i+1)+'</span>'+esc(line)+'\n';
+    });
+    html+='</div>';
+    preview.innerHTML=html;
+  } catch(e){
+    preview.innerHTML='<p style="color:var(--red);padding:12px">\u2717 Ошибка: '+esc(e.message)+'</p>';
+  }
+}
+
+// Toggle click handler
+document.getElementById('viewToggle').onclick=async function(){
+  TEST_VIEW_FILE=!TEST_VIEW_FILE;
+  this.classList.toggle('on',TEST_VIEW_FILE);
+  updateToggleLabels();
+  const findings=document.getElementById('testFindingsDetail');
+  const preview=document.getElementById('testFilePreview');
+  if(TEST_VIEW_FILE){
+    findings.classList.add('hidden');
+    preview.classList.remove('hidden');
+    if(!preview.innerHTML||preview.innerHTML.includes('Загрузка')){
+      await loadFilePreview(CURRENT_TEST_FILE);
+    }
+  } else {
+    findings.classList.remove('hidden');
+    preview.classList.add('hidden');
+  }
+};
+
+document.getElementById('btnAll').onclick=async()=>{
+  const files=[...document.getElementById('tsel').options].filter(o=>o.value).map(o=>o.value);
+  if(!files.length)return;
+  document.getElementById('testResultsArea').classList.remove('hidden');
+  document.getElementById('summTest').classList.add('hidden');
+  document.getElementById('testDetail').classList.add('hidden');
+  const tbody=document.getElementById('testBody');
+  tbody.innerHTML='';
+  let totalAll=0,totalWs=0,totalSp=0,totalHs=0;
+  for(let i=0;i<files.length;i++){
+    document.getElementById('tinfo').innerHTML='<span class="spinner"></span>'+(i+1)+'/'+files.length;
+    try{
+      const r=await fetch(B+'/tests/run/'+files[i],{method:'POST'});
+      const d=await r.json();
+      const ws=countByType(d.findings||[],'change_word');
+      const sp=countByType(d.findings||[],'spaces');
+      const hs=countByType(d.findings||[],'hidden_symbols');
+      totalAll+=d.total_findings;totalWs+=ws;totalSp+=sp;totalHs+=hs;
+      const status=d.total_findings>0?'<span class="fail">\u26a0 '+d.total_findings+' \u043d\u0430\u0445\u043e\u0434\u043e\u043a</span>':'<span class="pass">\u2705 \u0447\u0438\u0441\u0442\u043e</span>';
+      tbody.innerHTML+='<tr><td style="padding:8px;font-weight:600">'+esc(files[i])+'</td><td style="padding:8px">'+d.total_findings+'</td><td style="padding:8px;color:var(--red)">'+ws+'</td><td style="padding:8px;color:var(--orange)">'+sp+'</td><td style="padding:8px;color:var(--accent2)">'+hs+'</td><td style="padding:8px;color:var(--muted)">'+(d.elapsed_sec?.toFixed(5)||'-')+'</td><td style="padding:8px">'+status+'</td></tr>';
+      DATA=d;renderApiJson(d);
+    }catch(e){
+      tbody.innerHTML+='<tr><td style="padding:8px;font-weight:600">'+esc(files[i])+'</td><td colspan="6" style="padding:8px;color:var(--red)">\u2717 '+esc(e.message)+'</td></tr>';
+    }
+  }
+  tbody.innerHTML+='<tr style="font-weight:700;border-top:2px solid var(--accent)"><td style="padding:8px">\u0418\u0422\u041e\u0413\u041e</td><td style="padding:8px;color:var(--accent)">'+totalAll+'</td><td style="padding:8px;color:var(--red)">'+totalWs+'</td><td style="padding:8px;color:var(--orange)">'+totalSp+'</td><td style="padding:8px;color:var(--accent2)">'+totalHs+'</td><td colspan="2"></td></tr>';
+  document.getElementById('tinfo').textContent='\u2713 '+files.length+' \u0444\u0430\u0439\u043b\u043e\u0432';
+};
+</script>
+</body>
+</html>

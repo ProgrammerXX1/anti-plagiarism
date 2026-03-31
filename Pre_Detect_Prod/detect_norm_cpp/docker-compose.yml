@@ -1,0 +1,12 @@
+services:
+  detect_norm_cpp:
+    build: .
+    container_name: detect_norm_cpp
+    ports:
+      - "8001:8001"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2g

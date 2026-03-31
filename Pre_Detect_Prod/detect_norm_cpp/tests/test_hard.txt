@@ -1,0 +1,42 @@
+=== Symbol substitution ===
+Кaтaстрофa в рeзультaте
+cоблюдение pравил pроверки
+Улyчшить xoд исследования
+Aлгоритм Oбработки Cтруктур Eстественный
+Қазақстанның бiлiм беру жүйесі
+дa нет
+English framework is fine
+Чистый русский текст без подмен
+
+=== Spacing anomalies ===
+NBSP: между слов
+EN_QUAD: между слов
+EM_QUAD: между слов
+EN_SPACE: между слов
+EM_SPACE: между слов
+THREE_PER_EM: между слов
+FOUR_PER_EM: между слов
+SIX_PER_EM: между слов
+FIGURE_SPACE: между слов
+PUNCTUATION: между слов
+THIN_SPACE: между слов
+HAIR_SPACE: между слов
+NARROW_NBSP: между слов
+MEDIUM_MATH: между слов
+IDEOGRAPHIC:　между　слов
+ZWSP:вну​три​слова
+ZWNJ:вну‌три‌слова
+ZWJ:вну‍три‍слова
+LRM:вну‎три‎слова
+RLM:вну‏три‏слова
+WORD_JOINER:вну⁠три⁠слова
+BOM:вну﻿три﻿слова
+CGJ:вну͏три͏слова
+Два  пробела
+Пять     пробелов
+Двадцать                    пробелов
+Комбо: NBSP​и   три EM​​двойной-zwsp
+Обычный текст без аномалий.
+
+=== Symbols + Spaces together ===
+Студeнт нaписaл​​работу   с ошибками
