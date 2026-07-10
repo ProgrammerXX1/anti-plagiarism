@@ -67,6 +67,7 @@ std::vector<Finding> detect_hidden(const std::vector<TextRun>& runs) {
         if (!run.color_rgb.empty() && is_near_white(run.color_rgb)) {
             Finding f;
             f.fraud_type = FraudType::hidden_symbols;
+            f.paragraph = run.paragraph;
             f.offset = run.offset;
             f.word = safe_substr_utf8(run.text, 80);
             f.limit = text_len;
@@ -80,6 +81,7 @@ std::vector<Finding> detect_hidden(const std::vector<TextRun>& runs) {
             if (dist < COLOR_DISTANCE_THRESH) {
                 Finding f;
                 f.fraud_type = FraudType::hidden_symbols;
+                f.paragraph = run.paragraph;
                 f.offset = run.offset;
                 f.word = safe_substr_utf8(run.text, 80);
                 f.limit = text_len;
@@ -92,6 +94,7 @@ std::vector<Finding> detect_hidden(const std::vector<TextRun>& runs) {
         if (run.font_size > 0 && run.font_size < MIN_FONT_SIZE_PT) {
             Finding f;
             f.fraud_type = FraudType::hidden_symbols;
+            f.paragraph = run.paragraph;
             f.offset = run.offset;
             f.word = safe_substr_utf8(run.text, 80);
             f.limit = text_len;

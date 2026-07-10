@@ -12,10 +12,14 @@
 
 namespace dn {
 
-// Suspicious Unicode spaces
+// NBSP-like: common in Word, only suspicious when 2+ consecutive
+static bool is_nbsp_like(UChar32 cp) {
+    return cp == 0x00A0 || cp == 0x202F;  // NBSP, NARROW NBSP
+}
+
+// Exotic Unicode spaces: always suspicious (single occurrence = fraud)
 static bool is_suspicious_space(UChar32 cp) {
     switch (cp) {
-        case 0x00A0: // NBSP
         case 0x2000: // EN QUAD
         case 0x2001: // EM QUAD
         case 0x2002: // EN SPACE
@@ -27,7 +31,6 @@ static bool is_suspicious_space(UChar32 cp) {
         case 0x2008: // PUNCTUATION SPACE
         case 0x2009: // THIN SPACE
         case 0x200A: // HAIR SPACE
-        case 0x202F: // NARROW NBSP
         case 0x205F: // MEDIUM MATHEMATICAL SPACE
         case 0x3000: // IDEOGRAPHIC SPACE
             return true;
@@ -100,13 +103,14 @@ std::vector<Finding> detect_spaces(const std::vector<TextRun>& runs) {
             int byte_off = static_cast<int>(prev);
             int byte_len = static_cast<int>(i - prev);
 
-            // 1) Suspicious Unicode spaces
+            // 1) Exotic Unicode spaces (always suspicious, even single)
             if (is_suspicious_space(cp)) {
                 Finding f;
                 f.fraud_type = FraudType::spaces;
+                f.paragraph = run.paragraph;
                 f.offset = run.offset + byte_off;
                 f.word = run.text.substr(byte_off, byte_len);
-                f.limit = 1;  // single Unicode space
+                f.limit = 1;
                 findings.push_back(std::move(f));
                 continue;
             }
@@ -115,14 +119,43 @@ std::vector<Finding> detect_spaces(const std::vector<TextRun>& runs) {
             if (is_zero_width(cp)) {
                 Finding f;
                 f.fraud_type = FraudType::spaces;
+                f.paragraph = run.paragraph;
                 f.offset = run.offset + byte_off;
                 f.word = "[invisible]";
-                f.limit = 1;  // single zero-width char
+                f.limit = 1;
                 findings.push_back(std::move(f));
                 continue;
             }
 
-            // 3) Multiple consecutive ASCII spaces (2+)
+            // 3) NBSP-like: only flag 2+ consecutive (single NBSP is normal in Word)
+            if (is_nbsp_like(cp)) {
+                int nbsp_start = byte_off;
+                int count = 1;
+                // Count consecutive NBSP-like codepoints
+                while (i < len) {
+                    int32_t save_i = i;
+                    UChar32 next_cp;
+                    U8_NEXT(s, i, len, next_cp);
+                    if (next_cp >= 0 && is_nbsp_like(next_cp)) {
+                        ++count;
+                    } else {
+                        i = save_i;  // put back
+                        break;
+                    }
+                }
+                if (count >= 2) {
+                    Finding f;
+                    f.fraud_type = FraudType::spaces;
+                    f.paragraph = run.paragraph;
+                    f.offset = run.offset + nbsp_start;
+                    f.word = run.text.substr(nbsp_start, i - nbsp_start);
+                    f.limit = count;
+                    findings.push_back(std::move(f));
+                }
+                continue;
+            }
+
+            // 4) Multiple consecutive ASCII spaces (2+)
             if (cp == ' ') {
                 int space_start = byte_off;
                 int count = 1;
@@ -130,9 +163,10 @@ std::vector<Finding> detect_spaces(const std::vector<TextRun>& runs) {
                 if (count >= 2) {
                     Finding f;
                     f.fraud_type = FraudType::spaces;
+                    f.paragraph = run.paragraph;
                     f.offset = run.offset + space_start;
                     f.word = run.text.substr(space_start, count);
-                    f.limit = count;  // number of consecutive spaces
+                    f.limit = count;
                     findings.push_back(std::move(f));
                 }
             }

@@ -23,7 +23,7 @@ FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libicu74 libzip4 libpoppler-cpp0t64 \
+    libicu74 libzip4 libpoppler-cpp0t64 antiword \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

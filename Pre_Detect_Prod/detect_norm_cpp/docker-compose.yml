@@ -4,9 +4,14 @@ services:
     container_name: detect_norm_cpp
     ports:
       - "8001:8001"
+    volumes:
+      - request-log:/tmp/detect-norm-log
     restart: unless-stopped
     deploy:
       resources:
         limits:
-          cpus: "2"
-          memory: 2g
+          cpus: "4"
+          memory: 8g
+
+volumes:
+  request-log:

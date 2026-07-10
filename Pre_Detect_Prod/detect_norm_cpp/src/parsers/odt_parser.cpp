@@ -82,10 +82,12 @@ static void apply_style(TextRun& run, const std::string& style_name,
 }
 
 // Extract text from one paragraph (text:p or text:h)
-static void extract_paragraph(pugi::xml_node p_node, int para_idx,
+// Returns true if the paragraph had content (runs were added)
+static bool extract_paragraph(pugi::xml_node p_node, int para_idx,
                                const std::map<std::string, TextStyle>& styles,
                                std::vector<TextRun>& runs)
 {
+    size_t runs_before = runs.size();
     int offset = 0;
     const char* pstyle = p_node.attribute("text:style-name").as_string(nullptr);
 
@@ -161,6 +163,7 @@ static void extract_paragraph(pugi::xml_node p_node, int para_idx,
             runs.push_back(std::move(run));
         }
     }
+    return runs.size() > runs_before;
 }
 
 ParsedDocument parse_odt(const std::string& filename, const std::string& data) {
@@ -171,7 +174,8 @@ ParsedDocument parse_odt(const std::string& filename, const std::string& data) {
     if (xml_data.empty()) return doc;
 
     pugi::xml_document xdoc;
-    if (!xdoc.load_buffer(xml_data.data(), xml_data.size())) return doc;
+    unsigned int flags = pugi::parse_default | pugi::parse_ws_pcdata;
+    if (!xdoc.load_buffer(xml_data.data(), xml_data.size(), flags)) return doc;
 
     auto root = xdoc.document_element();
     auto styles = parse_styles(root);
@@ -187,15 +191,15 @@ ParsedDocument parse_odt(const std::string& filename, const std::string& data) {
     for (auto node : text_body.children()) {
         const char* name = node.name();
         if (strcmp(name, "text:p") == 0 || strcmp(name, "text:h") == 0) {
-            extract_paragraph(node, para_idx, styles, doc.runs);
-            ++para_idx;
+            if (extract_paragraph(node, para_idx, styles, doc.runs))
+                ++para_idx;
         }
         else if (strcmp(name, "text:list") == 0) {
             // Flatten list items: text:list > text:list-item > text:p
             for (auto li : node.children("text:list-item")) {
                 for (auto p : li.children("text:p")) {
-                    extract_paragraph(p, para_idx, styles, doc.runs);
-                    ++para_idx;
+                    if (extract_paragraph(p, para_idx, styles, doc.runs))
+                        ++para_idx;
                 }
             }
         }

@@ -60,6 +60,8 @@ add_executable(detect_norm_cpp
   src/detectors/spacing_detector.cpp
   src/detectors/hidden_text_detector.cpp
   src/parsers/txt_parser.cpp
+  src/parsers/rtf_parser.cpp
+  src/parsers/doc_parser.cpp
   src/parsers/docx_parser.cpp
   src/parsers/pptx_parser.cpp
   src/parsers/odt_parser.cpp

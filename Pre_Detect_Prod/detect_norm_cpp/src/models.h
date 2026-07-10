@@ -16,6 +16,8 @@ struct TextRun {
     double font_size = 12.0;
     std::vector<int> color_rgb;       // [r,g,b] or empty
     std::vector<int> background_rgb;  // [r,g,b] or empty
+    bool is_formula = false;          // true for OMML math runs
+    bool is_vanish = false;           // true for w:vanish (hidden text in Word)
 };
 
 struct ParsedDocument {
@@ -31,6 +33,7 @@ std::string fraud_type_str(FraudType ft);
 struct Finding {
     FraudType fraud_type;
     std::string word;
+    int paragraph = 0;
     int offset = 0;
     int limit = 1;
 };

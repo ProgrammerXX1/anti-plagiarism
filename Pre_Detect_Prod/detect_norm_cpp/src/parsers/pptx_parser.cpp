@@ -37,12 +37,14 @@ static void extract_text_bodies(pugi::xml_node node, int page, int& para_idx,
         // Extract paragraphs from this text body
         for (auto p = node.child("a:p"); p; p = p.next_sibling("a:p")) {
             int offset_in_para = 0;
+            bool para_has_content = false;
             for (auto r = p.child("a:r"); r; r = r.next_sibling("a:r")) {
                 std::string text;
                 for (auto t = r.child("a:t"); t; t = t.next_sibling("a:t"))
                     text += t.text().get();
                 if (text.empty()) continue;
 
+                para_has_content = true;
                 TextRun run;
                 run.text = text;
                 run.page = page;
@@ -69,7 +71,7 @@ static void extract_text_bodies(pugi::xml_node node, int page, int& para_idx,
                 offset_in_para += static_cast<int>(text.size());
                 runs.push_back(std::move(run));
             }
-            ++para_idx;
+            if (para_has_content) ++para_idx;
         }
         return; // don't recurse into children of txBody
     }
@@ -105,7 +107,8 @@ ParsedDocument parse_pptx(const std::string& filename, const std::string& data) 
         if (xml_data.empty()) continue;
 
         pugi::xml_document xdoc;
-        if (!xdoc.load_buffer(xml_data.data(), xml_data.size())) continue;
+        unsigned int flags = pugi::parse_default | pugi::parse_ws_pcdata;
+        if (!xdoc.load_buffer(xml_data.data(), xml_data.size(), flags)) continue;
 
         extract_text_bodies(xdoc.document_element(), si + 1, para_idx, doc.runs);
     }

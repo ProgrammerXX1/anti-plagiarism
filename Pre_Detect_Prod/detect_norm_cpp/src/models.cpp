@@ -16,6 +16,7 @@ std::string fraud_type_str(FraudType ft) {
 void to_json(json& j, const Finding& f) {
     j = json{
         {"word", f.word},
+        {"paragraph", f.paragraph},
         {"offset", f.offset},
         {"limit", f.limit},
         {"fraud_type", fraud_type_str(f.fraud_type)}
